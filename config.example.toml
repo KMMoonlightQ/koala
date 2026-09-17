@@ -1,0 +1,34 @@
+[llm]
+base_url = "https://api.openai.com/v1"     # 任意 OpenAI 兼容端点，如 https://dashscope.aliyuncs.com/compatible-mode/v1
+api_key = "sk-xxx"                          # provider 的 key，或用环境变量 KBA_API_KEY 覆盖
+model = "gpt-4o-mini"                       # 模型名
+
+# 额外的请求头：某些"OpenAI 兼容"端点要求额外的路由头时填这里，每个请求都会携带
+# [llm.headers]
+# x-opencode-session = "kb-agent"
+
+[memory]
+workspace = ".kb"
+
+[agent]
+max_tool_rounds = 8
+max_retries = 3
+compact_threshold = 40000                # history 字符数超过即自动压缩
+subagent_max_rounds = 8
+session_dir = ".kb/session"              # 会话转录目录：Agent 与知识库之间唯一的接口
+# memory_file = "..."                    # Agent 私有记忆，默认 <config dir>/kb-agent/memory.md
+
+# 权限：按工具名匹配，allow 优先于 deny，其余走 default（allow/ask/deny）
+# ask 会在界面里请求你确认（y/n）
+[permissions]
+default = "ask"
+allow = ["todo_write", "remember", "skill"]
+deny = []
+
+# hooks：每条是一个 shell 命令，stdin 收到 JSON 事件，超时 10s
+# pre_tool_use  exit 2 = 阻断该工具调用（stderr 作为原因回喂模型）
+[hooks]
+pre_tool_use = []
+post_tool_use = []
+turn_start = []
+turn_end = []

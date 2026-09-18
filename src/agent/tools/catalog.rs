@@ -1,5 +1,5 @@
 //! One tool directory for definitions, capabilities and execution ownership.
-use super::{Tool, ToolContext, ToolResult, bash, files, remember, skill, task, todo};
+use super::{Tool, ToolContext, ToolResult, background, bash, files, remember, skill, task, todo};
 use crate::agent::permissions::{Permissions, Policy};
 use crate::extensions::{Extension, Extensions};
 use serde_json::Value;
@@ -35,6 +35,12 @@ struct Builtin {
 // Names, capabilities and visibility come from the same lightweight declarations.
 static BUILTINS: &[Builtin] = &[
     Builtin {
+        tool: &background::BackgroundTasks,
+        plan_allowed: true,
+        approval: Approval::Always,
+        root_only: false,
+    },
+    Builtin {
         tool: &files::Read,
         plan_allowed: true,
         approval: Approval::Always,
@@ -56,6 +62,12 @@ static BUILTINS: &[Builtin] = &[
         tool: &files::Write,
         plan_allowed: false,
         approval: Approval::WorkspaceEdit,
+        root_only: false,
+    },
+    Builtin {
+        tool: &remember::Recall,
+        plan_allowed: true,
+        approval: Approval::Always,
         root_only: false,
     },
     Builtin {
@@ -133,6 +145,16 @@ impl ToolCatalog {
                 .ok()
                 .and_then(|path| path.canonicalize().ok()),
         }
+    }
+
+    pub fn with_memory_controls(mut self, memory: &crate::agent::agentmem::AgentMemory) -> Self {
+        self.entries
+            .retain(|entry| match entry.definition.function.name.as_str() {
+                "remember" => memory.write_enabled(),
+                "recall" => memory.read_enabled(),
+                _ => true,
+            });
+        self
     }
 
     fn find(&self, name: &str) -> Option<&Entry> {

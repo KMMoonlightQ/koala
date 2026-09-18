@@ -12,14 +12,22 @@ pub struct MockLlm {
 
 impl MockLlm {
     pub async fn start(responses: Vec<(u16, String)>) -> Self {
+        let mut responses = responses.into_iter();
+        Self::respond(move |_| responses.next().expect("unexpected model request")).await
+    }
+
+    /// Respond based on the request, e.g. interleaved stream and summary calls.
+    pub async fn respond(
+        mut response: impl FnMut(&Value) -> (u16, String) + Send + 'static,
+    ) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let (tx, requests) = tokio::sync::mpsc::unbounded_channel();
         let server = tokio::spawn(async move {
-            for (status, body) in responses {
+            loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut data = Vec::new();
-                loop {
+                let request = loop {
                     let mut buf = [0; 4096];
                     let n = socket.read(&mut buf).await.unwrap();
                     assert!(n > 0, "request closed before body arrived");
@@ -33,12 +41,12 @@ impl MockLlm {
                             .parse()
                             .unwrap();
                         if data.len() >= end + 4 + len {
-                            tx.send(serde_json::from_slice(&data[end + 4..end + 4 + len]).unwrap())
-                                .unwrap();
-                            break;
+                            break serde_json::from_slice(&data[end + 4..end + 4 + len]).unwrap();
                         }
                     }
-                }
+                };
+                let (status, body) = response(&request);
+                tx.send(request).unwrap();
                 let kind = if body.starts_with("data:") {
                     "text/event-stream"
                 } else {

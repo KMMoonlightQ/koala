@@ -153,6 +153,20 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                                 i18n::text(lang, Key::NoteBusyInterruptFirst).into(),
                             ));
                         }
+                        SessionCommand::Memory { control } => {
+                            let guard = agent.lock().await;
+                            match control {
+                                Some(super::event::MemoryControl::Read(enabled)) => guard.agent_memory.set_read_enabled(enabled),
+                                Some(super::event::MemoryControl::Write(enabled)) => guard.agent_memory.set_write_enabled(enabled),
+                                None => {},
+                            }
+                            let memory = &guard.agent_memory;
+                            let result = memory.content().map(|index| format!("{}\n{}\n{index}",
+                                i18n::text(shared.lang.get(), Key::MemoryIndex), memory.status()));
+                            let _ = ev_tx.send(match result {
+                                Ok(text) => UiEvent::Info(text), Err(e) => UiEvent::Error(e.to_string())
+                            });
+                        }
                         SessionCommand::ShowSessions => {
                             match agent.lock().await.list_sessions() {
                                 Ok(items) => { let _ = ev_tx.send(UiEvent::Sessions(items)); }

@@ -1,10 +1,10 @@
-//! Durable work journal, separate from the legacy conversation/distillation log.
+//! Durable work journal, separate from the conversation transcript.
 use super::{event::*, plan::TodoItem};
 use crate::llm::Message;
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::PathBuf,
     sync::{Arc, Mutex},
 };
@@ -36,6 +36,11 @@ enum Entry {
         messages: Vec<Message>,
         todos: Vec<TodoItem>,
     },
+    ContextDelta {
+        keep: usize,
+        messages: Vec<Message>,
+        todos: Vec<TodoItem>,
+    },
     Tasks(Vec<TaskView>),
 }
 
@@ -50,18 +55,38 @@ pub struct State {
 #[derive(Debug, Clone)]
 pub struct Journal {
     pub path: PathBuf,
-    lock: Arc<Mutex<()>>,
+    lock: Arc<Mutex<Writer>>,
+}
+
+#[derive(Debug)]
+struct Writer {
+    context: Option<Vec<serde_json::Value>>,
+    disk_len: u64,
+    text: String,
+    last_flush: std::time::Instant,
+}
+impl Default for Writer {
+    fn default() -> Self {
+        Self {
+            context: None,
+            disk_len: 0,
+            text: String::new(),
+            last_flush: std::time::Instant::now(),
+        }
+    }
 }
 
 impl Journal {
     pub fn new(path: PathBuf) -> Self {
         Self {
             path,
-            lock: Arc::new(Mutex::new(())),
+            lock: Arc::new(Mutex::new(Writer::default())),
         }
     }
 
     pub fn load(&self) -> Result<Option<State>, String> {
+        let mut writer = self.lock.lock().unwrap();
+        self.flush_text(&mut writer).map_err(|e| e.to_string())?;
         let metadata = match fs::symlink_metadata(&self.path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -70,19 +95,29 @@ impl Journal {
         if !metadata.is_file() {
             return Err("work journal is not a regular file".into());
         }
-        let mut file = fs::File::open(&self.path).map_err(|e| e.to_string())?;
+        let file = fs::File::open(&self.path).map_err(|e| e.to_string())?;
         file.lock_shared().map_err(|e| e.to_string())?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-        // A newline commits an entry. A crash can leave an incomplete tail,
-        // including half a UTF-8 character; only the committed prefix is read.
-        let committed = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-        let text = std::str::from_utf8(&bytes[..committed]).map_err(|e| e.to_string())?;
+        let mut reader = BufReader::new(file);
         let mut state = State::default();
         let mut partial_text = String::new();
-        for (line, value) in text.lines().enumerate() {
-            let entry: Entry = serde_json::from_str(value)
-                .map_err(|e| format!("work journal line {}: {e}", line + 1))?;
+        let mut value = Vec::new();
+        let mut line = 0;
+        loop {
+            value.clear();
+            if reader
+                .read_until(b'\n', &mut value)
+                .map_err(|e| e.to_string())?
+                == 0
+            {
+                break;
+            }
+            // Only newline-terminated entries are committed; ignore crash tails.
+            if value.last() != Some(&b'\n') {
+                break;
+            }
+            line += 1;
+            let entry: Entry = serde_json::from_slice(&value)
+                .map_err(|e| format!("work journal line {line}: {e}"))?;
             match entry {
                 Entry::Trace(trace) => {
                     if let Trace::User(text) = &trace {
@@ -103,6 +138,19 @@ impl Journal {
                 }
                 Entry::Context { messages, todos } => {
                     state.messages = messages;
+                    state.todos = todos;
+                    partial_text.clear();
+                }
+                Entry::ContextDelta {
+                    keep,
+                    messages,
+                    todos,
+                } => {
+                    if keep > state.messages.len() {
+                        return Err(format!("invalid context delta at line {line}"));
+                    }
+                    state.messages.truncate(keep);
+                    state.messages.extend(messages);
                     state.todos = todos;
                     partial_text.clear();
                 }
@@ -132,11 +180,8 @@ impl Journal {
         Ok(Some(state))
     }
 
-    fn append(&self, entry: Entry) -> std::io::Result<()> {
-        let _guard = self.lock.lock().unwrap();
+    fn append_locked(&self, writer: &mut Writer, mut entry: Entry) -> std::io::Result<()> {
         fs::create_dir_all(self.path.parent().unwrap())?;
-        let mut bytes = serde_json::to_vec(&entry)?;
-        bytes.push(b'\n');
         let mut file = fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -150,24 +195,89 @@ impl Journal {
             file.read_exact(&mut last)?;
             if last[0] != b'\n' {
                 // Repair only an uncommitted tail before the next append.
-                file.seek(SeekFrom::Start(0))?;
-                let mut previous = Vec::new();
-                file.read_to_end(&mut previous)?;
-                len = previous
-                    .iter()
-                    .rposition(|b| *b == b'\n')
-                    .map_or(0, |i| i + 1) as u64;
+                let mut cursor = len;
+                let mut block = [0; 4096];
+                len = 0;
+                while cursor > 0 {
+                    let start = cursor.saturating_sub(block.len() as u64);
+                    let size = (cursor - start) as usize;
+                    file.seek(SeekFrom::Start(start))?;
+                    file.read_exact(&mut block[..size])?;
+                    if let Some(end) = block[..size].iter().rposition(|b| *b == b'\n') {
+                        len = start + end as u64 + 1;
+                        break;
+                    }
+                    cursor = start;
+                }
                 file.set_len(len)?;
             }
         }
+        if len != writer.disk_len {
+            writer.context = None;
+        }
+        let mut next_context = None;
+        if let Entry::Context { messages, todos } = &entry {
+            let values: Vec<_> = messages
+                .iter()
+                .map(serde_json::to_value)
+                .collect::<Result<_, _>>()?;
+            if let Some(previous) = &writer.context {
+                let keep = previous
+                    .iter()
+                    .zip(&values)
+                    .take_while(|(a, b)| a == b)
+                    .count();
+                entry = Entry::ContextDelta {
+                    keep,
+                    messages: messages[keep..].to_vec(),
+                    todos: todos.clone(),
+                };
+            }
+            next_context = Some(values);
+        }
+        let mut bytes = serde_json::to_vec(&entry)?;
+        bytes.push(b'\n');
         if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_data()) {
             file.set_len(len)?;
             return Err(error);
         }
+        writer.disk_len = len + bytes.len() as u64;
+        if let Some(context) = next_context {
+            writer.context = Some(context);
+        }
         Ok(())
     }
+
+    fn flush_text(&self, writer: &mut Writer) -> std::io::Result<()> {
+        if !writer.text.is_empty() {
+            self.append_locked(writer, Entry::Trace(Trace::Text(writer.text.clone())))?;
+            writer.text.clear();
+        }
+        writer.last_flush = std::time::Instant::now();
+        Ok(())
+    }
+
+    fn append(&self, entry: Entry) -> std::io::Result<()> {
+        let mut writer = self.lock.lock().unwrap();
+        self.flush_text(&mut writer)?;
+        self.append_locked(&mut writer, entry)
+    }
+
     pub fn trace(&self, trace: Trace) -> std::io::Result<()> {
-        self.append(Entry::Trace(trace))
+        if let Trace::Text(text) = trace {
+            let mut writer = self.lock.lock().unwrap();
+            writer.text.push_str(&text);
+            // Batch stream fragments; tool/context boundaries and load flush too.
+            // An abrupt process crash can lose the most recent <4KB fragment.
+            if writer.text.len() >= 4096
+                || writer.last_flush.elapsed() >= std::time::Duration::from_millis(250)
+            {
+                self.flush_text(&mut writer)?;
+            }
+            Ok(())
+        } else {
+            self.append(Entry::Trace(trace))
+        }
     }
     pub fn context(&self, messages: &[Message], todos: &[TodoItem]) -> std::io::Result<()> {
         self.append(Entry::Context {

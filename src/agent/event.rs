@@ -29,8 +29,17 @@ pub enum SessionCommand {
     StopTask(usize),
     /// Report the skills listing as `UiEvent::Info`.
     ShowSkills,
+    /// Inspect the next memory index or change session-local read/write controls.
+    Memory {
+        control: Option<MemoryControl>,
+    },
     /// Switch the language of agent-side messages and of the system prompt.
     SetLang(Lang),
+}
+
+pub enum MemoryControl {
+    Read(bool),
+    Write(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

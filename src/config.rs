@@ -243,14 +243,19 @@ pub struct AgentConfig {
     pub max_tool_rounds: Option<usize>,
     pub max_retries: usize,
     /// Compact history when its estimated size (chars) exceeds this.
+    /// Serialized request byte budget including tools and a 4096-byte response reserve.
     pub compact_threshold: usize,
     #[serde(deserialize_with = "deserialize_round_limit")]
     pub subagent_max_rounds: Option<usize>,
     /// Directory where chat transcripts (session jsonl) are appended.
     /// Extensions can use the path supplied on successful root turn_end.
     pub session_dir: PathBuf,
-    /// Agent-private memory file, injected into the system prompt every turn.
+    /// Structured curated memory store; legacy Markdown is never imported.
     pub memory_file: PathBuf,
+    pub memory_read: bool,
+    pub memory_write: bool,
+    /// UTF-8 bytes; clamped to 1024..=32000 at the memory interface.
+    pub memory_index_bytes: usize,
 }
 
 impl Default for AgentConfig {
@@ -262,6 +267,9 @@ impl Default for AgentConfig {
             subagent_max_rounds: None,
             session_dir: PathBuf::from(".koala/session"),
             memory_file: default_memory_file(),
+            memory_read: true,
+            memory_write: true,
+            memory_index_bytes: 4000,
         }
     }
 }
@@ -288,8 +296,8 @@ where
 
 fn default_memory_file() -> PathBuf {
     dirs::config_dir()
-        .map(|d| d.join("koala").join("memory.md"))
-        .unwrap_or_else(|| PathBuf::from("memory.md"))
+        .map(|d| d.join("koala").join("memory.json"))
+        .unwrap_or_else(|| PathBuf::from("memory.json"))
 }
 
 impl Config {

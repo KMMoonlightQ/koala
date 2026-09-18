@@ -71,7 +71,7 @@ pub fn border() -> Style {
 }
 /// Consistent focus treatment for navigable lists, distinct from warning badges.
 pub fn selected() -> Style {
-    suggestion().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    suggestion().add_modifier(Modifier::BOLD)
 }
 
 pub fn task_status(state: crate::agent::event::TaskState) -> Style {

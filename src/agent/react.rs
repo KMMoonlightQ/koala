@@ -18,7 +18,8 @@ pub async fn run(
     max_rounds: Option<usize>,
     turn_context: Option<&str>,
 ) -> Result<String, AgentError> {
-    let registry = ToolCatalog::build(ctx.depth, &ctx.shared.extensions);
+    let registry = ToolCatalog::build(ctx.depth, &ctx.shared.extensions)
+        .with_memory_controls(ctx.agent_memory);
     let tool_defs = registry.definitions_for_mode(ctx.plan_mode);
     let resources = prompt::PromptResources::load(
         std::env::current_dir()?,
@@ -28,6 +29,7 @@ pub async fn run(
     // Allow one final model response after the last permitted tool round,
     // but never execute tools beyond the configured budget.
     let mut remaining = max_rounds;
+    let mut compact_attempts = 0;
     loop {
         let memory = ctx
             .agent_memory
@@ -91,6 +93,61 @@ pub async fn run(
         if ctx.depth == 0 {
             let _ = ctx.events.send(UiEvent::ContextUsage(None));
         }
+        // Count the actual serialized request components, including dynamic
+        // extension/background context and tool definitions. This is a byte
+        // budget, not a provider-specific token-window claim.
+        let used = serde_json::to_vec(&request)
+            .expect("serializable messages")
+            .len()
+            + serde_json::to_vec(&tool_defs)
+                .expect("serializable tools")
+                .len()
+            + 4096; // space reserved for the response
+        let limit = ctx.shared.compact_threshold;
+        if used > limit {
+            if compact_attempts >= 2 {
+                return Err(AgentError::ContextBudget { used, limit });
+            }
+            let _ = ctx.events.send(UiEvent::Status(
+                crate::i18n::text(ctx.shared.lang.get(), crate::i18n::Key::StatusCompacting).into(),
+            ));
+            ctx.shared
+                .extensions
+                .hook(
+                    Stage::BeforeCompact,
+                    compaction_payload(ctx, messages, None),
+                )
+                .await
+                .map_err(AgentError::Extension)?;
+            let mut history: Vec<_> = messages
+                .iter()
+                .filter(|m| m.role != "system")
+                .cloned()
+                .collect();
+            let keep = if compact_attempts == 0 {
+                super::compact::KEEP_RECENT
+            } else {
+                1
+            };
+            let changed =
+                super::compact::compact_keeping(&ctx.shared.llm, &mut history, keep, limit).await?;
+            if changed {
+                *messages = history;
+                checkpoint(ctx, messages)?;
+            }
+            ctx.shared
+                .extensions
+                .hook(
+                    Stage::AfterCompact,
+                    compaction_payload(ctx, messages, Some(changed)),
+                )
+                .await
+                .map_err(AgentError::Extension)?;
+            compact_attempts += 1;
+            // Rebuild system state and extension context after compaction.
+            continue;
+        }
+        compact_attempts = 0;
         let mut stream = connect_with_retry(ctx, &request, &tool_defs).await?;
         let mut agg = DeltaAggregator::default();
         while let Some(delta) = stream.next().await {
@@ -128,6 +185,28 @@ pub async fn run(
             checkpoint(ctx, messages)?;
         }
     }
+}
+
+fn compaction_payload(
+    ctx: &ToolContext<'_>,
+    messages: &[Message],
+    changed: Option<bool>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({"messages": messages, "depth": ctx.depth});
+    if ctx.depth == 0
+        && let Some(session) = ctx
+            .background
+            .journal
+            .as_ref()
+            .and_then(|j| j.path.file_stem())
+            .and_then(|s| s.to_str())
+    {
+        payload["session"] = session.into();
+    }
+    if let Some(changed) = changed {
+        payload["changed"] = changed.into();
+    }
+    payload
 }
 
 fn checkpoint(ctx: &ToolContext<'_>, messages: &[Message]) -> Result<(), AgentError> {
@@ -277,10 +356,16 @@ async fn execute_checked(
         "arguments": arguments,
     });
 
-    if let HookOutcome::Blocked(reason) =
-        hooks::run_all(&ctx.shared.hooks.pre_tool_use, &payload).await
-    {
-        return tools::ToolResult::err(format!("blocked by hook: {reason}"));
+    match hooks::run_all(&ctx.shared.hooks.pre_tool_use, &payload).await {
+        HookOutcome::Ok => {}
+        HookOutcome::Blocked(reason) => {
+            return tools::ToolResult::err(format!("blocked by hook: {reason}"));
+        }
+        HookOutcome::Failed(reason) => {
+            return tools::ToolResult::err(format!(
+                "pre-tool hook failed; execution blocked: {reason}"
+            ));
+        }
     }
     if ctx.plan_mode && !registry.plan_allowed(name) {
         return tools::ToolResult::err(format!(

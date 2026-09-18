@@ -30,10 +30,13 @@ model = "gpt-4o-mini"                       # 模型名
 [agent]
 max_tool_rounds = "unlimited"           # 不限制轮数；非负整数设置上限，0 禁止工具调用
 max_retries = 5
-compact_threshold = 40000                # history 字符数超过即自动压缩
+compact_threshold = 40000                # 每次请求的序列化字节预算，含工具、动态上下文及 4096 字节回复预留
 subagent_max_rounds = "unlimited"
 session_dir = ".koala/session"              # 会话转录目录：通用 JSONL 会话转录
-# memory_file = "..."                    # Agent 私有记忆，默认 <config dir>/koala/memory.md
+# memory_file = "..."                    # 结构化私有记忆，默认 <config dir>/koala/memory.json
+# memory_read = true                     # 自动加载索引及 recall；与写入开关独立
+# memory_write = true                    # remember 更新/删除；不影响已有条目的读取
+# memory_index_bytes = 4000              # 索引 UTF-8 字节预算，限制在 1024..=32000
 
 # 权限等级：normal / ask_when_need / auto_edit / never_ask
 # 对话内 /permissions 切换；方向键选择，Enter 确认，Esc 取消
@@ -45,14 +48,14 @@ allow = []
 deny = []
 
 # hooks：每条是一个 shell 命令，stdin 收到 JSON 事件，超时 10s
-# pre_tool_use  exit 2 = 阻断该工具调用（stderr 作为原因回喂模型）
+# pre_tool_use  非零退出、超时或执行失败 = 阻断该工具调用（stderr 作为原因回喂模型）
 [hooks]
 pre_tool_use = []
 post_tool_use = []
 turn_start = []
 turn_end = []
 
-# Extensions are trusted local programs. All extensions (including memory) load in the listed order.
+# Extensions are trusted local programs. All extensions load in the listed order.
 [extensions]
 manifests = [] # e.g. [".koala/extensions/context-example/extension.toml"]
 timeout_secs = 30

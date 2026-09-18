@@ -1,4 +1,3 @@
-use super::super::agentmem::AgentMemory;
 use super::super::event::null_events;
 use super::super::plan::TodoList;
 use super::super::subagent;
@@ -69,11 +68,10 @@ impl Tool for TaskTool {
                 let id = ctx.background.register("task", &description);
                 let seed = ctx.subagent_seed();
                 let bg = ctx.background.clone();
-                let memory_file = ctx.shared.memory_file.clone();
+                let mem = ctx.agent_memory.clone();
                 let handle = tokio::spawn(async move {
                     let outcome = async {
                         let mut todos = TodoList::default();
-                        let mem = AgentMemory::load(memory_file);
                         let null_tx = null_events();
                         let mut sub_ctx = seed.build(&mut todos, &mem, &null_tx);
                         subagent::run(&mut sub_ctx, &prompt).await

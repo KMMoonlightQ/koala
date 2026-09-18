@@ -33,6 +33,10 @@ use tools::ToolContext;
 
 #[derive(Debug, Error)]
 pub enum AgentError {
+    #[error(
+        "request context exceeds configured budget ({used} > {limit} bytes including response reserve); reduce input, extension context, or tools, or raise agent.compact_threshold"
+    )]
+    ContextBudget { used: usize, limit: usize },
     #[error("extension: {0}")]
     Extension(String),
     #[error(transparent)]
@@ -112,7 +116,9 @@ impl Agent {
         crate::mcp::load(&cfg.mcp, &mut extensions)
             .await
             .map_err(AgentError::Extension)?;
-        let transcript = transcripts::TranscriptStore::new(cfg.agent.session_dir.clone());
+        let transcript = transcripts::TranscriptStore::new(
+            std::env::current_dir()?.join(&cfg.agent.session_dir),
+        );
         let background = BackgroundManager::default().for_session(
             work::Journal::new(transcript.path().with_extension("work")),
             Vec::new(),
@@ -133,7 +139,14 @@ impl Agent {
                 subagent_max_rounds: cfg.agent.subagent_max_rounds,
                 memory_file: cfg.agent.memory_file.clone(),
             }),
-            agent_memory: AgentMemory::load(cfg.agent.memory_file.clone()),
+            agent_memory: AgentMemory::new(
+                cfg.agent.memory_file.clone(),
+                &std::env::current_dir()?,
+                transcript.path().display().to_string(),
+                cfg.agent.memory_read,
+                cfg.agent.memory_write,
+                cfg.agent.memory_index_bytes,
+            )?,
             skills: Arc::new(Skills::load()),
             todos: TodoList::default(),
             background,
@@ -221,6 +234,8 @@ impl Agent {
             work::Journal::new(self.transcript.path().with_file_name(format!("{id}.work")));
         let saved = journal.load()?;
         self.transcript.restore(id, self.lang())?;
+        self.agent_memory
+            .set_source(self.transcript.path().display().to_string());
         self.history = records
             .iter()
             .map(|r| {
@@ -250,6 +265,8 @@ impl Agent {
 
     pub fn new_session(&mut self) {
         self.transcript.reset();
+        self.agent_memory
+            .set_source(self.transcript.path().display().to_string());
         self.background = self.background.for_session(
             work::Journal::new(self.transcript.path().with_extension("work")),
             Vec::new(),
@@ -325,7 +342,13 @@ impl Agent {
             .await
             .map_err(AgentError::Extension)?;
         self.initialize_work_trace()?;
-        let changed = compact::compact(&self.shared.llm, &mut self.history).await?;
+        let changed = compact::compact_keeping(
+            &self.shared.llm,
+            &mut self.history,
+            compact::KEEP_RECENT,
+            self.shared.compact_threshold,
+        )
+        .await?;
         self.shared.extensions.hook(crate::extensions::Stage::AfterCompact, serde_json::json!({"session": self.transcript.id(), "messages": self.history, "changed": changed})).await.map_err(AgentError::Extension)?;
         if let Some(journal) = &self.background.journal {
             journal.context(&self.history, &self.todos.items)?;
@@ -398,21 +421,6 @@ impl Agent {
         self.pending_input = None;
         self.transcript.append_turn(input, &reply)?;
 
-        if compact::estimate_chars(&self.history) > self.shared.compact_threshold {
-            let _ = events.send(UiEvent::Status(
-                i18n::text(self.lang(), Key::StatusCompacting).into(),
-            ));
-            match self.compact_now().await {
-                Ok(true) => {
-                    let _ = events.send(UiEvent::ContextUsage(None));
-                }
-                Ok(false) => {}
-                Err(e) => {
-                    let _ = events.send(UiEvent::Note(format!("compact failed: {e}")));
-                }
-            }
-        }
-
         if let hooks::HookOutcome::Failed(reason) = hooks::run_all(
             &self.shared.hooks.turn_end,
             &serde_json::json!({"hook": "turn_end", "session": self.transcript.id()}),
@@ -483,6 +491,134 @@ mod tests {
         cfg.agent.session_dir = root.join("sessions");
         cfg.agent.max_tool_rounds = Some(1);
         (Agent::new(&cfg).await.unwrap(), root)
+    }
+
+    #[tokio::test]
+    async fn extension_context_is_budgeted_for_root_and_child() {
+        use crate::extensions::{Extension, ExtensionFuture, Response, Stage};
+        struct LargeContext;
+        impl Extension for LargeContext {
+            fn name(&self) -> &str {
+                "large-context"
+            }
+            fn hook<'a>(&'a self, stage: Stage, _: &'a serde_json::Value) -> ExtensionFuture<'a> {
+                Box::pin(async move {
+                    Ok(Response {
+                        context: (stage == Stage::BeforeModel).then(|| "x".repeat(50000)),
+                        ..Default::default()
+                    })
+                })
+            }
+        }
+        let mock = crate::test_support::MockLlm::start(vec![]).await;
+        let (mut agent, root) = mock_agent(&mock.url).await;
+        Arc::get_mut(&mut agent.shared)
+            .unwrap()
+            .extensions
+            .register(Arc::new(LargeContext))
+            .unwrap();
+        assert!(matches!(
+            agent.run_turn("hello", event::null_events()).await,
+            Err(AgentError::ContextBudget { .. })
+        ));
+        let events = event::null_events();
+        let mut ctx = ToolContext {
+            todos: &mut agent.todos,
+            agent_memory: &agent.agent_memory,
+            background: agent.background.clone(),
+            skills: &agent.skills,
+            events: &events,
+            shared: &agent.shared,
+            depth: 1,
+            plan_mode: false,
+        };
+        assert!(matches!(
+            subagent::run(&mut ctx, "hello").await,
+            Err(AgentError::ContextBudget { .. })
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn new_session_preserves_curated_memory_and_updates_provenance_and_controls() {
+        use crate::test_support::{MockLlm, stream};
+        use agentmem::{Kind, Note, Scope};
+        let mut mock = MockLlm::start(vec![stream(serde_json::json!({"content":"你好"})); 3]).await;
+        let (mut agent, root) = mock_agent(&mock.url).await;
+        let entry = |summary: &str| Note {
+            key: "language".into(),
+            kind: Kind::Preference,
+            scope: Scope::Project,
+            summary: summary.into(),
+            details: "DETAIL_NOT_IN_INDEX".into(),
+            expires_on: None,
+        };
+        let old = agent.agent_memory.upsert(entry("回答使用中文")).unwrap();
+        let background_memory = agent.agent_memory.clone();
+        agent.new_session();
+        let corrected = agent
+            .agent_memory
+            .upsert(entry("偏好简洁的中文回答"))
+            .unwrap();
+        assert_ne!(old.source, corrected.source);
+        assert!(corrected.source.contains(agent.session_id()));
+        let background_entry = background_memory
+            .upsert(Note {
+                key: "background-source".into(),
+                ..entry("后台任务继承原始来源")
+            })
+            .unwrap();
+        assert_eq!(background_entry.source, old.source);
+        agent
+            .agent_memory
+            .forget("background-source", Scope::Project)
+            .unwrap();
+        agent.run_turn("你好", event::null_events()).await.unwrap();
+        let initial = mock.request().await;
+        let system = initial["messages"][0]["content"].as_str().unwrap();
+        assert!(system.contains("偏好简洁的中文回答"));
+        assert!(!system.contains("DETAIL_NOT_IN_INDEX"));
+        assert!(system.contains("Do not resume old work"));
+        assert_eq!(
+            agent.agent_memory.entries(false).unwrap().len(),
+            1,
+            "a greeting with no memory write must not append a record"
+        );
+        agent.agent_memory.set_read_enabled(false);
+        agent.agent_memory.set_write_enabled(false);
+        assert!(!background_memory.read_enabled());
+        assert!(!background_memory.write_enabled());
+        agent.run_turn("hello", event::null_events()).await.unwrap();
+        let disabled = mock.request().await;
+        assert!(
+            !disabled["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("<agent_memory>")
+        );
+        for tool in disabled["tools"].as_array().unwrap() {
+            assert_ne!(tool["function"]["name"], "recall");
+            assert_ne!(tool["function"]["name"], "remember");
+        }
+        agent.agent_memory.set_read_enabled(true);
+        agent.run_turn("hello", event::null_events()).await.unwrap();
+        let read_only = mock.request().await;
+        assert!(
+            read_only["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["function"]["name"] == "recall")
+        );
+        assert!(
+            !read_only["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["function"]["name"] == "remember")
+        );
+        assert_eq!(agent.agent_memory.entries(false).unwrap().len(), 1);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
@@ -580,7 +716,7 @@ mod tests {
         let mut mock = MockLlm::start(vec![
             stream(serde_json::json!({"tool_calls": [
                 {"index":0,"id":"todo","function":{"name":"todo_write","arguments":serde_json::json!({"todos":[{"content":"LIVE_TODO_MARKER","status":"in_progress"}]}).to_string()}},
-                {"index":1,"id":"memory","function":{"name":"remember","arguments":"{\"text\":\"LIVE_MEMORY_MARKER\"}"}}
+                {"index":1,"id":"memory","function":{"name":"remember","arguments":serde_json::json!({"action":"upsert","key":"live-marker","kind":"constraint","summary":"LIVE_MEMORY_MARKER"}).to_string()}}
             ]})),
             stream(serde_json::json!({"content":"done"})),
             stream(serde_json::json!({"content":"plan"})),
@@ -630,7 +766,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_results_reach_model_and_stay_in_their_session() {
+    async fn background_index_reaches_model_and_stay_in_their_session() {
         use crate::test_support::{MockLlm, stream};
         let mut mock = MockLlm::start(vec![stream(serde_json::json!({"content": "ok"})); 3]).await;
         let (mut agent, root) = mock_agent(&mock.url).await;
@@ -644,11 +780,9 @@ mod tests {
             .run_turn("summarize", event::null_events())
             .await
             .unwrap();
-        assert!(
-            mock.request().await["messages"]
-                .to_string()
-                .contains("UNIQUE_BACKGROUND_RESULT")
-        );
+        let request = mock.request().await["messages"].to_string();
+        assert!(request.contains("research"));
+        assert!(!request.contains("UNIQUE_BACKGROUND_RESULT"));
         agent.new_session();
         old_background.finish(late, true, "STALE_BACKGROUND_RESULT".into());
         agent
@@ -663,18 +797,16 @@ mod tests {
             .background
             .finish(id, false, "NEW_BACKGROUND_FAILURE".into());
         agent.run_turn("check", event::null_events()).await.unwrap();
-        assert!(
-            mock.request().await["messages"]
-                .to_string()
-                .contains("NEW_BACKGROUND_FAILURE")
-        );
+        let request = mock.request().await["messages"].to_string();
+        assert!(request.contains("new task"));
+        assert!(!request.contains("NEW_BACKGROUND_FAILURE"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
     async fn tool_round_limit_reports_failure_without_executing_extra_round() {
         use crate::test_support::{MockLlm, stream};
-        let call = |text: &str| serde_json::json!({"tool_calls": [{"index": 0, "id": "c", "function": {"name": "remember", "arguments": serde_json::json!({"text": text}).to_string()}}]});
+        let call = |text: &str| serde_json::json!({"tool_calls": [{"index": 0, "id": "c", "function": {"name": "remember", "arguments": serde_json::json!({"action":"upsert","key": text.replace(' ', "-").to_lowercase(),"kind":"constraint","summary":text}).to_string()}}]});
         let mock = MockLlm::start(vec![
             stream(call("first allowed write")),
             stream(call("EXTRA_WRITE")),
@@ -693,7 +825,7 @@ mod tests {
     async fn final_answer_is_allowed_after_last_tool_round() {
         use crate::test_support::{MockLlm, stream};
         let mock = MockLlm::start(vec![
-            stream(serde_json::json!({"tool_calls": [{"index": 0, "id": "c", "function": {"name": "remember", "arguments": "{\"text\":\"fact\"}"}}]})),
+            stream(serde_json::json!({"tool_calls": [{"index": 0, "id": "c", "function": {"name": "remember", "arguments": serde_json::json!({"action":"upsert","key":"fact","kind":"constraint","summary":"fact"}).to_string()}}]})),
             stream(serde_json::json!({"content": "finished"})),
         ]).await;
         let (mut agent, root) = mock_agent(&mock.url).await;
@@ -711,7 +843,7 @@ mod tests {
         for round in 0..12 {
             replies.push(stream(serde_json::json!({"tool_calls": [{"index": 0, "id": format!("c{round}"), "function": {
                 "name": "remember",
-                "arguments": serde_json::json!({"text": format!("fact {round}")}).to_string()
+                "arguments": serde_json::json!({"action":"upsert","key":format!("fact-{round}"),"kind":"constraint","summary": format!("fact {round}")}).to_string()
             }}]})));
         }
         replies.push(stream(serde_json::json!({"content": "finished"})));
@@ -723,7 +855,7 @@ mod tests {
             agent.run_turn("work", event::null_events()).await.unwrap(),
             "finished"
         );
-        let memory = agent.agent_memory.content().unwrap();
+        let memory = serde_json::to_string(&agent.agent_memory.entries(false).unwrap()).unwrap();
         for round in 0..12 {
             assert!(memory.contains(&format!("fact {round}")));
         }

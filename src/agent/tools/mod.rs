@@ -1,3 +1,4 @@
+pub mod background;
 pub mod bash;
 pub mod catalog;
 pub mod files;
@@ -153,7 +154,12 @@ pub fn summarize_args(name: &str, arguments: &str) -> String {
     let summary = match name {
         "bash" => pick("command"),
         "read" | "edit" | "write" => pick("path"),
-        "remember" => pick("text"),
+        "remember" => pick("key"),
+        "recall" => args
+            .get("key")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| pick("query")),
         "skill" => pick("name"),
         "task" => pick("description"),
         "todo_write" => args
@@ -213,7 +219,7 @@ mod tests {
             extensions: crate::extensions::Extensions::default(),
             max_tool_rounds: Some(4),
             max_retries: 0,
-            compact_threshold: 1000,
+            compact_threshold: 40000,
             subagent_max_rounds: Some(2),
             memory_file: std::path::PathBuf::from("/tmp/koala-ctx-test.md"),
             lang: crate::i18n::LangCell::new(crate::i18n::Lang::En),

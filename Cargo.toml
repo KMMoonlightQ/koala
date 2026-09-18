@@ -5,7 +5,6 @@ edition = "2024"
 
 [workspace]
 members = ["crates/*"]
-exclude = ["extensions/memory"]
 resolver = "3"
 
 [dependencies]

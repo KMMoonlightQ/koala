@@ -614,6 +614,22 @@ fn submit(app: &mut App) {
 fn handle_command(app: &mut App, cmd: &str) -> bool {
     let mut words = cmd.split_whitespace();
     let command = words.next();
+    if command == Some("memory") {
+        let args: Vec<_> = words.collect();
+        let control = match args.as_slice() {
+            [] | ["show"] => None,
+            ["read", "on"] => Some(crate::agent::event::MemoryControl::Read(true)),
+            ["read", "off"] => Some(crate::agent::event::MemoryControl::Read(false)),
+            ["write", "on"] => Some(crate::agent::event::MemoryControl::Write(true)),
+            ["write", "off"] => Some(crate::agent::event::MemoryControl::Write(false)),
+            _ => {
+                app.hint = Some(i18n::text(app.lang, Key::UsageMemory).into());
+                return false;
+            }
+        };
+        app.session.send(SessionCommand::Memory { control });
+        return true;
+    }
     if command == Some("theme") {
         let value = words.next();
         if words.next().is_some() || value.is_some_and(|v| Theme::parse(v).is_none()) {
@@ -1471,6 +1487,30 @@ mod tests {
         // The composer placeholder follows the language too.
         app.set_lang(Lang::En);
         assert!(render(&mut app, 90, 24).contains("running"));
+    }
+
+    #[test]
+    fn memory_commands_route_without_sending_a_model_turn() {
+        let (session, mut commands) = SessionHandle::test_channel();
+        let mut app = App::new(session);
+        app.input = input::editor("/memory write off", Lang::En);
+        submit(&mut app);
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            SessionCommand::Memory {
+                control: Some(crate::agent::event::MemoryControl::Write(false))
+            }
+        ));
+        app.input = input::editor("/memory", Lang::En);
+        submit(&mut app);
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            SessionCommand::Memory { control: None }
+        ));
+        app.input = input::editor("/memory read maybe", Lang::En);
+        submit(&mut app);
+        assert!(commands.try_recv().is_err());
+        assert_eq!(app.input.lines(), ["/memory read maybe"]);
     }
 
     #[test]

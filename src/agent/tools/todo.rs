@@ -21,6 +21,14 @@ impl Tool for TodoWrite {
          Each item: {content, status: pending|in_progress|done}."
     }
 
+    fn prompt_snippet(&self, lang: crate::i18n::Lang) -> &str {
+        crate::i18n::text(lang, crate::i18n::Key::ToolTodoSnippet)
+    }
+
+    fn prompt_guidelines(&self, lang: crate::i18n::Lang) -> &str {
+        crate::i18n::text(lang, crate::i18n::Key::ToolTodoRules)
+    }
+
     fn schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -53,6 +61,12 @@ impl Tool for TodoWrite {
             };
             if todos.iter().any(|item| item.content.trim().is_empty()) {
                 return ToolResult::err("todo content must not be empty");
+            }
+            if ctx.depth == 0
+                && let Some(journal) = &ctx.background.journal
+                && let Err(error) = journal.trace(crate::agent::work::Trace::Todos(todos.clone()))
+            {
+                return ToolResult::err(format!("failed to persist todos: {error}"));
             }
             ctx.todos.replace(todos);
             let _ = ctx.events.send(UiEvent::Todos(

@@ -16,6 +16,14 @@ impl Tool for Remember {
          Use it for working state, hints to future you, and ephemeral preferences."
     }
 
+    fn prompt_snippet(&self, lang: crate::i18n::Lang) -> &str {
+        crate::i18n::text(lang, crate::i18n::Key::ToolRememberSnippet)
+    }
+
+    fn prompt_guidelines(&self, lang: crate::i18n::Lang) -> &str {
+        crate::i18n::text(lang, crate::i18n::Key::ToolRememberRules)
+    }
+
     fn schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",

@@ -809,7 +809,9 @@ dependencies = [
  "koala-extensions",
  "koala-llm",
  "koala-markdown",
+ "koala-test-support",
  "pulldown-cmark",
+ "ring",
  "serde",
  "serde_json",
  "serde_yml",
@@ -824,6 +826,15 @@ name = "koala-process"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "tokio",
+]
+
+[[package]]
+name = "koala-test-support"
+version = "0.1.0"
+dependencies = [
+ "koala-llm",
+ "serde_json",
  "tokio",
 ]
 

@@ -142,7 +142,31 @@ pub fn read(directory: &Path, id: &str, lang: Lang) -> Result<Vec<Record>, Strin
         )
     };
     // Only regular transcript files inside the configured directory are accepted.
-    let metadata = fs::symlink_metadata(&path).map_err(|e| read_error(&e))?;
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(saved) = super::work::Journal::new(path.with_extension("work")).load()? {
+                return Ok(saved
+                    .trace
+                    .into_iter()
+                    .filter_map(|trace| {
+                        let (role, content) = match trace {
+                            super::work::Trace::User(text) => ("user", text),
+                            super::work::Trace::Text(text) => ("assistant", text),
+                            _ => return None,
+                        };
+                        Some(Record {
+                            ts: String::new(),
+                            role: role.into(),
+                            content,
+                        })
+                    })
+                    .collect());
+            }
+            return Err(read_error(&error));
+        }
+        Err(error) => return Err(read_error(&error)),
+    };
     if !metadata.file_type().is_file() {
         return Err(i18n::fill(lang, Key::SessionNotAFile, &[("id", id)]));
     }
@@ -191,11 +215,14 @@ pub fn list(directory: &Path, current: &str, lang: Lang) -> Result<Vec<SessionVi
         }
     };
     let mut sessions = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for entry in entries {
         let entry = entry
             .map_err(|e| i18n::fill(lang, Key::SessionDirEntryFailed, &[("e", &e.to_string())]))?;
         let path = entry.path();
-        if path.extension().is_none_or(|ext| ext != "jsonl")
+        if path
+            .extension()
+            .is_none_or(|ext| ext != "jsonl" && ext != "work")
             || !entry.file_type().map_err(|e| e.to_string())?.is_file()
         {
             continue;
@@ -203,11 +230,39 @@ pub fn list(directory: &Path, current: &str, lang: Lang) -> Result<Vec<SessionVi
         let Some(id) = path.file_stem().and_then(|v| v.to_str()) else {
             continue;
         };
-        let modified = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .map_err(|e| e.to_string())?;
-        let title = match read(directory, id, lang) {
+        if !seen.insert(id.to_owned()) {
+            continue;
+        }
+        let modified = ["jsonl", "work"]
+            .into_iter()
+            .filter_map(|extension| {
+                fs::symlink_metadata(path.with_extension(extension))
+                    .ok()
+                    .filter(|metadata| metadata.is_file())
+                    .and_then(|metadata| metadata.modified().ok())
+            })
+            .max()
+            .ok_or_else(|| "session metadata unavailable".to_owned())?;
+        let title_records = match super::work::Journal::new(path.with_extension("work")).load() {
+            Ok(Some(saved)) if !saved.trace.is_empty() => Ok(saved
+                .trace
+                .into_iter()
+                .filter_map(|trace| {
+                    if let super::work::Trace::User(content) = trace {
+                        Some(Record {
+                            ts: String::new(),
+                            role: "user".into(),
+                            content,
+                        })
+                    } else {
+                        None
+                    }
+                })
+                .collect()),
+            Ok(_) => read(directory, id, lang),
+            Err(error) => Err(error),
+        };
+        let title = match title_records {
             Ok(records) => records
                 .iter()
                 .find(|r| r.role == "user")

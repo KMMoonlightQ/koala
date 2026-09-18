@@ -54,9 +54,24 @@ pub async fn distill_session(
     if slug.is_empty() {
         return Err(DistillError::NoMarkdown);
     }
-    let path = format!("daily/{today}/{slug}.md");
-    store.write_file(&path, markdown_text)?;
-    Ok(path)
+    for suffix in 1u64.. {
+        let name = if suffix == 1 {
+            slug.clone()
+        } else {
+            format!("{slug}-{suffix}")
+        };
+        let path = format!("daily/{today}/{name}.md");
+        match store.create_file(&path, markdown_text) {
+            Ok(()) => return Ok(path),
+            Err(MemoryError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::AlreadyExists =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    unreachable!("exhausted all card suffixes")
 }
 
 fn read_transcript(session_path: &Path) -> Result<String, DistillError> {
@@ -130,6 +145,48 @@ pub fn distillation_text(path: &Path, max_bytes: usize) -> std::io::Result<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn same_topic_distillations_preserve_both_sessions() {
+        use crate::test_support::{MockLlm, reply};
+        let root =
+            std::env::temp_dir().join(format!("koala-distill-collision-{}", uuid::Uuid::new_v4()));
+        let mut store = FileStore::open(&root).unwrap();
+        let mock = MockLlm::start(
+            (1..=2)
+                .map(|n| {
+                    reply(Message::assistant(format!(
+                        "---\nname: same-topic\ndescription: test\n---\nunique-fact-{n}\n"
+                    )))
+                })
+                .collect(),
+        )
+        .await;
+        let mut paths = Vec::new();
+        for n in 1..=2 {
+            let session = root.join(format!("session-{n}.jsonl"));
+            std::fs::write(
+                &session,
+                serde_json::json!({"role":"user", "content":format!("fact-{n}")}).to_string(),
+            )
+            .unwrap();
+            paths.push(
+                distill_session(&mock.client, &mut store, &session)
+                    .await
+                    .unwrap(),
+            );
+        }
+        assert_ne!(paths[0], paths[1]);
+        for (n, path) in paths.iter().enumerate() {
+            assert!(
+                store
+                    .read_lines(path, 1, usize::MAX)
+                    .unwrap()
+                    .contains(&format!("unique-fact-{}", n + 1))
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn transcript_projection_tolerates_bad_lines_and_truncates_utf8() {

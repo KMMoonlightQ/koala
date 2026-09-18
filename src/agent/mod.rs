@@ -2,6 +2,7 @@ pub mod agentmem;
 pub mod background;
 pub mod compact;
 pub mod event;
+mod file_io;
 pub mod hooks;
 pub mod permissions;
 pub mod plan;
@@ -14,6 +15,7 @@ pub mod skills;
 pub mod subagent;
 pub mod tools;
 pub mod transcripts;
+pub mod work;
 
 use crate::config::{Config, HooksConfig};
 use crate::i18n::{self, Key, Lang, LangCell};
@@ -110,6 +112,11 @@ impl Agent {
         crate::mcp::load(&cfg.mcp, &mut extensions)
             .await
             .map_err(AgentError::Extension)?;
+        let transcript = transcripts::TranscriptStore::new(cfg.agent.session_dir.clone());
+        let background = BackgroundManager::default().for_session(
+            work::Journal::new(transcript.path().with_extension("work")),
+            Vec::new(),
+        );
         Ok(Self {
             reasoning_efforts: efforts.clone(),
             context_window: selected.context_window.map(|v| v.get()),
@@ -129,8 +136,8 @@ impl Agent {
             agent_memory: AgentMemory::load(cfg.agent.memory_file.clone()),
             skills: Arc::new(Skills::load()),
             todos: TodoList::default(),
-            background: BackgroundManager::default(),
-            transcript: transcripts::TranscriptStore::new(cfg.agent.session_dir.clone()),
+            background,
+            transcript,
             history: Vec::new(),
             plan_mode: false,
             pending_input: None,
@@ -209,7 +216,11 @@ impl Agent {
 
     pub fn restore_session(&mut self, id: &str) -> Result<Vec<transcripts::Record>, String> {
         // Validate the entire file before changing any live session state.
-        let records = self.transcript.restore(id, self.lang())?;
+        let records = transcripts::read(self.transcript.path().parent().unwrap(), id, self.lang())?;
+        let journal =
+            work::Journal::new(self.transcript.path().with_file_name(format!("{id}.work")));
+        let saved = journal.load()?;
+        self.transcript.restore(id, self.lang())?;
         self.history = records
             .iter()
             .map(|r| {
@@ -220,8 +231,15 @@ impl Agent {
                 }
             })
             .collect();
-        self.background = self.background.new_scope();
         self.todos = TodoList::default();
+        let tasks = if let Some(saved) = saved {
+            self.history = saved.messages;
+            self.todos.replace(saved.todos);
+            saved.tasks
+        } else {
+            Vec::new()
+        };
+        self.background = self.background.for_session(journal, tasks);
         self.pending_input = None;
         self.plan_mode = false;
         self.shared
@@ -232,7 +250,10 @@ impl Agent {
 
     pub fn new_session(&mut self) {
         self.transcript.reset();
-        self.background = self.background.new_scope();
+        self.background = self.background.for_session(
+            work::Journal::new(self.transcript.path().with_extension("work")),
+            Vec::new(),
+        );
         self.history.clear();
         self.todos = TodoList::default();
         self.pending_input = None;
@@ -251,6 +272,49 @@ impl Agent {
         &self.skills
     }
 
+    fn initialize_work_trace(&self) -> std::io::Result<()> {
+        let Some(journal) = &self.background.journal else {
+            return Ok(());
+        };
+        if journal
+            .load()
+            .map_err(std::io::Error::other)?
+            .is_some_and(|saved| !saved.trace.is_empty())
+        {
+            return Ok(());
+        }
+        // The display uses original conversation records, even if the saved model
+        // context has already been compacted by an earlier version.
+        let messages = if self.transcript.path().is_file() {
+            transcripts::read(
+                self.transcript.path().parent().unwrap(),
+                self.transcript.id(),
+                self.lang(),
+            )
+            .map_err(std::io::Error::other)?
+            .into_iter()
+            .map(|record| {
+                if record.role == "user" {
+                    Message::user(record.content)
+                } else {
+                    Message::assistant(record.content)
+                }
+            })
+            .collect()
+        } else {
+            self.history.clone()
+        };
+        for message in messages {
+            let content = message.content.unwrap_or_default();
+            journal.trace(if message.role == "user" {
+                work::Trace::User(content)
+            } else {
+                work::Trace::Text(content)
+            })?;
+        }
+        Ok(())
+    }
+
     /// Manual /compact. Returns true when history was compacted.
     pub async fn compact_now(&mut self) -> Result<bool, AgentError> {
         let payload =
@@ -260,8 +324,12 @@ impl Agent {
             .hook(crate::extensions::Stage::BeforeCompact, payload)
             .await
             .map_err(AgentError::Extension)?;
+        self.initialize_work_trace()?;
         let changed = compact::compact(&self.shared.llm, &mut self.history).await?;
         self.shared.extensions.hook(crate::extensions::Stage::AfterCompact, serde_json::json!({"session": self.transcript.id(), "messages": self.history, "changed": changed})).await.map_err(AgentError::Extension)?;
+        if let Some(journal) = &self.background.journal {
+            journal.context(&self.history, &self.todos.items)?;
+        }
         Ok(changed)
     }
 
@@ -270,6 +338,13 @@ impl Agent {
         input: &str,
         events: EventSender,
     ) -> Result<String, AgentError> {
+        self.initialize_work_trace()?;
+        if let Some(journal) = &self.background.journal {
+            journal.trace(work::Trace::User(input.to_owned()))?;
+            let mut messages = self.history.clone();
+            messages.push(Message::user(input));
+            journal.context(&messages, &self.todos.items)?;
+        }
         self.pending_input = Some(input.to_owned());
         if let hooks::HookOutcome::Failed(reason) = hooks::run_all(
             &self.shared.hooks.turn_start,
@@ -282,25 +357,7 @@ impl Agent {
 
         let extension = self.shared.extensions.hook(crate::extensions::Stage::TurnStart,
             serde_json::json!({"session": self.transcript.id(), "input": input, "plan_mode": self.plan_mode, "depth": 0})).await.map_err(AgentError::Extension)?;
-        let mut system = prompt::build_system(
-            &self
-                .agent_memory
-                .content()
-                .map_err(|source| AgentError::Io {
-                    path: self.shared.memory_file.display().to_string(),
-                    source,
-                })?,
-            &self.skills,
-            &self.todos,
-            self.plan_mode,
-            self.lang(),
-        );
-
-        if let Some(context) = extension.context {
-            system.push_str(&context);
-        }
         let mut messages = Vec::with_capacity(self.history.len() + 2);
-        messages.push(Message::system(system));
         messages.extend(self.history.iter().cloned());
         messages.push(Message::user(input));
 
@@ -315,7 +372,14 @@ impl Agent {
                 depth: 0,
                 plan_mode: self.plan_mode,
             };
-            match react::run(&mut ctx, &mut messages, self.shared.max_tool_rounds).await {
+            match react::run(
+                &mut ctx,
+                &mut messages,
+                self.shared.max_tool_rounds,
+                extension.context.as_deref(),
+            )
+            .await
+            {
                 Ok(reply) => reply,
                 Err(error) => {
                     if let Err(reason) = self.shared.extensions.hook(crate::extensions::Stage::TurnEnd,
@@ -327,7 +391,12 @@ impl Agent {
             }
         };
 
-        self.record_turn(input, &reply)?;
+        self.history = messages
+            .into_iter()
+            .filter(|m| m.role != "system")
+            .collect();
+        self.pending_input = None;
+        self.transcript.append_turn(input, &reply)?;
 
         if compact::estimate_chars(&self.history) > self.shared.compact_threshold {
             let _ = events.send(UiEvent::Status(
@@ -368,7 +437,23 @@ impl Agent {
                 progress,
                 i18n::text(self.lang(), Key::InterruptNotice)
             );
-            self.record_turn(&input, &reply)?;
+            if let Some(journal) = &self.background.journal {
+                let saved = journal.load();
+                if let Ok(Some(saved)) = &saved {
+                    self.history = saved.messages.clone();
+                } else {
+                    self.history.push(Message::user(&input));
+                }
+                self.history.push(Message::assistant(&reply));
+                saved.map_err(std::io::Error::other)?;
+                journal.trace(work::Trace::Note(
+                    i18n::text(self.lang(), Key::InterruptNotice).into(),
+                ))?;
+                journal.context(&self.history, &self.todos.items)?;
+                self.transcript.append_turn(&input, &reply)?;
+            } else {
+                self.record_turn(&input, &reply)?;
+            }
         }
         Ok(())
     }
@@ -398,6 +483,150 @@ mod tests {
         cfg.agent.session_dir = root.join("sessions");
         cfg.agent.max_tool_rounds = Some(1);
         (Agent::new(&cfg).await.unwrap(), root)
+    }
+
+    #[tokio::test]
+    async fn first_turn_crash_can_be_listed_restored_and_corruption_preserves_live_state() {
+        let (mut agent, root) = mock_agent("http://localhost:1").await;
+        let id = agent.session_id().to_owned();
+        let journal = agent.background.journal.as_ref().unwrap().clone();
+        journal
+            .trace(work::Trace::User("not finished".into()))
+            .unwrap();
+        journal
+            .context(&[Message::user("not finished")], &[])
+            .unwrap();
+        agent.new_session();
+        assert!(agent.list_sessions().unwrap().iter().any(|s| s.id == id));
+        agent.restore_session(&id).unwrap();
+        assert_eq!(agent.history[0].content.as_deref(), Some("not finished"));
+        let bad = journal.path.with_file_name("broken.work");
+        std::fs::write(bad, "bad record\n").unwrap();
+        assert!(agent.restore_session("broken").is_err());
+        assert_eq!(agent.session_id(), id);
+        assert_eq!(agent.history[0].content.as_deref(), Some("not finished"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_recovers_tool_protocol_and_working_todos() {
+        use crate::test_support::{MockLlm, stream};
+        let mut mock = MockLlm::start(vec![
+            stream(serde_json::json!({"tool_calls": [{"index":0,"id":"todo-call","function":{"name":"todo_write","arguments":r#"{"todos":[{"content":"resume this work","status":"in_progress"}]}"#}}]})),
+            stream(serde_json::json!({"content":"planned"})),
+            stream(serde_json::json!({"content":"continued"})),
+        ]).await;
+        let (mut agent, root) = mock_agent(&mock.url).await;
+        agent.run_turn("work", event::null_events()).await.unwrap();
+        let id = agent.session_id().to_owned();
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.llm.base_url = mock.url.clone();
+        cfg.agent.session_dir = root.join("sessions");
+        cfg.agent.memory_file = root.join("memory.md");
+        drop(agent);
+        let mut agent = Agent::new(&cfg).await.unwrap();
+        agent.restore_session(&id).unwrap();
+        assert_eq!(agent.todos.items.len(), 1, "working todos were lost");
+        assert!(
+            agent
+                .history
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("todo-call")),
+            "tool results were lost"
+        );
+        agent
+            .run_turn("continue", event::null_events())
+            .await
+            .unwrap();
+        mock.request().await;
+        mock.request().await;
+        let request = mock.request().await;
+        assert!(
+            request["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("resume this work")
+        );
+        assert!(
+            request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message["role"] == "tool" && message["tool_call_id"] == "todo-call")
+        );
+        let saved = agent
+            .background
+            .journal
+            .as_ref()
+            .unwrap()
+            .load()
+            .unwrap()
+            .unwrap();
+        assert!(saved.trace.iter().any(|trace| matches!(trace, work::Trace::ToolStart { name, arguments, .. } if name == "todo_write" && arguments.contains("resume this work"))));
+        assert!(saved.trace.iter().any(|trace| matches!(
+            trace,
+            work::Trace::ToolEnd {
+                is_error: false,
+                ..
+            }
+        )));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn prompt_and_tool_definitions_refresh_after_state_changes() {
+        use crate::test_support::{MockLlm, stream};
+        let mut mock = MockLlm::start(vec![
+            stream(serde_json::json!({"tool_calls": [
+                {"index":0,"id":"todo","function":{"name":"todo_write","arguments":serde_json::json!({"todos":[{"content":"LIVE_TODO_MARKER","status":"in_progress"}]}).to_string()}},
+                {"index":1,"id":"memory","function":{"name":"remember","arguments":"{\"text\":\"LIVE_MEMORY_MARKER\"}"}}
+            ]})),
+            stream(serde_json::json!({"content":"done"})),
+            stream(serde_json::json!({"content":"plan"})),
+        ]).await;
+        let (mut agent, root) = mock_agent(&mock.url).await;
+        agent.run_turn("work", event::null_events()).await.unwrap();
+        let initial = mock.request().await;
+        let next = mock.request().await;
+        let system = |request: &serde_json::Value| {
+            request["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert!(!system(&initial).contains("LIVE_TODO_MARKER"));
+        assert!(!system(&initial).contains("LIVE_MEMORY_MARKER"));
+        assert!(system(&next).contains("<todos>\n1. [~] LIVE_TODO_MARKER"));
+        assert!(system(&next).contains("LIVE_MEMORY_MARKER"));
+        for name in ["read", "bash", "edit", "write"] {
+            assert!(system(&initial).contains(&format!("- {name}: ")));
+            assert!(
+                initial["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == name)
+            );
+        }
+        agent.toggle_plan_mode();
+        agent
+            .run_turn("plan only", event::null_events())
+            .await
+            .unwrap();
+        let plan = mock.request().await;
+        assert!(system(&plan).contains("<plan_mode>"));
+        for name in ["bash", "edit", "write", "remember"] {
+            assert!(!system(&plan).contains(&format!("- {name}: ")));
+            assert!(
+                !plan["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|tool| tool["function"]["name"] == name)
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

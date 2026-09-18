@@ -8,7 +8,15 @@ const MAX_SUMMARY_INPUT_BYTES: usize = 20_000;
 pub fn estimate_chars(history: &[Message]) -> usize {
     history
         .iter()
-        .map(|m| m.content.as_deref().unwrap_or("").len())
+        .map(|m| {
+            m.content.as_deref().unwrap_or("").len()
+                + m.tool_calls.as_ref().map_or(0, |calls| {
+                    calls
+                        .iter()
+                        .map(|c| c.function.arguments.len())
+                        .sum::<usize>()
+                })
+        })
         .sum()
 }
 
@@ -20,11 +28,26 @@ pub fn split_point(len: usize) -> Option<usize> {
 /// Replace all but the last KEEP_RECENT messages with an LLM summary.
 /// Returns true when compaction happened. Failure keeps history untouched.
 pub async fn compact(llm: &LlmClient, history: &mut Vec<Message>) -> Result<bool, LlmError> {
-    let Some(split) = split_point(history.len()) else {
+    let Some(mut split) = split_point(history.len()) else {
         return Ok(false);
     };
+    // Keep each assistant tool call and all its results on the same side.
+    while split > 0 && history[split].role == "tool" {
+        split -= 1;
+    }
+    if split == 0 {
+        return Ok(false);
+    }
     let mut transcript = String::new();
     for m in &history[..split] {
+        if let Some(calls) = &m.tool_calls {
+            for call in calls {
+                transcript.push_str(&format!(
+                    "tool call {}: {} {}\n\n",
+                    call.id, call.function.name, call.function.arguments
+                ));
+            }
+        }
         let content = m.content.as_deref().unwrap_or("");
         if content.is_empty() {
             continue;
@@ -75,6 +98,29 @@ pub async fn compact(llm: &LlmClient, history: &mut Vec<Message>) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn compaction_keeps_tool_calls_with_their_results() {
+        let mock = crate::test_support::MockLlm::start(vec![crate::test_support::reply(
+            Message::assistant("summary"),
+        )])
+        .await;
+        let call: Message = serde_json::from_value(serde_json::json!({"role":"assistant","tool_calls":[{"id":"a","type":"function","function":{"name":"read","arguments":"{}"}},{"id":"b","type":"function","function":{"name":"read","arguments":"{}"}}]})).unwrap();
+        let mut history = vec![
+            Message::user("old"),
+            Message::assistant("old reply"),
+            Message::user("work"),
+            call,
+            Message::tool("a", "result a"),
+            Message::tool("b", "result b"),
+            Message::assistant("done"),
+            Message::user("next"),
+        ];
+        assert!(compact(&mock.client, &mut history).await.unwrap());
+        assert!(history[2].tool_calls.is_some());
+        assert_eq!(history[3].tool_call_id.as_deref(), Some("a"));
+        assert_eq!(history[4].tool_call_id.as_deref(), Some("b"));
+    }
 
     #[tokio::test]
     async fn long_unicode_history_is_compacted_without_panicking() {

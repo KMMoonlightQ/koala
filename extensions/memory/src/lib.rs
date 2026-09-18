@@ -6,7 +6,7 @@ pub mod distill;
 pub mod dream;
 pub mod store;
 #[cfg(test)]
-mod test_support;
+use koala_test_support as test_support;
 pub mod tools;
 
 pub use distill::{DistillError, distill_session};

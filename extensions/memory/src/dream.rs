@@ -69,24 +69,29 @@ pub async fn dream(
 ) -> Result<DreamReport, DreamError> {
     let catalog = Catalog::load(store.workspace())?;
     let daily_files = list_daily(store.workspace())?;
-    let changed: Vec<(String, i64)> = daily_files
-        .into_iter()
-        .filter(|(rel, mtime)| catalog.checkpoints.get(rel).is_none_or(|cp| mtime > cp))
-        .collect();
-
+    let mut changed = Vec::new();
+    let mut corpus = String::new();
+    for rel in &daily_files {
+        // Hash the exact snapshot sent to the model, not a later reread after integration.
+        let path = super::store::checked_path(store.workspace(), rel)?;
+        let text = std::fs::read_to_string(&path).map_err(|source| MemoryError::Io {
+            path: path.display().to_string(),
+            source,
+        })?;
+        let digest = ring::digest::digest(&ring::digest::SHA256, text.as_bytes());
+        let fingerprint: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        if catalog.fingerprints.get(rel) != Some(&fingerprint) {
+            corpus.push_str(&format!("--- 文件 {rel} ---\n{text}\n\n"));
+            changed.push((rel.clone(), fingerprint));
+        }
+    }
     let mut report = DreamReport {
-        scanned: changed.len(),
+        scanned: daily_files.len(),
         changed: changed.len(),
         ..Default::default()
     };
     if changed.is_empty() {
         return Ok(report);
-    }
-
-    let mut corpus = String::new();
-    for (rel, _) in &changed {
-        let text = store.read_lines(rel, 1, usize::MAX)?;
-        corpus.push_str(&format!("--- 文件 {rel} ---\n{text}\n\n"));
     }
 
     let units = extract_units(llm, &corpus, max_units).await?;
@@ -109,9 +114,12 @@ pub async fn dream(
             Err(_) => report.failed.push(unit.name.clone()),
         }
     }
-    for (src, mtime) in &changed {
+    for (src, fingerprint) in &changed {
         if sources.get(src.as_str()) == Some(&true) {
-            catalog.checkpoints.insert(src.clone(), *mtime);
+            catalog
+                .fingerprints
+                .insert(src.clone(), fingerprint.clone());
+            catalog.checkpoints.remove(src);
             dirty = true;
         }
     }
@@ -224,33 +232,21 @@ async fn integrate_unit(
     Err(DreamError::Incomplete("tool round limit reached".into()))
 }
 
-/// All `daily/**/*.md` as (workspace-relative path, mtime unix secs).
-fn list_daily(workspace: &Path) -> Result<Vec<(String, i64)>, DreamError> {
-    let mut out = Vec::new();
-    walk(workspace, &workspace.join("daily"), &mut out)?;
-    out.sort();
-    Ok(out)
-}
-
-fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, i64)>) -> Result<(), DreamError> {
+/// All regular `daily/**/*.md` files, sorted by workspace-relative path.
+fn list_daily(workspace: &Path) -> Result<Vec<String>, DreamError> {
     let mut paths = Vec::new();
-    super::store::collect_markdown(dir, &mut paths)?;
+    super::store::collect_markdown(&workspace.join("daily"), &mut paths)?;
+    let mut out = Vec::new();
     for path in paths {
         let rel = path
-            .strip_prefix(root)
+            .strip_prefix(workspace)
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .map_err(|_| MemoryError::InvalidPath(path.display().to_string()))?;
-        let path = super::store::checked_path(root, &rel)?;
-        let mtime = path
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        out.push((rel, mtime));
+        super::store::checked_path(workspace, &rel)?;
+        out.push(rel);
     }
-    Ok(())
+    out.sort();
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -276,6 +272,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn content_changes_with_unchanged_mtime_are_integrated() {
+        use crate::test_support::{MockLlm, reply};
+        let root =
+            std::env::temp_dir().join(format!("koala-dream-content-{}", uuid::Uuid::new_v4()));
+        let mut store = FileStore::open(&root).unwrap();
+        store.write_file("daily/a.md", "original fact").unwrap();
+        let path = root.join("daily/a.md");
+        let mut legacy = Catalog::default();
+        legacy.checkpoints.insert("daily/a.md".into(), i64::MAX);
+        legacy.save(&root).unwrap();
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let script = || {
+            vec![
+                reply(Message::assistant(
+                    serde_json::json!([unit("a")]).to_string(),
+                )),
+                write_reply("digest/wiki/a"),
+                reply(Message::assistant("done")),
+            ]
+        };
+        let mock = MockLlm::start(script()).await;
+        assert_eq!(
+            dream(&mock.client, &mut store, 5)
+                .await
+                .unwrap()
+                .integrated
+                .len(),
+            1
+        );
+        let migrated = Catalog::load(&root).unwrap();
+        assert!(migrated.checkpoints.is_empty());
+        assert_eq!(migrated.fingerprints["daily/a.md"].len(), 64);
+        // Touching metadata alone must not cost another model request.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(modified + std::time::Duration::from_secs(10)),
+            )
+            .unwrap();
+        assert_eq!(dream(&mock.client, &mut store, 5).await.unwrap().changed, 0);
+        store.write_file("daily/a.md", "modified fact").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let mock = MockLlm::start(script()).await;
+        assert_eq!(
+            dream(&mock.client, &mut store, 5)
+                .await
+                .unwrap()
+                .integrated
+                .len(),
+            1
+        );
+        // An unchanged file must not invoke the model again.
+        assert_eq!(dream(&mock.client, &mut store, 5).await.unwrap().changed, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn missing_failed_or_unfinished_writes_do_not_checkpoint() {
         use crate::test_support::{MockLlm, reply};
         for responses in [
@@ -294,7 +355,7 @@ mod tests {
             let report = dream(&mock.client, &mut store, 5).await.unwrap();
             assert!(report.integrated.is_empty());
             assert_eq!(report.failed, ["a"]);
-            assert!(Catalog::load(&root).unwrap().checkpoints.is_empty());
+            assert!(Catalog::load(&root).unwrap().fingerprints.is_empty());
             std::fs::remove_dir_all(root).unwrap();
         }
     }
@@ -317,7 +378,7 @@ mod tests {
         let report = dream(&mock.client, &mut store, 5).await.unwrap();
         assert_eq!(report.integrated, ["digest/wiki/existing.md"]);
         assert_eq!(report.failed, ["b"]);
-        assert!(Catalog::load(&root).unwrap().checkpoints.is_empty());
+        assert!(Catalog::load(&root).unwrap().fingerprints.is_empty());
         let retry = MockLlm::start(vec![
             reply(Message::assistant(
                 serde_json::json!([unit("a"), unit("b")]).to_string(),
@@ -334,7 +395,7 @@ mod tests {
         assert!(
             Catalog::load(&root)
                 .unwrap()
-                .checkpoints
+                .fingerprints
                 .contains_key("daily/a.md")
         );
         std::fs::remove_dir_all(root).unwrap();
@@ -357,9 +418,8 @@ mod tests {
         fs::write(dir.join("daily/2026-09-17.md"), "index").unwrap();
         fs::write(dir.join("daily/skip.txt"), "no").unwrap();
         let files = list_daily(&dir).unwrap();
-        let rels: Vec<&str> = files.iter().map(|(r, _)| r.as_str()).collect();
+        let rels: Vec<&str> = files.iter().map(String::as_str).collect();
         assert_eq!(rels, vec!["daily/2026-09-17.md", "daily/2026-09-17/a.md"]);
-        assert!(files.iter().all(|(_, m)| *m > 0));
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -360,6 +360,42 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
                 &[("id", &id)],
             )));
         }
+        UiEvent::WorkRestored(trace) => {
+            use crate::agent::work::Trace;
+            app.transcript.reset();
+            for item in trace {
+                match item {
+                    Trace::User(text) => app.push(EntryKind::User(text)),
+                    Trace::Text(text) => app.transcript.append_text(text),
+                    Trace::ToolStart {
+                        id,
+                        name,
+                        summary,
+                        arguments,
+                    } => app.transcript.start_tool(id, name, summary, arguments),
+                    Trace::ToolEnd {
+                        id,
+                        output,
+                        is_error,
+                        duration_ms,
+                    } => app
+                        .transcript
+                        .finish_tool(&id, output, is_error, duration_ms),
+                    Trace::Todos(items) => app.transcript.set_todos(
+                        items
+                            .iter()
+                            .map(crate::agent::event::TodoView::from)
+                            .collect(),
+                    ),
+                    Trace::Note(text) => app.push(EntryKind::Note(text)),
+                }
+            }
+            app.transcript.stop_tools(
+                ToolState::Cancelled,
+                i18n::text(app.lang, Key::NoteToolInterrupted),
+            );
+            app.finish();
+        }
         UiEvent::SessionRestoreFailed(error) => {
             app.restarting = false;
             app.finish();
@@ -827,6 +863,50 @@ mod tests {
     }
 
     #[test]
+    fn work_restore_replays_full_tool_details_todos_and_marks_unfinished_tools() {
+        use crate::agent::plan::{TodoItem, TodoStatus};
+        use crate::agent::work::Trace;
+        let mut app = app();
+        let output = "full result ".repeat(1000);
+        handle_ui_event(
+            &mut app,
+            UiEvent::WorkRestored(vec![
+                Trace::User("work".into()),
+                Trace::Text("checking".into()),
+                Trace::ToolStart {
+                    id: "done".into(),
+                    name: "bash".into(),
+                    summary: "test".into(),
+                    arguments: r#"{"command":"test"}"#.into(),
+                },
+                Trace::ToolEnd {
+                    id: "done".into(),
+                    output: output.clone(),
+                    is_error: false,
+                    duration_ms: 42,
+                },
+                Trace::Todos(vec![TodoItem {
+                    content: "continue work".into(),
+                    status: TodoStatus::InProgress,
+                }]),
+                Trace::ToolStart {
+                    id: "pending".into(),
+                    name: "bash".into(),
+                    summary: "unfinished".into(),
+                    arguments: "{}".into(),
+                },
+            ]),
+        );
+        let entries = app.transcript.entries();
+        assert!(entries.iter().any(|entry| matches!(entry, EntryKind::Tool(tool) if tool.id == "done" && tool.output.as_deref() == Some(&output) && tool.duration_ms == Some(42) && tool.state == ToolState::Succeeded)));
+        assert!(entries.iter().any(|entry| matches!(entry, EntryKind::Tool(tool) if tool.id == "pending" && tool.state == ToolState::Cancelled)));
+        assert!(entries.iter().any(
+            |entry| matches!(entry, EntryKind::Todos(items) if items[0].content == "continue work")
+        ));
+        assert!(!app.busy);
+    }
+
+    #[test]
     fn permission_picker_commands_events_cancel_and_busy_guard() {
         let (session, mut commands) = SessionHandle::test_channel();
         let mut app = test_app(session);
@@ -839,6 +919,7 @@ mod tests {
         let screen = render(&mut app, 110, 24);
         assert!(screen.contains("Ask When Need"));
         assert!(screen.contains("Never Ask"));
+        assert!(screen.contains("Auto Edit"));
         handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(
@@ -861,6 +942,11 @@ mod tests {
         assert!(!handle_command(&mut app, "permissions typo"));
         assert!(!handle_command(&mut app, "permissions never_ask extra"));
         assert!(commands.try_recv().is_err());
+        assert!(handle_command(&mut app, "permissions auto_edit"));
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            SessionCommand::SetPermissionMode(PermissionMode::AutoEdit)
+        ));
         app.input = input::editor("/permissions never_ask", Lang::Zh);
         app.busy = true;
         submit(&mut app);
@@ -966,6 +1052,7 @@ mod tests {
         for (mode, color) in [
             (PermissionMode::Normal, theme::TEXT),
             (PermissionMode::AskWhenNeed, theme::WARNING),
+            (PermissionMode::AutoEdit, theme::WARNING),
             (PermissionMode::NeverAsk, theme::ERROR),
         ] {
             let mut app = app();
@@ -1540,6 +1627,7 @@ mod tests {
             assert!(!line.contains('Z'), "transcript leaks beside modal: {line}");
         }
         assert!(screen.contains("Never Ask"));
+        assert!(screen.contains("Auto Edit"));
         assert!(screen.contains("draft"));
         assert!(
             lines[..top.saturating_sub(1)]

@@ -71,16 +71,23 @@ pub enum PermissionMode {
     #[default]
     Normal,
     AskWhenNeed,
+    AutoEdit,
     NeverAsk,
 }
 
 impl PermissionMode {
-    pub const ALL: [Self; 3] = [Self::Normal, Self::AskWhenNeed, Self::NeverAsk];
+    pub const ALL: [Self; 4] = [
+        Self::Normal,
+        Self::AskWhenNeed,
+        Self::AutoEdit,
+        Self::NeverAsk,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Normal => "Normal",
             Self::AskWhenNeed => "Ask When Need",
+            Self::AutoEdit => "Auto Edit",
             Self::NeverAsk => "Never Ask",
         }
     }
@@ -89,6 +96,7 @@ impl PermissionMode {
         match self {
             Self::Normal => i18n::text(lang, Key::PermNormalDesc),
             Self::AskWhenNeed => i18n::text(lang, Key::PermAskDesc),
+            Self::AutoEdit => i18n::text(lang, Key::PermAutoEditDesc),
             Self::NeverAsk => i18n::text(lang, Key::PermNeverDesc),
         }
     }
@@ -97,6 +105,7 @@ impl PermissionMode {
         match value {
             "normal" => Some(Self::Normal),
             "ask_when_need" => Some(Self::AskWhenNeed),
+            "auto_edit" => Some(Self::AutoEdit),
             "never_ask" => Some(Self::NeverAsk),
             _ => None,
         }
@@ -107,7 +116,7 @@ impl PermissionMode {
 #[serde(default, deny_unknown_fields)]
 pub struct PermissionsConfig {
     pub mode: PermissionMode,
-    /// Explicit trusted tools in Ask When Need only.
+    /// Explicit trusted tools in Ask When Need and Auto Edit.
     pub allow: Vec<String>,
     pub deny: Vec<String>,
 }
@@ -486,11 +495,13 @@ max_tool_rounds = 2
         for (name, mode) in [
             ("normal", PermissionMode::Normal),
             ("ask_when_need", PermissionMode::AskWhenNeed),
+            ("auto_edit", PermissionMode::AutoEdit),
             ("never_ask", PermissionMode::NeverAsk),
         ] {
             let cfg: Config =
                 toml::from_str(&format!("[permissions]\nmode = \"{name}\"\n")).unwrap();
             assert_eq!(cfg.permissions.mode, mode);
+            assert_eq!(PermissionMode::parse(name), Some(mode));
         }
         assert!(toml::from_str::<Config>("[permissions]\nmode = \"typo\"").is_err());
         assert!(toml::from_str::<Config>("[permissions]\ndefault = \"deny\"").is_err());

@@ -13,6 +13,14 @@ impl Tool for SkillTool {
         "Load the full instructions of a skill listed in the system prompt by name."
     }
 
+    fn prompt_snippet(&self, lang: crate::i18n::Lang) -> &str {
+        crate::i18n::text(lang, crate::i18n::Key::ToolSkillSnippet)
+    }
+
+    fn prompt_guidelines(&self, lang: crate::i18n::Lang) -> &str {
+        crate::i18n::text(lang, crate::i18n::Key::ToolSkillRules)
+    }
+
     fn schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -33,7 +41,11 @@ impl Tool for SkillTool {
                 return ToolResult::err("name must be a string");
             };
             match ctx.skills.get(name) {
-                Some(skill) => ToolResult::ok(skill.body.clone()),
+                Some(skill) => ToolResult::ok(format!(
+                    "Skill file: {}\n\n{}",
+                    skill.path.display(),
+                    skill.body
+                )),
                 None => ToolResult::err(format!("unknown skill: {name}")),
             }
         })

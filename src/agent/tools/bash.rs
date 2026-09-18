@@ -1,4 +1,3 @@
-use super::super::event::UiEvent;
 use super::{Tool, ToolContext, ToolResult};
 use std::future::Future;
 use std::pin::Pin;
@@ -22,6 +21,14 @@ impl Tool for Bash {
     fn description(&self) -> &str {
         "Run a shell command and return stdout+stderr (truncated). \
          Set background=true for long-running commands; completion is reported back."
+    }
+
+    fn prompt_snippet(&self, lang: crate::i18n::Lang) -> &str {
+        crate::i18n::text(lang, crate::i18n::Key::ToolBashSnippet)
+    }
+
+    fn prompt_guidelines(&self, lang: crate::i18n::Lang) -> &str {
+        crate::i18n::text(lang, crate::i18n::Key::ToolBashRules)
     }
 
     fn schema(&self) -> serde_json::Value {
@@ -56,21 +63,13 @@ impl Tool for Bash {
             if background {
                 let id = ctx.background.register("bash", &command);
                 let bg = ctx.background.clone();
-                let events = ctx.events.clone();
                 let handle = tokio::spawn(async move {
                     let outcome = run_command(&command, Duration::from_secs(3600)).await;
                     let (success, output) = match outcome {
                         Ok(o) => (o.success, o.text),
                         Err(e) => (false, e),
                     };
-                    if !bg.finish(id, success, output.clone()) {
-                        return;
-                    }
-                    let mark = if success { "✓" } else { "✗" };
-                    let _ = events.send(UiEvent::Note(format!(
-                        "{mark} #{id} bash: {command}\n{}",
-                        super::result_preview(&output)
-                    )));
+                    bg.finish(id, success, output);
                 });
                 ctx.background.attach(id, handle);
                 return ToolResult::ok(format!("background task #{id} started"));

@@ -8,4 +8,4 @@ pub mod mcp;
 pub mod tui;
 
 #[cfg(test)]
-mod test_support;
+use koala_test_support as test_support;

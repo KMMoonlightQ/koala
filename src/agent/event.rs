@@ -33,7 +33,7 @@ pub enum SessionCommand {
     SetLang(Lang),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TaskState {
     Running,
     Stopping,
@@ -57,7 +57,7 @@ impl TaskState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TaskView {
     pub id: usize,
     pub kind: String,
@@ -113,6 +113,7 @@ pub enum UiEvent {
         id: String,
         records: Vec<super::transcripts::Record>,
     },
+    WorkRestored(Vec<super::work::Trace>),
     SessionRestoreFailed(String),
     PlanMode(bool),
     PermissionMode(crate::config::PermissionMode),
@@ -160,6 +161,7 @@ impl std::fmt::Debug for UiEvent {
             UiEvent::Sessions(items) => write!(f, "Sessions({} items)", items.len()),
             UiEvent::SessionRestored { id, .. } => write!(f, "SessionRestored({id})"),
             UiEvent::SessionRestoreFailed(error) => write!(f, "SessionRestoreFailed({error})"),
+            UiEvent::WorkRestored(_) => write!(f, "WorkRestored"),
             UiEvent::SessionReset => write!(f, "SessionReset"),
             UiEvent::PermissionMode(mode) => write!(f, "PermissionMode({mode:?})"),
             UiEvent::PlanMode(on) => write!(f, "PlanMode({on})"),

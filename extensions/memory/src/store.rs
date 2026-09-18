@@ -134,6 +134,29 @@ impl FileStore {
         self.index_file(rel)
     }
 
+    /// Reserve a new card atomically; a competing writer cannot be overwritten.
+    pub fn create_file(&mut self, rel: &str, content: &str) -> Result<(), MemoryError> {
+        use std::io::Write;
+        let abs = checked_path(&self.workspace, rel)?;
+        if let Some(parent) = abs.parent() {
+            fs::create_dir_all(parent).map_err(io_err(parent))?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&abs)
+            .map_err(io_err(&abs))?;
+        if let Err(error) = file
+            .write_all(content.as_bytes())
+            .and_then(|_| file.sync_all())
+        {
+            drop(file);
+            let _ = fs::remove_file(&abs);
+            return Err(io_err(&abs)(error));
+        }
+        self.index_file(rel)
+    }
+
     pub fn search(&self, query: &str, limit: usize) -> Vec<SearchHit> {
         let tokens = tokenize(query);
         self.bm25
@@ -309,11 +332,14 @@ pub(super) fn collect_markdown(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(),
     Ok(())
 }
 
-/// dream checkpoint: for each processed file, the mtime (unix secs) it was processed at.
+/// Content fingerprints of successfully integrated daily cards. Legacy mtimes are
+/// accepted on load, but cannot prove content equality and are reprocessed once.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Catalog {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub checkpoints: HashMap<String, i64>,
+    #[serde(default)]
+    pub fingerprints: HashMap<String, String>,
 }
 
 impl Catalog {

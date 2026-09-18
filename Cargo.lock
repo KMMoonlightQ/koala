@@ -976,6 +976,7 @@ dependencies = [
  "koala-llm",
  "koala-markdown",
  "koala-process",
+ "koala-test-support",
  "pulldown-cmark",
  "ratatui",
  "reqwest",
@@ -1037,6 +1038,15 @@ name = "koala-process"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "tokio",
+]
+
+[[package]]
+name = "koala-test-support"
+version = "0.1.0"
+dependencies = [
+ "koala-llm",
+ "serde_json",
  "tokio",
 ]
 

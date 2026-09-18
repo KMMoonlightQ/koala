@@ -51,7 +51,7 @@ pub(super) fn content_height(app: &App) -> usize {
     match &app.panel {
         Some(Panel::Sessions { .. }) => (app.sessions.len() * 2).clamp(1, 16),
         Some(Panel::Theme { .. }) => super::Theme::ALL.len(),
-        Some(Panel::Permissions { .. }) => 3,
+        Some(Panel::Permissions { .. }) => super::PermissionMode::ALL.len(),
         Some(Panel::Model { .. }) => app.models.len(),
         Some(Panel::Effort { .. }) => app.reasoning_efforts.len(),
         Some(Panel::Todos { .. }) => todos(app).len().clamp(1, 16),

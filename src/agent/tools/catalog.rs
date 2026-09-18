@@ -1,5 +1,5 @@
 //! One tool directory for definitions, capabilities and execution ownership.
-use super::{Tool, ToolContext, ToolResult, bash, remember, skill, task, todo};
+use super::{Tool, ToolContext, ToolResult, bash, files, remember, skill, task, todo};
 use crate::agent::permissions::{Permissions, Policy};
 use crate::extensions::{Extension, Extensions};
 use serde_json::Value;
@@ -9,6 +9,7 @@ use std::sync::Arc;
 enum Approval {
     Always,
     Shell,
+    WorkspaceEdit,
     Ask,
 }
 
@@ -34,6 +35,30 @@ struct Builtin {
 // Names, capabilities and visibility come from the same lightweight declarations.
 static BUILTINS: &[Builtin] = &[
     Builtin {
+        tool: &files::Read,
+        plan_allowed: true,
+        approval: Approval::Always,
+        root_only: false,
+    },
+    Builtin {
+        tool: &bash::Bash,
+        plan_allowed: false,
+        approval: Approval::Shell,
+        root_only: false,
+    },
+    Builtin {
+        tool: &files::Edit,
+        plan_allowed: false,
+        approval: Approval::WorkspaceEdit,
+        root_only: false,
+    },
+    Builtin {
+        tool: &files::Write,
+        plan_allowed: false,
+        approval: Approval::WorkspaceEdit,
+        root_only: false,
+    },
+    Builtin {
         tool: &remember::Remember,
         plan_allowed: false,
         approval: Approval::Always,
@@ -52,12 +77,6 @@ static BUILTINS: &[Builtin] = &[
         root_only: false,
     },
     Builtin {
-        tool: &bash::Bash,
-        plan_allowed: false,
-        approval: Approval::Shell,
-        root_only: false,
-    },
-    Builtin {
         tool: &task::TaskTool,
         plan_allowed: true,
         approval: Approval::Always,
@@ -71,6 +90,7 @@ pub(crate) fn builtin_names() -> impl Iterator<Item = &'static str> {
 
 pub struct ToolCatalog {
     entries: Vec<Entry>,
+    workspace: Option<std::path::PathBuf>,
 }
 
 impl ToolCatalog {
@@ -107,7 +127,12 @@ impl ToolCatalog {
                     }
                 }),
         );
-        Self { entries }
+        Self {
+            entries,
+            workspace: std::env::current_dir()
+                .ok()
+                .and_then(|path| path.canonicalize().ok()),
+        }
     }
 
     fn find(&self, name: &str) -> Option<&Entry> {
@@ -117,8 +142,39 @@ impl ToolCatalog {
     }
 
     pub fn definitions(&self) -> Vec<crate::llm::Tool> {
+        self.definitions_for_mode(false)
+    }
+
+    /// Prompt metadata and API definitions share the same visibility decisions.
+    pub fn prompt_sections(
+        &self,
+        lang: crate::i18n::Lang,
+        plan_mode: bool,
+    ) -> (String, Vec<String>) {
+        let mut tools = Vec::new();
+        let mut rules = Vec::new();
+        for entry in &self.entries {
+            if plan_mode && !entry.plan_allowed {
+                continue;
+            }
+            let (snippet, guidelines) = match &entry.target {
+                Target::Builtin(tool) => (tool.prompt_snippet(lang), tool.prompt_guidelines(lang)),
+                Target::Extension(_) => (entry.definition.function.description.as_str(), ""),
+            };
+            tools.push(format!("- {}: {}", entry.definition.function.name, snippet));
+            for rule in guidelines.lines().map(str::trim).filter(|s| !s.is_empty()) {
+                if !rules.iter().any(|existing| existing == rule) {
+                    rules.push(rule.to_owned());
+                }
+            }
+        }
+        (tools.join("\n"), rules)
+    }
+
+    pub fn definitions_for_mode(&self, plan_mode: bool) -> Vec<crate::llm::Tool> {
         self.entries
             .iter()
+            .filter(|entry| !plan_mode || entry.plan_allowed)
             .map(|entry| entry.definition.clone())
             .collect()
     }
@@ -132,6 +188,14 @@ impl ToolCatalog {
         let automatic = self.find(name).is_some_and(|entry| match entry.approval {
             Approval::Always => true,
             Approval::Ask => false,
+            Approval::WorkspaceEdit => {
+                permissions.mode() == crate::config::PermissionMode::AutoEdit
+                    && self.workspace.as_deref().is_some_and(|root| {
+                        args.get("path")
+                            .and_then(Value::as_str)
+                            .is_some_and(|path| workspace_edit(root, path))
+                    })
+            }
             Approval::Shell => args
                 .get("command")
                 .and_then(Value::as_str)
@@ -157,6 +221,38 @@ impl ToolCatalog {
                 },
                 Err(reason) => ToolResult::err(reason),
             },
+        }
+    }
+}
+
+/// Resolve symlinks in the nearest existing ancestor before allowing new files
+/// or directories. Broken links, traversal through missing parents and errors ask.
+fn workspace_edit(root: &std::path::Path, path: &str) -> bool {
+    let Ok(mut path) = files::resolve_path(path) else {
+        return false;
+    };
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let Ok(mut target) = path.canonicalize() else {
+                    return false;
+                };
+                for component in missing.iter().rev() {
+                    target.push(component);
+                }
+                return target.starts_with(root);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = path.file_name() else {
+                    return false;
+                };
+                missing.push(name.to_owned());
+                if !path.pop() {
+                    return false;
+                }
+            }
+            Err(_) => return false,
         }
     }
 }
@@ -284,6 +380,9 @@ mod tests {
             ..Default::default()
         });
         for (name, args, policy, plan) in [
+            ("read", json!({}), Policy::Allow, true),
+            ("edit", json!({}), Policy::Ask, false),
+            ("write", json!({}), Policy::Ask, false),
             ("remember", json!({}), Policy::Allow, false),
             ("todo_write", json!({}), Policy::Allow, true),
             ("skill", json!({}), Policy::Allow, true),
@@ -311,6 +410,89 @@ mod tests {
         );
         assert!(!child.plan_allowed("task"));
         assert_eq!(child.policy(&permissions, "task", &json!({})), Policy::Ask);
+    }
+
+    #[test]
+    fn auto_edit_limits_mutations_to_resolved_workspace_paths() {
+        let root = std::env::temp_dir().join(format!("koala-permissions-{}", uuid::Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let outside = root.join("workspace-other");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(workspace.join("existing"), "original").unwrap();
+        std::fs::write(outside.join("existing"), "original").unwrap();
+        let mut extensions = Extensions::default();
+        extensions.register(Arc::new(Echo)).unwrap();
+        let mut catalog = ToolCatalog::build(0, &extensions);
+        catalog.workspace = Some(workspace.canonicalize().unwrap());
+        let permissions = Permissions::new(&PermissionsConfig {
+            mode: PermissionMode::AutoEdit,
+            ..Default::default()
+        });
+        let policy = |name: &str, path: std::path::PathBuf| {
+            catalog.policy(&permissions, name, &json!({"path": path}))
+        };
+        for name in ["edit", "write"] {
+            assert_eq!(policy(name, workspace.join("existing")), Policy::Allow);
+            assert_eq!(policy(name, workspace.join("new")), Policy::Allow);
+            assert_eq!(policy(name, outside.join("new")), Policy::Ask);
+            assert_eq!(
+                policy(name, workspace.join("../workspace-other/existing")),
+                Policy::Ask
+            );
+            assert_eq!(policy(name, workspace.join("missing/new")), Policy::Allow);
+            assert_eq!(catalog.policy(&permissions, name, &json!({})), Policy::Ask);
+            assert_eq!(
+                catalog.policy(&permissions, name, &json!({"path":""})),
+                Policy::Ask
+            );
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, workspace.join("linked-dir")).unwrap();
+            std::os::unix::fs::symlink(outside.join("existing"), workspace.join("linked-file"))
+                .unwrap();
+            std::os::unix::fs::symlink(outside.join("missing"), workspace.join("dangling"))
+                .unwrap();
+            std::os::unix::fs::symlink(workspace.join("existing"), workspace.join("internal"))
+                .unwrap();
+            for path in ["linked-dir/new", "linked-file", "dangling"] {
+                assert_eq!(policy("write", workspace.join(path)), Policy::Ask, "{path}");
+            }
+            assert_eq!(policy("edit", workspace.join("internal")), Policy::Allow);
+        }
+        for (name, args, expected) in [
+            ("bash", json!({"command":"ls"}), Policy::Allow),
+            ("bash", json!({"command":"cargo test"}), Policy::Ask),
+            ("bash", json!({"command":"rm file"}), Policy::Ask),
+            ("echo", json!({}), Policy::Allow),
+            ("save", json!({}), Policy::Ask),
+            ("unknown", json!({}), Policy::Ask),
+        ] {
+            assert_eq!(catalog.policy(&permissions, name, &args), expected);
+        }
+        permissions.set_mode(PermissionMode::AskWhenNeed);
+        assert_eq!(policy("edit", workspace.join("existing")), Policy::Ask);
+        let denied = Permissions::new(&PermissionsConfig {
+            mode: PermissionMode::AutoEdit,
+            deny: vec!["write".into()],
+            ..Default::default()
+        });
+        assert_eq!(
+            catalog.policy(&denied, "write", &json!({"path":workspace.join("new")})),
+            Policy::Deny
+        );
+        catalog.workspace = None;
+        permissions.set_mode(PermissionMode::AutoEdit);
+        assert_eq!(
+            catalog.policy(
+                &permissions,
+                "write",
+                &json!({"path":workspace.join("new")})
+            ),
+            Policy::Ask
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

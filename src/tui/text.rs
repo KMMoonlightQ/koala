@@ -83,15 +83,11 @@ pub fn prefixed_styled(
 }
 
 pub fn prefixed(lines: Vec<Line<'static>>, first: &str, rest: &str) -> Vec<Line<'static>> {
-    lines
-        .into_iter()
-        .enumerate()
-        .map(|(i, mut line)| {
-            line.spans
-                .insert(0, Span::raw(if i == 0 { first } else { rest }.to_owned()));
-            line
-        })
-        .collect()
+    prefixed_styled(
+        lines,
+        Span::raw(first.to_owned()),
+        Span::raw(rest.to_owned()),
+    )
 }
 
 #[cfg(test)]

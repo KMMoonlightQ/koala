@@ -155,7 +155,9 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
 fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
     let permission_style = match app.permission_mode {
         crate::config::PermissionMode::Normal => theme::text(),
-        crate::config::PermissionMode::AskWhenNeed => theme::warning(),
+        crate::config::PermissionMode::AskWhenNeed | crate::config::PermissionMode::AutoEdit => {
+            theme::warning()
+        }
         crate::config::PermissionMode::NeverAsk => theme::error(),
     };
     let mut spans = vec![

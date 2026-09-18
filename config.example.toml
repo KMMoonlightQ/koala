@@ -35,11 +35,11 @@ subagent_max_rounds = "unlimited"
 session_dir = ".koala/session"              # 会话转录目录：通用 JSONL 会话转录
 # memory_file = "..."                    # Agent 私有记忆，默认 <config dir>/koala/memory.md
 
-# 权限等级：normal / ask_when_need / never_ask
+# 权限等级：normal / ask_when_need / auto_edit / never_ask
 # 对话内 /permissions 切换；方向键选择，Enter 确认，Esc 取消
 [permissions]
 mode = "normal"
-# allow 仅在 ask_when_need 下自动放行指定工具；deny 优先。
+# allow 在 ask_when_need / auto_edit 下自动放行指定工具；deny 优先。
 # never_ask 自动放行全部工具，不应用 allow/deny。
 allow = []
 deny = []

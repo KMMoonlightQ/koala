@@ -18,6 +18,7 @@ Agent 的依赖图不包含 memory 包，删除 `extensions/memory/` 也能构�
 - [会话恢复](#会话恢复)、[工具权限](#工具权限)与[模型和思考档位](#模型和思考档位)
 - [快捷键与输入](#快捷键与输入)、[后台任务](#后台任务)与[对话界面](#对话界面)
 - [Agent 架构](#agent-架构)
+- [文件工具与系统提示词](#文件工具与系统提示词)
 - [MCP 服务器](#mcp-服务器)
 - [Extension 开发与安装](#extension-开发与安装)
 - [开发](#开发)
@@ -124,6 +125,9 @@ koala-memory search "所有权" -k 5             # BM25 检索，默认返回最
 koala-memory read digest/wiki/ownership.md --start 1 --end 20
 ```
 
+`distill` 遇到同一天的同名卡片时自动添加 `-2`、`-3` 等后缀，不覆盖已有记忆。
+`dream` 按内容指纹检测变化；旧版时间戳检查点会在下次成功整合后迁移，首次会重新处理对应卡片。
+
 `read` 的路径相对于扩展配置的 `memory.workspace`，需替换为实际存在的文件路径；行号从 1 开始，
 包含起止行。不传 `--start` / `--end` 时读取全文。`search` 输出文件路径、行号范围、
 相关度分数和匹配内容。
@@ -158,7 +162,7 @@ koala-memory read digest/wiki/ownership.md --start 1 --end 20
 | `/plan` | 开关 plan mode |
 | `/compact` | 手动压缩上下文 |
 | `/model` | 打开模型列表，↑↓ 选择、Enter 确认、Esc 取消；也支持 `/model 模型名` |
-| `/permissions` | 选择三级权限；也支持 `/permissions normal`、`/permissions ask_when_need`、`/permissions never_ask` |
+| `/permissions` | 选择四级权限；也支持 `/permissions normal`、`/permissions ask_when_need`、`/permissions auto_edit`、`/permissions never_ask` |
 | `/effort` | 打开思考档位列表，↑↓ 选择、Enter 确认、Esc 取消；也支持 `/effort high` |
 | `/tasks` | 查看后台任务 |
 | `/todos` | 打开完整 Todo 列表 |
@@ -175,8 +179,11 @@ koala-memory read digest/wiki/ownership.md --start 1 --end 20
 显示首条用户消息、更新时间、会话 ID，并标记当前会话。Enter 恢复历史对话到界面和模型上下文，
 后续消息继续追加到原文件。前台执行期间需先中断，再切换会话。
 
-恢复时权限回到 **Normal**、退出 Plan 模式并清空 Todo，保留当前模型设置；
-会话转录只保存用户消息和 Agent 回复，不能还原完整工具轨迹或重启前的后台任务。
+恢复时权限回到 **Normal**、退出 Plan 模式，保留当前模型设置。新会话在原 `.jsonl` 问答转录之外，
+使用同名 `.work` 日志保存工具参数、完整显示输出、调用状态与耗时、模型工具消息、Todo 和后台任务状态。
+恢复后工具详情和 Todo 回到界面，模型也能接续工具上下文；旧版仅含 `.jsonl` 的会话仍可恢复聊天。
+同一进程内切回会话会重新关联仍在运行的后台任务；应用重启后保留已保存的任务结果，原运行中任务显示为已停止，
+并注明执行中断、结果未知，不会自动重跑命令。同一进程中，离开会话期间完成的任务通知会在切回时显示一次。首轮尚未完成的会话也可从工作日志恢复。
 损坏或无法读取的会话会显示错误，当前对话保持不变。切换会话不会重新执行历史操作。
 
 ## 工具权限
@@ -186,11 +193,14 @@ koala-memory read digest/wiki/ownership.md --start 1 --end 20
 | 等级 | 行为 |
 |---|---|
 | Normal | 所有工具调用都需审批，包括读取、Todo 和记忆操作 |
-| Ask When Need | 自动执行 Todo、Agent 私有记忆追加、加载 skill、派生任务及扩展声明的只读工具；危险或无法判定的操作需审批 |
+| Ask When Need | 自动执行 read、Todo、Agent 私有记忆追加、加载 skill、派生任务及扩展声明的只读工具；edit、write 和危险或无法判定的操作需审批 |
+| Auto Edit | 在 Ask When Need 基础上，自动执行当前工作区内的 edit/write；工作区外路径及指向外部的符号链接仍需审批，Shell 和扩展写操作规则不变 |
 | Never Ask | 所有工具调用自动执行，不再请求审批 |
 
 Ask When Need 仅自动放行简单的 `pwd`、`ls`、`cat`、`head`、`tail`、`wc` shell 命令。
 重定向、管道、命令组合、变量展开、脚本执行、网络请求及其他无法确认安全的命令都会请求审批。
+Auto Edit 的工作区为启动目录，路径按真实目标解析（包括符号链接）；支持在工作区内新建子目录和文件。
+显式 `allow` 仍可授权整个工具（如 `write`），包括工作区外操作；`deny` 优先。
 子 Agent 的后续工具调用仍逐次检查相同权限；没有交互通道时，需要审批的操作会被拒绝。
 
 `/permissions` 在前台空闲时切换，影响主 Agent 和已启动子 Agent 的后续工具调用；
@@ -198,9 +208,9 @@ Ask When Need 仅自动放行简单的 `pwd`、`ls`、`cat`、`head`、`tail`、
 
 ```toml
 [permissions]
-mode = "normal" # normal / ask_when_need / never_ask
-allow = []      # 仅 Ask When Need：明确授权可自动执行的工具
-deny = []      # Normal / Ask When Need：直接禁止的工具，优先于 allow
+mode = "normal" # normal / ask_when_need / auto_edit / never_ask
+allow = []      # Ask When Need / Auto Edit：明确授权可自动执行的工具
+deny = []      # Normal / Ask When Need / Auto Edit：直接禁止的工具，优先于 allow
 ```
 
 Never Ask 忽略 `allow` / `deny`；Plan 模式限制和 hook 阻断仍然有效。
@@ -298,12 +308,12 @@ Enter 发送，Shift+Enter、Ctrl+J 或 `\` 后接 Enter 换行。启用终端�
 | 显示转录 | `src/tui/transcript.rs`：集中处理转录事件、工具状态、待办、滚动、详情模式与渲染缓存；界面通过操作与可见行访问它 |
 | 持久化转录 | `src/agent/transcripts.rs`：管理当前转录标识、整轮追加、严格恢复与容错蒸馏；保存失败保留内存回答，避免再次记为中断 |
 | ReAct 循环 | `src/agent/react.rs`：流式思考 → 工具调用 → 观察回填，直到模型不再调工具；可配置工具轮数上限，默认不限 |
-| 工具目录 | `src/agent/tools/catalog.rs`：统一内置与扩展工具的定义、能力和执行归属；自动许可与 plan mode 可用性分别判断。内置 remember / todo_write / skill / task / bash |
+| 工具目录 | `src/agent/tools/catalog.rs`：统一内置与扩展工具的定义、提示词摘要、使用规则、能力和执行归属；自动许可与 plan mode 可用性分别判断。内置 read / bash / edit / write / remember / todo_write / skill / task |
 | Extensions | `crates/extension-api/` 与 `crates/extensions/`：协议及通用运行时；知识库为独立项目 `extensions/memory/` |
 | Hooks | `src/agent/hooks.rs`：PreToolUse（exit 2 阻断）/ PostToolUse / TurnStart / TurnEnd，stdin 收 JSON |
 | 权限控制 | `src/agent/permissions.rs`：三级可切换审批策略；审批区显示操作与参数 |
-| System prompt | `src/agent/prompt.rs`：每次调用前按节组装（基础准则 + agent 私有记忆 + skills 清单 + todos + plan mode） |
-| Plan mode | `/plan` 切换；允许 todo_write / skill / task 及扩展声明的只读工具；写工具被拒绝，子 Agent 继承此限制 |
+| System prompt | `src/agent/prompt.rs`：每次模型请求前组装角色、当前工具及规则、项目指令、skills 目录、实时记忆与 Todo、模式约束和 cwd；支持自定义前缀与追加指令 |
+| Plan mode | `/plan` 切换；仅向模型提供 read / todo_write / skill / task 及扩展声明的只读工具；bash、edit、write、remember 的执行仍会被后端拒绝，子 Agent 继承此限制 |
 | Skills | `./skills/*/SKILL.md` 或 `<config dir>/koala/skills/*/SKILL.md`，清单进 prompt，`skill` 工具按需加载全文 |
 | Context compact | history 超阈值自动压缩（保留最近 4 条，其余 LLM 摘要），也可 `/compact` 手动 |
 | Sub agents | `task` 工具派生子 Agent（独立上下文，不能再派孙 Agent），支持后台运行 |
@@ -315,6 +325,41 @@ Enter 发送，Shift+Enter、Ctrl+J 或 `\` 后接 Enter 换行。启用终端�
 默认均为 `"unlimited"`（不限制轮数），也可设置为非负整数，例如 `50`；`0` 表示禁止执行工具。
 一轮可包含多个工具调用。达到数字上限后仍允许模型生成最终文本；
 若模型继续请求工具，则报告达到上限，不执行额外工具，已完成的操作保留。
+
+## 文件工具与系统提示词
+
+默认提供四个文件与命令工具，主 Agent 和子 Agent 共用相同实现：
+
+| 工具 | 参数和行为 |
+|---|---|
+| `read` | `path`，可选 `offset`（从 1 开始）和 `limit`；读取 UTF-8 文本，每页最多 2,000 行 / 32 KiB，返回继续读取的 offset；不支持图片或二进制文件 |
+| `bash` | `command`，可选 `timeout` 和 `background`；执行命令、搜索文件和运行测试，保留后台任务支持 |
+| `edit` | `path` 与 `edits: [{oldText, newText}]`；所有匹配都基于原文件，必须非空、唯一且互不重叠；全部验证通过才写入 |
+| `write` | `path` 与 `content`；创建或完整覆盖文件，自动创建缺失的父目录 |
+
+文件工具支持绝对路径、相对启动工作目录的路径及 `~/`。edit / write 通过临时文件替换目标，
+避免写入失败时留下截断文件；保留已有文件的权限，并跟随已有符号链接修改目标文件。
+工具仍走统一的 hooks、权限审批和 Plan 模式检查；Ask When Need 下 edit / write 默认需要审批。
+
+系统提示词借鉴 Pi 的分段方式：简短角色说明后依次组合 `<tools>`、`<rules>`、
+`<addendum>`、`<project_context>`、`<skills>`、`<agent_memory>`、`<todos>`、
+`<subagent>`、`<plan_mode>` 和 `<cwd>`，空的可选部分省略。
+工具摘要和使用规则来自工具目录，扩展及 MCP 工具也会列入；Plan 模式隐藏执行工具，
+子 Agent 不包含 task。每次模型请求前刷新记忆与 Todo，工具产生的新状态在下一轮立即可见。
+技能只注入名称、描述和文件位置，通过 skill 工具按需获取正文。
+
+可在当前项目下创建以下文件（全局回退位置为 `<config dir>/koala/`）：
+
+| 文件 | 用途 |
+|---|---|
+| `.koala/SYSTEM.md` | 替换默认角色、tools 和 rules 前缀；API 工具定义及后续上下文、模式约束仍保留 |
+| `.koala/APPEND_SYSTEM.md` | 在默认或自定义前缀后追加指令 |
+
+每种文件都是项目优先、全局回退，不合并两处同名文件；空白 SYSTEM.md 使用默认前缀。
+项目上下文自动加载全局配置目录以及从文件系统根目录到启动工作目录的祖先指令。
+每个目录按 `AGENTS.override.md`、`AGENTS.md`、`CLAUDE.md` 选择第一个存在的文件，
+按全局、祖先、当前目录排列。文件指令在每次 Agent run 开始时重新读取，修改后下一次 run 生效。
+现有 turn_start / before_model 扩展注入分别放入独立上下文段，保留原有扩展行为。
 
 ## MCP 服务器
 
@@ -352,7 +397,7 @@ HTTP token 从指定环境变量读取；不支持自动 OAuth 登录或旧版�
 不兼容或重复的名字会在启动时报告。工具描述、输入 schema、结构化结果、内容块和 `isError`
 均保留；当前模型工具结果通道为文本，图片等内容块保留为 JSON，不直接显示为图片。
 
-MCP 工具沿用现有 hooks、三级权限和 Plan 模式。默认视作非只读工具，
+MCP 工具沿用现有 hooks、四级权限和 Plan 模式。默认视作非只读工具，
 服务器的 `readOnlyHint` 不会自动授予权限。只有 `read_only_tools` 中明确列出的工具
 允许在 Plan 模式使用，并可在 Ask When Need 中自动执行；Normal 仍逐次审批。
 `permissions.allow` / `deny` 使用带 `mcp__` 前缀的完整工具名。

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ring = "0.17.14"
 pulldown-cmark = "0.13.4"
 koala-extension-api = { path = "../../crates/extension-api" }
 koala-llm = { path = "../../crates/llm" }
@@ -19,5 +20,6 @@ tokio = { version = "1.53.1", features = ["full"] }
 toml = "1.1.6"
 
 [dev-dependencies]
+koala-test-support = { path = "../../crates/test-support" }
 koala-extensions = { path = "../../crates/extensions" }
 uuid = { version = "1.26.1", features = ["v4"] }

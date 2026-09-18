@@ -30,6 +30,7 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
     let (ev_tx, ev_rx) = mpsc::unbounded_channel();
     let (mut work_tx, mut work_rx) = mpsc::unbounded_channel();
     let background = agent.background.clone();
+    let mut current_background = background.clone();
     // Shared language cell, cloned out before the agent goes behind its mutex:
     // /lang neither waits for a running turn nor blocks cancellation.
     let shared = agent.shared.clone();
@@ -78,7 +79,11 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                         }
                         SessionCommand::NewSession => {
                             stop(&mut active, &agent, &mut work_rx, &ev_tx, &mut progress, shared.lang.get()).await;
-                            agent.lock().await.new_session();
+                            {
+                                let mut guard = agent.lock().await;
+                                guard.new_session();
+                                current_background = guard.background.clone();
+                            }
                             (work_tx, work_rx) = mpsc::unbounded_channel();
                             progress.clear();
                             let _ = ev_tx.send(UiEvent::SessionReset);
@@ -158,12 +163,27 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                             }
                         }
                         SessionCommand::RestoreSession(id) => {
-                            match agent.lock().await.restore_session(&id) {
+                            let restored = agent.lock().await.restore_session(&id);
+                            match restored {
                                 Ok(records) => {
                                     (work_tx, work_rx) = mpsc::unbounded_channel();
                                     progress.clear();
                                     watch_tasks = false;
                                     let _ = ev_tx.send(UiEvent::SessionRestored { id, records });
+                                    let guard = agent.lock().await;
+                                    current_background = guard.background.clone();
+                                    if let Some(journal) = &guard.background.journal {
+                                        match journal.load() {
+                                            Ok(Some(saved)) if !saved.trace.is_empty() => { let _ = ev_tx.send(UiEvent::WorkRestored(saved.trace)); }
+                                            Ok(Some(_)) => {}
+                                            Ok(None) => {}
+                                            Err(error) => { let _ = ev_tx.send(UiEvent::Error(error)); }
+                                        }
+                                    }
+                                    for text in current_background.take_notifications() { let _ = ev_tx.send(UiEvent::Note(text)); }
+                                    let _ = ev_tx.send(UiEvent::Todos(guard.todos.items.iter().map(super::event::TodoView::from).collect()));
+                                    let _ = ev_tx.send(UiEvent::Tasks(background.list()));
+                                    let _ = ev_tx.send(UiEvent::BackgroundCount(*background_count.borrow()));
                                     let _ = ev_tx.send(UiEvent::PlanMode(false));
                                     let _ = ev_tx.send(UiEvent::PermissionMode(crate::config::PermissionMode::Normal));
                                 }
@@ -227,6 +247,8 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                     }
                 }
                 Ok(()) = background_count.changed() => {
+                    for text in current_background.take_notifications() { let _ = ev_tx.send(UiEvent::Note(text)); }
+                    for error in background.take_errors() { let _ = ev_tx.send(UiEvent::Note(error)); }
                     let _ = ev_tx.send(UiEvent::BackgroundCount(*background_count.borrow_and_update()));
                     if watch_tasks { let _ = ev_tx.send(UiEvent::Tasks(background.list())); }
                 }
@@ -295,6 +317,133 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn legacy_compact_restore_preserves_display_history() {
+        let root =
+            std::env::temp_dir().join(format!("koala-legacy-compact-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("saved.jsonl"),
+            concat!(
+                "{\"ts\":\"then\",\"role\":\"user\",\"content\":\"old question\"}\n",
+                "{\"ts\":\"then\",\"role\":\"assistant\",\"content\":\"old answer\"}\n"
+            ),
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.agent.session_dir = root.clone();
+        cfg.agent.memory_file = root.join("memory.md");
+        let (session, mut events) = spawn(Agent::new(&cfg).await.unwrap());
+        session.send(SessionCommand::RestoreSession("saved".into()));
+        receive_until(&mut events, |e| {
+            matches!(e, UiEvent::SessionRestored { .. })
+        })
+        .await;
+        session.send(SessionCommand::Compact);
+        receive_until(&mut events, |e| matches!(e, UiEvent::Done)).await;
+        session.send(SessionCommand::NewSession);
+        receive_until(&mut events, |e| matches!(e, UiEvent::SessionReset)).await;
+        let work_path = root.join("saved.work");
+        let saved = super::super::work::Journal::new(work_path.clone())
+            .load()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.trace.len(),
+            2,
+            "compact must seed the original display records"
+        );
+        // Also support context-only journals already created by the previous version.
+        let context_only = std::fs::read_to_string(&work_path)
+            .unwrap()
+            .lines()
+            .filter(|line| {
+                serde_json::from_str::<serde_json::Value>(line)
+                    .unwrap()
+                    .get("Context")
+                    .is_some()
+            })
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        std::fs::write(work_path, context_only).unwrap();
+        session.send(SessionCommand::RestoreSession("saved".into()));
+        let mut visible = Vec::new();
+        timeout(Duration::from_secs(3), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    UiEvent::SessionRestored { records, .. } => {
+                        visible = records.into_iter().map(|r| r.content).collect()
+                    }
+                    UiEvent::WorkRestored(trace) => {
+                        visible = trace
+                            .into_iter()
+                            .filter_map(|t| match t {
+                                super::super::work::Trace::User(s)
+                                | super::super::work::Trace::Text(s) => Some(s),
+                                _ => None,
+                            })
+                            .collect()
+                    }
+                    UiEvent::PermissionMode(_) => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(visible, ["old question", "old answer"]);
+        session.send(SessionCommand::Shutdown);
+        while events.recv().await.is_some() {}
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restored_background_task_delivers_completion_notice() {
+        use crate::test_support::{MockLlm, stream};
+        let root = std::env::temp_dir().join(format!("koala-notice-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let release = root.join("release");
+        let command = format!(
+            "while [ ! -f '{}' ]; do sleep 0.01; done; echo FINISHED_AFTER_RESTORE",
+            release.display()
+        );
+        let mock = MockLlm::start(vec![stream(serde_json::json!({"tool_calls":[{"index":0,"id":"bg","function":{"name":"bash","arguments":serde_json::json!({"command":command,"background":true}).to_string()}}]})), stream(serde_json::json!({"content":"started"}))]).await;
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.llm.base_url = mock.url.clone();
+        cfg.agent.session_dir = root.join("sessions");
+        cfg.agent.memory_file = root.join("memory.md");
+        cfg.permissions.mode = crate::config::PermissionMode::NeverAsk;
+        let agent = Agent::new(&cfg).await.unwrap();
+        let id = agent.session_id().to_owned();
+        let background = agent.background.clone();
+        let (session, mut events) = spawn(agent);
+        session.send(SessionCommand::Submit("start".into()));
+        receive_until(&mut events, |e| matches!(e, UiEvent::Done)).await;
+        session.send(SessionCommand::NewSession);
+        receive_until(&mut events, |e| matches!(e, UiEvent::SessionReset)).await;
+        session.send(SessionCommand::RestoreSession(id));
+        receive_until(&mut events, |e| {
+            matches!(e, UiEvent::SessionRestored { .. })
+        })
+        .await;
+        std::fs::write(release, "go").unwrap();
+        let result = timeout(Duration::from_secs(3), async {
+            while let Some(event) = events.recv().await {
+                if matches!(event, UiEvent::Note(ref text) if text.contains("FINISHED_AFTER_RESTORE")) { return; }
+            }
+            panic!("event stream closed");
+        }).await;
+        session.send(SessionCommand::Shutdown);
+        while events.recv().await.is_some() {}
+        for task in background.list() {
+            background.stop(task.id).await;
+        }
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(result.is_ok(), "completion notice was lost after restore");
+    }
 
     #[tokio::test]
     async fn language_switch_during_active_turn_updates_backend_without_interrupting() {

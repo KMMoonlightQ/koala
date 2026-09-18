@@ -1,5 +1,6 @@
 pub mod bash;
 pub mod catalog;
+pub mod files;
 pub mod remember;
 pub mod skill;
 pub mod task;
@@ -124,6 +125,13 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
     fn description(&self) -> &str;
     fn schema(&self) -> serde_json::Value;
+    fn prompt_snippet(&self, _lang: crate::i18n::Lang) -> &str {
+        self.description()
+    }
+    /// One guideline per line, included only when this tool is available.
+    fn prompt_guidelines(&self, _lang: crate::i18n::Lang) -> &str {
+        ""
+    }
     fn execute<'a>(
         &'a self,
         ctx: &'a mut ToolContext,
@@ -144,6 +152,7 @@ pub fn summarize_args(name: &str, arguments: &str) -> String {
     };
     let summary = match name {
         "bash" => pick("command"),
+        "read" | "edit" | "write" => pick("path"),
         "remember" => pick("text"),
         "skill" => pick("name"),
         "task" => pick("description"),
@@ -277,6 +286,22 @@ mod tests {
                 .is_error
         );
         for (name, args) in [
+            (
+                "read",
+                serde_json::json!({"path": "must-not-read", "offset": 0}),
+            ),
+            (
+                "read",
+                serde_json::json!({"path": "must-not-read", "limit": -1}),
+            ),
+            (
+                "edit",
+                serde_json::json!({"path": "must-not-write", "edits": [{"oldText": "x"}]}),
+            ),
+            (
+                "write",
+                serde_json::json!({"path": "must-not-write", "content": 123}),
+            ),
             (
                 "todo_write",
                 serde_json::json!({"todos": [{"content": "bad", "status": "typo"}]}),

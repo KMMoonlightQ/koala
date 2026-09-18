@@ -2,27 +2,61 @@ use super::AgentError;
 use super::event::UiEvent;
 use super::hooks::{self, HookOutcome};
 use super::permissions::Policy;
-use super::retry;
 use super::tools::{self, ToolCatalog, ToolContext};
+use super::{prompt, retry};
 use crate::extensions::Stage;
 use crate::llm::{DeltaAggregator, Message, ToolCall};
 use futures_util::StreamExt;
 
 /// The ReAct loop: stream → tool calls (hooked, permission-checked) → repeat.
-/// `messages` must already contain system + history + the new user message.
+/// `messages` contains history + the new user message; system state is refreshed
+/// before every request, including after tools update memory or todos.
 /// Returns the final assistant text.
 pub async fn run(
     ctx: &mut ToolContext<'_>,
     messages: &mut Vec<Message>,
     max_rounds: Option<usize>,
+    turn_context: Option<&str>,
 ) -> Result<String, AgentError> {
     let registry = ToolCatalog::build(ctx.depth, &ctx.shared.extensions);
-    let tool_defs = registry.definitions();
+    let tool_defs = registry.definitions_for_mode(ctx.plan_mode);
+    let resources = prompt::PromptResources::load(
+        std::env::current_dir()?,
+        dirs::config_dir().map(|path| path.join("koala")).as_deref(),
+    )?;
 
     // Allow one final model response after the last permitted tool round,
     // but never execute tools beyond the configured budget.
     let mut remaining = max_rounds;
     loop {
+        let memory = ctx
+            .agent_memory
+            .content()
+            .map_err(|source| AgentError::Io {
+                path: ctx.shared.memory_file.display().to_string(),
+                source,
+            })?;
+        let mut system = prompt::build_system(prompt::PromptOptions {
+            resources: &resources,
+            catalog: &registry,
+            agent_memory: &memory,
+            skills: ctx.skills,
+            todos: ctx.todos,
+            plan_mode: ctx.plan_mode,
+            depth: ctx.depth,
+            lang: ctx.shared.lang.get(),
+        });
+        if let Some(context) = turn_context {
+            prompt::append_section(&mut system, "turn_context", context);
+        }
+        if messages
+            .first()
+            .is_some_and(|message| message.role == "system")
+        {
+            messages[0] = Message::system(system);
+        } else {
+            messages.insert(0, Message::system(system));
+        }
         let _ = ctx.events.send(UiEvent::Status(
             crate::i18n::text(ctx.shared.lang.get(), crate::i18n::Key::StatusGenerating).into(),
         ));
@@ -33,7 +67,11 @@ pub async fn run(
             let context = ctx.background.result_context();
             if !context.is_empty() {
                 if let Some(system) = request.first_mut().filter(|m| m.role == "system") {
-                    system.content.get_or_insert_default().push_str(&context);
+                    prompt::append_section(
+                        system.content.get_or_insert_default(),
+                        "background_results",
+                        &context,
+                    );
                 } else {
                     request.insert(0, Message::system(context));
                 }
@@ -41,7 +79,11 @@ pub async fn run(
         }
         if let Some(context) = extension.context {
             if let Some(system) = request.first_mut().filter(|m| m.role == "system") {
-                system.content.get_or_insert_default().push_str(&context);
+                prompt::append_section(
+                    system.content.get_or_insert_default(),
+                    "extension_context",
+                    &context,
+                );
             } else {
                 request.insert(0, Message::system(context));
             }
@@ -61,7 +103,7 @@ pub async fn run(
                 )));
             }
             if let Some(content) = &delta.content {
-                let _ = ctx.events.send(UiEvent::Text(content.clone()));
+                emit(ctx, UiEvent::Text(content.clone()))?;
             }
             agg.push(&delta);
         }
@@ -69,6 +111,7 @@ pub async fn run(
         ctx.shared.extensions.hook(Stage::AfterModel,
             serde_json::json!({"message": assistant, "depth": ctx.depth, "plan_mode": ctx.plan_mode})).await.map_err(AgentError::Extension)?;
         messages.push(assistant.clone());
+        checkpoint(ctx, messages)?;
         let calls = assistant.tool_calls.as_deref().unwrap_or_default();
         if calls.is_empty() {
             return Ok(assistant.content.unwrap_or_default());
@@ -82,8 +125,55 @@ pub async fn run(
         for call in calls {
             let result = execute_one(ctx, &registry, call).await;
             messages.push(Message::tool(call.id.clone(), result.content));
+            checkpoint(ctx, messages)?;
         }
     }
+}
+
+fn checkpoint(ctx: &ToolContext<'_>, messages: &[Message]) -> Result<(), AgentError> {
+    if ctx.depth == 0
+        && let Some(journal) = &ctx.background.journal
+    {
+        journal.context(messages, &ctx.todos.items)?;
+    }
+    Ok(())
+}
+
+fn emit(ctx: &ToolContext<'_>, event: UiEvent) -> Result<(), AgentError> {
+    use super::work::Trace;
+    if ctx.depth == 0
+        && let Some(journal) = &ctx.background.journal
+    {
+        let trace = match &event {
+            UiEvent::Text(text) => Trace::Text(text.clone()),
+            UiEvent::ToolStart {
+                id,
+                name,
+                summary,
+                arguments,
+            } => Trace::ToolStart {
+                id: id.clone(),
+                name: name.clone(),
+                summary: summary.clone(),
+                arguments: arguments.clone(),
+            },
+            UiEvent::ToolEnd {
+                id,
+                output,
+                is_error,
+                duration_ms,
+            } => Trace::ToolEnd {
+                id: id.clone(),
+                output: output.clone(),
+                is_error: *is_error,
+                duration_ms: *duration_ms,
+            },
+            _ => unreachable!(),
+        };
+        journal.trace(trace)?;
+    }
+    let _ = ctx.events.send(event);
+    Ok(())
 }
 
 async fn connect_with_retry(
@@ -112,12 +202,17 @@ async fn execute_one(
     // Use a UI-local invocation id: providers may reuse call ids across rounds.
     let id = uuid::Uuid::new_v4().to_string();
     let started = std::time::Instant::now();
-    let _ = ctx.events.send(UiEvent::ToolStart {
-        id: id.clone(),
-        name: call.function.name.clone(),
-        summary: tools::summarize_args(&call.function.name, &call.function.arguments),
-        arguments: call.function.arguments.clone(),
-    });
+    if let Err(error) = emit(
+        ctx,
+        UiEvent::ToolStart {
+            id: id.clone(),
+            name: call.function.name.clone(),
+            summary: tools::summarize_args(&call.function.name, &call.function.arguments),
+            arguments: call.function.arguments.clone(),
+        },
+    ) {
+        return tools::ToolResult::err(error.to_string());
+    }
     let mut result = execute_checked(ctx, registry, call).await;
     match ctx.shared.extensions.hook(Stage::PostToolUse, serde_json::json!({
         "tool": call.function.name, "arguments": serde_json::from_str::<serde_json::Value>(&call.function.arguments).unwrap_or_default(),
@@ -128,16 +223,21 @@ async fn execute_one(
         },
         Err(reason) => { let _ = ctx.events.send(UiEvent::Note(format!("extension: {reason}"))); }
     }
-    let _ = ctx.events.send(UiEvent::ToolEnd {
-        id,
-        output: result
-            .display_content
-            .as_ref()
-            .unwrap_or(&result.content)
-            .clone(),
-        is_error: result.is_error,
-        duration_ms: started.elapsed().as_millis() as u64,
-    });
+    if let Err(error) = emit(
+        ctx,
+        UiEvent::ToolEnd {
+            id,
+            output: result
+                .display_content
+                .as_ref()
+                .unwrap_or(&result.content)
+                .clone(),
+            is_error: result.is_error,
+            duration_ms: started.elapsed().as_millis() as u64,
+        },
+    ) {
+        let _ = ctx.events.send(UiEvent::Error(error.to_string()));
+    }
     result
 }
 
@@ -346,6 +446,95 @@ mod tests {
             assert!(!matches!(event, UiEvent::PermissionRequest { .. }));
         }
         std::fs::remove_file(marker).unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_tools_obey_plan_mode_and_permissions_before_mutation() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .join(format!(".koala-file-policy-{}", uuid::Uuid::new_v4()));
+        let path = root.join("file.txt");
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.permissions.mode = crate::config::PermissionMode::AskWhenNeed;
+        cfg.permissions.deny.push("write".into());
+        let mut agent = Agent::new(&cfg).await.unwrap();
+        let events = crate::agent::event::null_events();
+        let mut ctx = ToolContext {
+            todos: &mut agent.todos,
+            agent_memory: &agent.agent_memory,
+            background: agent.background.clone(),
+            skills: &agent.skills,
+            events: &events,
+            shared: &agent.shared,
+            depth: 1,
+            plan_mode: false,
+        };
+        let registry = ToolCatalog::build(1, &ctx.shared.extensions);
+        let call = |name: &str, args: serde_json::Value| ToolCall {
+            id: "file-call".into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: args.to_string(),
+            },
+        };
+        let write = call(
+            "write",
+            serde_json::json!({"path":path, "content":"original"}),
+        );
+        let blocked = execute_one(&mut ctx, &registry, &write).await;
+        assert!(blocked.content.contains("permission denied"));
+        assert!(!path.exists());
+        ctx.shared
+            .permissions
+            .set_mode(crate::config::PermissionMode::NeverAsk);
+        ctx.plan_mode = true;
+        assert!(
+            execute_one(&mut ctx, &registry, &write)
+                .await
+                .content
+                .contains("plan mode")
+        );
+        assert!(!path.exists());
+        ctx.plan_mode = false;
+        assert!(!execute_one(&mut ctx, &registry, &write).await.is_error);
+        let edit = call(
+            "edit",
+            serde_json::json!({"path":path, "edits":[{"oldText":"original","newText":"updated"}]}),
+        );
+        ctx.plan_mode = true;
+        assert!(
+            execute_one(&mut ctx, &registry, &edit)
+                .await
+                .content
+                .contains("plan mode")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+        ctx.shared
+            .permissions
+            .set_mode(crate::config::PermissionMode::AskWhenNeed);
+        let read = call("read", serde_json::json!({"path":path}));
+        let result = execute_one(&mut ctx, &registry, &read).await;
+        assert!(!result.is_error && result.content.contains("original"));
+        ctx.plan_mode = false;
+        assert!(
+            execute_one(&mut ctx, &registry, &edit)
+                .await
+                .content
+                .contains("user rejected")
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+        ctx.shared
+            .permissions
+            .set_mode(crate::config::PermissionMode::AutoEdit);
+        ctx.plan_mode = true;
+        assert!(execute_one(&mut ctx, &registry, &edit).await.is_error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+        ctx.plan_mode = false;
+        assert!(!execute_one(&mut ctx, &registry, &edit).await.is_error);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "updated");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

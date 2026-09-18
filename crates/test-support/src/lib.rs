@@ -1,5 +1,5 @@
 //! Scripted local HTTP server for exercising real model request/response paths.
-use crate::llm::{LlmClient, Message};
+use koala_llm::{LlmClient, Message};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 

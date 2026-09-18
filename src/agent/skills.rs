@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 pub struct Skill {
     pub name: String,
     pub description: String,
+    pub path: PathBuf,
     pub body: String,
 }
 
@@ -37,13 +38,22 @@ impl Skills {
         self.list.iter().find(|s| s.name == name)
     }
 
-    /// name — description, one per line, for the system prompt.
+    /// name — description, one per line, for the UI.
     pub fn listing(&self) -> String {
         self.list
             .iter()
             .map(|s| format!("- {}: {}", s.name, s.description))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    pub fn prompt_listing(&self) -> String {
+        use super::prompt::escape_xml;
+        let skills = self.list.iter().map(|skill| format!(
+            "<skill>\n<name>{}</name>\n<description>{}</description>\n<location>{}</location>\n</skill>",
+            escape_xml(&skill.name), escape_xml(&skill.description), escape_xml(&skill.path.to_string_lossy())
+        )).collect::<Vec<_>>().join("\n");
+        format!("<available_skills>\n{skills}\n</available_skills>")
     }
 }
 
@@ -71,6 +81,7 @@ fn scan_dir(root: &Path, out: &mut Vec<Skill>) {
         out.push(Skill {
             name,
             description,
+            path: std::fs::canonicalize(&file).unwrap_or(file),
             body: parsed.body,
         });
     }

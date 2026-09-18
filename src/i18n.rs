@@ -168,6 +168,7 @@ keys!(
     UsageLang,
     PermNormalDesc,
     PermAskDesc,
+    PermAutoEditDesc,
     PermNeverDesc,
     TaskRunning,
     TaskStopping,
@@ -233,9 +234,26 @@ keys!(
     SessionDirReadFailed,
     SessionDirEntryFailed,
     SystemBase,
+    SystemRules,
     SystemPlan,
     SkillsSection,
     SubagentSystem,
+    ToolReadSnippet,
+    ToolReadRules,
+    ToolBashSnippet,
+    ToolBashRules,
+    ToolEditSnippet,
+    ToolEditRules,
+    ToolWriteSnippet,
+    ToolWriteRules,
+    ToolRememberSnippet,
+    ToolRememberRules,
+    ToolTodoSnippet,
+    ToolTodoRules,
+    ToolSkillSnippet,
+    ToolSkillRules,
+    ToolTaskSnippet,
+    ToolTaskRules,
 );
 
 /// The mapping table. Placeholders are `{name}`; fill them with [`fill`].
@@ -375,8 +393,8 @@ pub fn text(lang: Lang, key: Key) -> &'static str {
         ),
         InfoLanguageSet => ("Language: {label}", "语言：{label}"),
         UsagePermissions => (
-            "Usage: /permissions [normal|ask_when_need|never_ask]",
-            "用法：/permissions [normal|ask_when_need|never_ask]",
+            "Usage: /permissions [normal|ask_when_need|auto_edit|never_ask]",
+            "用法：/permissions [normal|ask_when_need|auto_edit|never_ask]",
         ),
         UsageModel => ("Usage: /model [model name]", "用法：/model [模型名]"),
         UsageEffort => ("Usage: /effort [level]", "用法：/effort [档位]"),
@@ -386,6 +404,10 @@ pub fn text(lang: Lang, key: Key) -> &'static str {
         PermAskDesc => (
             "Risky or undecidable actions need approval",
             "危险或无法判定的操作需审批",
+        ),
+        PermAutoEditDesc => (
+            "Auto-edit workspace files; other approval rules unchanged",
+            "自动编辑工作区文件，其他审批规则不变",
         ),
         PermNeverDesc => ("All tool calls run automatically", "所有工具调用自动执行"),
 
@@ -547,39 +569,89 @@ pub fn text(lang: Lang, key: Key) -> &'static str {
         ),
 
         SystemBase => (
-            "You are a personal assistant agent with long-term memory and execution \
-             ability, running in the user's terminal.\n\
-             How you work:\n\
-             - `remember` is your private memory file; use it for user preferences, facts \
-             and working state worth keeping.\n\
-             - Break multi-step tasks down with todo_write and keep the progress updated.\n\
-             - Use bash to operate on the local environment; hand self-contained subtasks \
-             to a sub-agent with task.\n\
-             - Answer concisely and directly, in the user's language.",
-            "你是一个带长期记忆和执行能力的个人助手 Agent，运行在用户的终端里。\n\
-             工作方式：\n\
-             - remember 是你的私人记忆文件，用来记值得保留的用户偏好、事实和工作状态。\n\
-             - 多步骤任务先用 todo_write 拆解并持续更新进度。\n\
-             - 需要操作本地环境时用 bash；独立的子任务用 task 派给子 Agent。\n\
-             - 回答简洁直接，用用户的语言。",
+            "You are koala, a personal assistant running in the user's terminal. \
+             Help users investigate questions, work with files, execute tasks, and retain useful knowledge.",
+            "你是 koala，运行在用户终端里的个人助手。帮助用户调研问题、处理文件、执行任务，并保留有用的知识。",
+        ),
+        SystemRules => (
+            "Answer concisely and directly, in the user's language.\n\
+             Show file paths clearly when working with files.\n\
+             Check the results of your work and report what was completed and what remains unresolved.",
+            "用用户的语言简洁、直接地回答。\n\
+             处理文件时清楚标明文件路径。\n\
+             检查工作结果，说明已完成的内容和未解决的问题。",
         ),
         SystemPlan => (
-            "You are in plan mode: investigate and plan only (todo_write / skill / task); \
-             do not modify any file or state. Write the plan into the todo list and wait for \
-             the user to leave plan mode before executing.",
-            "当前处于 plan mode：只做调查和规划（todo_write / skill / task），\
-             不要修改任何文件或状态。把计划写进 todo 列表，等用户退出 plan mode 后再执行。",
+            "You are in plan mode: use the available tools to investigate and plan. \
+             You may update todos and delegate investigation, but must not execute shell commands or modify files. \
+             Sub-agents inherit this restriction. Wait for the user to leave plan mode before execution.",
+            "当前处于 plan mode：使用可用工具调查和规划。可以更新 Todo 或委派调查，\
+             但不能执行 shell 命令或修改文件；子 Agent 继承此限制。等用户退出 plan mode 后再执行。",
         ),
         SkillsSection => (
-            "Available skills; load the full text with the skill tool when needed:\n{listing}",
-            "可用 skill，需要时用 skill 工具加载全文：\n{listing}",
+            "Available skills are listed below. Load a matching skill with the skill tool before following it. \
+             Resolve relative references against the directory containing its SKILL.md.\n{listing}",
+            "以下是可用技能目录。任务匹配时先用 skill 工具加载全文，再按指引执行。\
+             相对引用以 SKILL.md 所在目录为基准。\n{listing}",
         ),
         SubagentSystem => (
-            "You are a sub-agent completing the subtask you were given, on your own. \
-             You may use bash to operate on the environment. Return the result directly \
-             without explaining your process.",
-            "你是子 Agent，独立完成交给你的子任务。可以用 bash 操作环境。\
-             完成后直接给出结果，不要解释过程。",
+            "Complete the assigned subtask using your available tools. \
+             Return the result, relevant evidence, and any unresolved limitations to the parent agent.",
+            "使用当前可用工具完成分配的子任务，向主 Agent 返回结果、相关依据和未解决的限制。",
+        ),
+        ToolReadSnippet => ("Read text files with pagination", "分页读取文本文件"),
+        ToolReadRules => (
+            "Use read to inspect files before editing. Continue with the returned offset when more content is needed.",
+            "修改前先用 read 检查文件；需要更多内容时，按返回的 offset 继续读取。",
+        ),
+        ToolBashSnippet => (
+            "Execute shell commands, optionally in the background",
+            "执行 shell 命令，支持后台运行",
+        ),
+        ToolBashRules => (
+            "Use bash for listing and searching files (ls, rg, find), running programs and tests. Use background=true for long-running work.",
+            "用 bash 列出和搜索文件（ls、rg、find）、运行程序和测试；耗时任务可用 background=true 后台运行。",
+        ),
+        ToolEditSnippet => (
+            "Make precise replacements in an existing file",
+            "精确替换现有文件中的文本",
+        ),
+        ToolEditRules => (
+            "Use edit for targeted changes. Each edits[].oldText must exactly match a unique region of the original file.\n\
+             Batch separate changes to one file in one edit call. Do not overlap replacements; use the smallest unique matching text.",
+            "局部修改用 edit；每个 edits[].oldText 必须精确且唯一地匹配原文件。\n\
+             同一文件的独立修改合并到一次 edit 调用；匹配区域不能重叠，并尽量使用最短的唯一匹配文本。",
+        ),
+        ToolWriteSnippet => ("Create or completely overwrite files", "创建或完整覆盖文件"),
+        ToolWriteRules => (
+            "Use write for new files or complete rewrites only.",
+            "仅在创建文件或完整重写时使用 write。",
+        ),
+        ToolRememberSnippet => ("Append to private agent memory", "追加 Agent 私有记忆"),
+        ToolRememberRules => (
+            "Use remember for user preferences, facts and working state worth keeping; it is separate from the shared knowledge base.",
+            "用 remember 保存值得保留的用户偏好、事实和工作状态；它与共享知识库独立。",
+        ),
+        ToolTodoSnippet => ("Update the working todo list", "更新当前 Todo 列表"),
+        ToolTodoRules => (
+            "Use todo_write to track multi-step work and keep progress current.",
+            "用 todo_write 跟踪多步骤任务，及时更新进度。",
+        ),
+        ToolSkillSnippet => (
+            "Load a skill's full instructions by name",
+            "按名称加载技能全文",
+        ),
+        ToolSkillRules => (
+            "Load relevant skills on demand instead of guessing their instructions.",
+            "需要时加载相关技能，依据实际指引执行。",
+        ),
+        ToolTaskSnippet => (
+            "Delegate a self-contained subtask to a sub-agent",
+            "将独立子任务委派给子 Agent",
+        ),
+        ToolTaskRules => (
+            "Use task for self-contained subtasks; include the context and expected outcome the sub-agent needs.",
+            "用 task 委派独立子任务，并提供所需上下文和预期结果。",
         ),
     };
     match lang {

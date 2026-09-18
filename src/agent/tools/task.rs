@@ -1,5 +1,5 @@
 use super::super::agentmem::AgentMemory;
-use super::super::event::{UiEvent, null_events};
+use super::super::event::null_events;
 use super::super::plan::TodoList;
 use super::super::subagent;
 use super::{Tool, ToolContext, ToolResult};
@@ -25,6 +25,14 @@ impl Tool for TaskTool {
         "Spawn a sub-agent with its own context to work on a self-contained subtask. \
          The sub-agent cannot spawn further sub-agents. \
          Set background=true to run it asynchronously; completion is reported back."
+    }
+
+    fn prompt_snippet(&self, lang: crate::i18n::Lang) -> &str {
+        crate::i18n::text(lang, crate::i18n::Key::ToolTaskSnippet)
+    }
+
+    fn prompt_guidelines(&self, lang: crate::i18n::Lang) -> &str {
+        crate::i18n::text(lang, crate::i18n::Key::ToolTaskRules)
     }
 
     fn schema(&self) -> serde_json::Value {
@@ -61,7 +69,6 @@ impl Tool for TaskTool {
                 let id = ctx.background.register("task", &description);
                 let seed = ctx.subagent_seed();
                 let bg = ctx.background.clone();
-                let events = ctx.events.clone();
                 let memory_file = ctx.shared.memory_file.clone();
                 let handle = tokio::spawn(async move {
                     let outcome = async {
@@ -74,20 +81,10 @@ impl Tool for TaskTool {
                     .await;
                     match outcome {
                         Ok(text) => {
-                            if !bg.finish(id, true, text.clone()) {
-                                return;
-                            }
-                            let _ = events.send(UiEvent::Note(format!(
-                                "✓ #{id} task: {description}\n{}",
-                                super::result_preview(&text)
-                            )));
+                            bg.finish(id, true, text);
                         }
-                        Err(e) => {
-                            if !bg.finish(id, false, e.to_string()) {
-                                return;
-                            }
-                            let _ = events
-                                .send(UiEvent::Note(format!("✗ #{id} task: {description}\n{e}")));
+                        Err(error) => {
+                            bg.finish(id, false, error.to_string());
                         }
                     }
                 });

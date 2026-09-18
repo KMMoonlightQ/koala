@@ -243,6 +243,7 @@ mod tests {
                 turn_start: vec![],
                 turn_end: vec![],
             }),
+            extensions: crate::extensions::Extensions::default(),
             max_tool_rounds: 4,
             max_retries: 0,
             compact_threshold: 1000,

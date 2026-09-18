@@ -19,6 +19,12 @@ struct Cli {
 enum Command {
     /// Start an interactive chat session (default)
     Chat,
+    /// Install a local extension directory (contains extension.toml)
+    ExtensionInstall {
+        source: PathBuf,
+        #[arg(long, default_value = ".kb/extensions")]
+        directory: PathBuf,
+    },
     /// Search the knowledge base with BM25
     Search {
         query: String,
@@ -44,6 +50,14 @@ enum Command {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Chat) {
+        Command::ExtensionInstall { source, directory } => {
+            let manifest =
+                kb_agent::extensions::install(&source, &directory).map_err(anyhow::Error::msg)?;
+            println!(
+                "Installed. Add to [extensions].manifests in config.toml:\n{}",
+                serde_json::to_string(&manifest)?
+            );
+        }
         Command::Chat => tui::run(&config::Config::load()?).await?,
         Command::Distill { session } => {
             let cfg = config::Config::load()?;

@@ -19,6 +19,7 @@ pub struct Config {
     pub agent: AgentConfig,
     pub permissions: PermissionsConfig,
     pub hooks: HooksConfig,
+    pub extensions: ExtensionsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -94,7 +95,7 @@ pub struct AgentConfig {
     pub compact_threshold: usize,
     pub subagent_max_rounds: usize,
     /// Directory where chat transcripts (session jsonl) are appended.
-    /// This directory is the only interface between the agent and the knowledge base.
+    /// Extensions can use the path supplied on successful root turn_end.
     pub session_dir: PathBuf,
     /// Agent-private memory file, injected into the system prompt every turn.
     pub memory_file: PathBuf,
@@ -242,5 +243,23 @@ max_tool_rounds = 2
         let mut cfg: Config = toml::from_str("[llm]\napi_key = \"from-file\"\n").unwrap();
         cfg.apply_env_with(|_| None);
         assert_eq!(cfg.llm.api_key, "from-file");
+    }
+}
+
+/// Extensions are trusted local code. Explicit manifest paths determine order.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ExtensionsConfig {
+    pub memory: bool,
+    pub manifests: Vec<PathBuf>,
+    pub timeout_secs: u64,
+}
+impl Default for ExtensionsConfig {
+    fn default() -> Self {
+        Self {
+            memory: true,
+            manifests: Vec::new(),
+            timeout_secs: 30,
+        }
     }
 }

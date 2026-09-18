@@ -1,6 +1,6 @@
+use crate::extensions::memory::{FileStore, MemoryError};
 use crate::llm::{LlmClient, LlmError, Message};
 use crate::markdown;
-use crate::memory::{FileStore, MemoryError};
 use std::path::Path;
 use thiserror::Error;
 

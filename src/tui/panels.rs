@@ -32,9 +32,7 @@ pub(super) fn content_height(app: &App) -> usize {
             // Sectioned help text plus the command list.
             22 + input::COMMANDS.len()
         }
-        Some(Panel::History { query, .. }) => {
-            2 + app.history.search(query).len().clamp(1, 10)
-        }
+        Some(Panel::History { query, .. }) => 2 + app.history.search(query).len().clamp(1, 10),
         Some(Panel::Tasks { output: false, .. }) => app.tasks.len().clamp(1, 12),
         Some(Panel::Tasks { output: true, .. }) => 14,
         None => 0,
@@ -235,7 +233,10 @@ pub(super) fn draw_menu(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(theme::border())
-        .title(Span::styled(" 命令 · ↑↓ 选择 · Tab 补全 · Enter 执行 ", theme::subtle()));
+        .title(Span::styled(
+            " 命令 · ↑↓ 选择 · Tab 补全 · Enter 执行 ",
+            theme::subtle(),
+        ));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let mut lines = Vec::new();

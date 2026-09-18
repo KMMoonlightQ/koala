@@ -32,3 +32,9 @@ pre_tool_use = []
 post_tool_use = []
 turn_start = []
 turn_end = []
+
+# Extensions are trusted local programs. Loaded in the listed order after memory.
+[extensions]
+memory = true
+manifests = [] # e.g. [".kb/extensions/context-example/extension.toml"]
+timeout_secs = 30

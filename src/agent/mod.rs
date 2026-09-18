@@ -5,7 +5,7 @@ pub mod event;
 pub mod hooks;
 pub mod permissions;
 pub mod plan;
-mod process;
+pub(crate) mod process;
 pub mod prompt;
 pub mod react;
 pub mod retry;
@@ -33,6 +33,8 @@ use tools::ToolContext;
 
 #[derive(Debug, Error)]
 pub enum AgentError {
+    #[error("extension: {0}")]
+    Extension(String),
     #[error(transparent)]
     Llm(#[from] LlmError),
     #[error("io error on {path}: {source}")]
@@ -50,6 +52,7 @@ pub struct SharedState {
     pub llm: LlmClient,
     pub permissions: Permissions,
     pub hooks: Hooks,
+    pub extensions: crate::extensions::Extensions,
     pub max_tool_rounds: usize,
     pub max_retries: usize,
     pub compact_threshold: usize,
@@ -92,6 +95,7 @@ impl Agent {
                 ),
                 permissions: Permissions::new(&cfg.permissions),
                 hooks: Hooks::new(&cfg.hooks),
+                extensions: crate::extensions::load(cfg).map_err(AgentError::Extension)?,
                 max_tool_rounds: cfg.agent.max_tool_rounds,
                 max_retries: cfg.agent.max_retries,
                 compact_threshold: cfg.agent.compact_threshold,
@@ -140,7 +144,15 @@ impl Agent {
 
     /// Manual /compact. Returns true when history was compacted.
     pub async fn compact_now(&mut self) -> Result<bool, AgentError> {
-        Ok(compact::compact(&self.shared.llm, &mut self.history).await?)
+        let payload = serde_json::json!({"session": self.session_id, "messages": self.history});
+        self.shared
+            .extensions
+            .hook(crate::extensions::Stage::BeforeCompact, payload)
+            .await
+            .map_err(AgentError::Extension)?;
+        let changed = compact::compact(&self.shared.llm, &mut self.history).await?;
+        self.shared.extensions.hook(crate::extensions::Stage::AfterCompact, serde_json::json!({"session": self.session_id, "messages": self.history, "changed": changed})).await.map_err(AgentError::Extension)?;
+        Ok(changed)
     }
 
     pub async fn run_turn(
@@ -158,13 +170,18 @@ impl Agent {
             let _ = events.send(UiEvent::Note(format!("hook: {reason}")));
         }
 
-        let system = prompt::build_system(
+        let extension = self.shared.extensions.hook(crate::extensions::Stage::TurnStart,
+            serde_json::json!({"session": self.session_id, "input": input, "plan_mode": self.plan_mode, "depth": 0})).await.map_err(AgentError::Extension)?;
+        let mut system = prompt::build_system(
             &self.agent_memory.content(),
             &self.skills,
             &self.todos,
             self.plan_mode,
         );
 
+        if let Some(context) = extension.context {
+            system.push_str(&context);
+        }
         let mut messages = Vec::with_capacity(self.history.len() + 2);
         messages.push(Message::system(system));
         messages.extend(self.history.iter().cloned());
@@ -181,7 +198,16 @@ impl Agent {
                 depth: 0,
                 plan_mode: self.plan_mode,
             };
-            react::run(&mut ctx, &mut messages, self.shared.max_tool_rounds).await?
+            match react::run(&mut ctx, &mut messages, self.shared.max_tool_rounds).await {
+                Ok(reply) => reply,
+                Err(error) => {
+                    if let Err(reason) = self.shared.extensions.hook(crate::extensions::Stage::TurnEnd,
+                        serde_json::json!({"session": self.session_id, "input": input, "error": error.to_string(), "depth": 0, "plan_mode": self.plan_mode})).await {
+                        let _ = events.send(UiEvent::Note(format!("extension: {reason}")));
+                    }
+                    return Err(error);
+                }
+            }
         };
 
         self.history.push(Message::user(input));
@@ -204,6 +230,10 @@ impl Agent {
         .await
         {
             let _ = events.send(UiEvent::Note(format!("hook: {reason}")));
+        }
+        if let Err(reason) = self.shared.extensions.hook(crate::extensions::Stage::TurnEnd,
+            serde_json::json!({"session": self.session_id, "input": input, "reply": reply, "session_path": self.session_path(), "plan_mode": self.plan_mode, "depth": 0})).await {
+            let _ = events.send(UiEvent::Note(format!("extension: {reason}")));
         }
         Ok(reply)
     }

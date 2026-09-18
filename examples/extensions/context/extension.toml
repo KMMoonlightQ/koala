@@ -1,0 +1,4 @@
+api_version = 1
+name = "context-example"
+command = ["bash", "hook.sh"]
+hooks = ["before_model"]

@@ -2,7 +2,7 @@
 use std::io;
 use tokio::process::{Child, Command};
 
-pub(super) struct ProcessGroup {
+pub(crate) struct ProcessGroup {
     #[cfg(unix)]
     id: u32,
 }
@@ -18,7 +18,7 @@ impl Drop for ProcessGroup {
     }
 }
 
-pub(super) fn spawn(command: &mut Command) -> io::Result<(Child, ProcessGroup)> {
+pub(crate) fn spawn(command: &mut Command) -> io::Result<(Child, ProcessGroup)> {
     command.kill_on_drop(true);
     #[cfg(unix)]
     command.process_group(0);

@@ -246,7 +246,10 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
     } else if app.panel.is_some() {
         ("Esc 返回 · 面板打开期间保留输入草稿", None)
     } else if app.detailed {
-        ("↑↓ / PgUp/PgDn 滚动 · Home/End 首尾 · Esc 返回（保留草稿）", None)
+        (
+            "↑↓ / PgUp/PgDn 滚动 · Home/End 首尾 · Esc 返回（保留草稿）",
+            None,
+        )
     } else if let Some(hint) = &app.hint {
         (hint.as_str(), None)
     } else if app.unread {

@@ -1,9 +1,8 @@
-//! Tool definitions and dispatch for KB-internal LLM processes (dream).
-//! These are not exposed to the interactive agent.
+//! Shared tool definitions for the memory extension and KB consolidation.
 
+use crate::extensions::memory::FileStore;
 use crate::llm::ToolCall;
 use crate::markdown::{self, FrontMatter};
-use crate::memory::FileStore;
 
 const WRITEABLE_PREFIXES: [&str; 2] = ["daily/", "digest/"];
 
@@ -58,15 +57,17 @@ pub fn definitions() -> Vec<crate::llm::Tool> {
 
 /// Execute a memory tool call directly against the store.
 pub fn dispatch(kb: &mut FileStore, call: &ToolCall) -> String {
-    let args: serde_json::Value = match serde_json::from_str(&call.function.arguments) {
-        Ok(v) => v,
-        Err(e) => return format!("invalid arguments: {e}"),
-    };
+    dispatch_result(kb, call).unwrap_or_else(|error| error)
+}
+
+pub fn dispatch_result(kb: &mut FileStore, call: &ToolCall) -> Result<String, String> {
+    let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
+        .map_err(|e| format!("invalid arguments: {e}"))?;
     match call.function.name.as_str() {
-        "memory_search" => exec_search(kb, &args),
+        "memory_search" => Ok(exec_search(kb, &args)),
         "memory_read" => exec_read(kb, &args),
         "memory_write" => exec_write(kb, &args),
-        other => format!("unknown tool: {other}"),
+        other => Err(format!("unknown tool: {other}")),
     }
 }
 
@@ -87,7 +88,7 @@ fn exec_search(kb: &FileStore, args: &serde_json::Value) -> String {
         .join("\n\n")
 }
 
-fn exec_read(kb: &FileStore, args: &serde_json::Value) -> String {
+fn exec_read(kb: &FileStore, args: &serde_json::Value) -> Result<String, String> {
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
     let start = args
         .get("start_line")
@@ -100,13 +101,13 @@ fn exec_read(kb: &FileStore, args: &serde_json::Value) -> String {
         .map(|v| v as usize)
         .unwrap_or(usize::MAX);
     match kb.read_lines(path, start, end) {
-        Ok(text) if text.is_empty() => "empty range".to_string(),
-        Ok(text) => text,
-        Err(e) => format!("read failed: {e}"),
+        Ok(text) if text.is_empty() => Ok("empty range".to_string()),
+        Ok(text) => Ok(text),
+        Err(e) => Err(format!("read failed: {e}")),
     }
 }
 
-fn exec_write(kb: &mut FileStore, args: &serde_json::Value) -> String {
+fn exec_write(kb: &mut FileStore, args: &serde_json::Value) -> Result<String, String> {
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
     let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let description = args
@@ -115,7 +116,7 @@ fn exec_write(kb: &mut FileStore, args: &serde_json::Value) -> String {
         .unwrap_or("");
     let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
     if name.is_empty() || content.is_empty() {
-        return "name and content must not be empty".to_string();
+        return Err("name and content must not be empty".to_string());
     }
     let path = if path.ends_with(".md") {
         path.to_string()
@@ -123,10 +124,10 @@ fn exec_write(kb: &mut FileStore, args: &serde_json::Value) -> String {
         format!("{path}.md")
     };
     if !WRITEABLE_PREFIXES.iter().any(|p| path.starts_with(p)) {
-        return format!(
+        return Err(format!(
             "path must be under one of: {}",
             WRITEABLE_PREFIXES.join(", ")
-        );
+        ));
     }
     let fm = FrontMatter {
         name: Some(name.to_string()),
@@ -135,11 +136,11 @@ fn exec_write(kb: &mut FileStore, args: &serde_json::Value) -> String {
     };
     let rendered = match markdown::render(&fm, content) {
         Ok(r) => r,
-        Err(e) => return format!("render failed: {e}"),
+        Err(e) => return Err(format!("render failed: {e}")),
     };
     match kb.write_file(&path, &rendered) {
-        Ok(()) => format!("written: {path}"),
-        Err(e) => format!("write failed: {e}"),
+        Ok(()) => Ok(format!("written: {path}")),
+        Err(e) => Err(format!("write failed: {e}")),
     }
 }
 

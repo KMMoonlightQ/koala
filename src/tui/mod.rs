@@ -1,5 +1,7 @@
+use crate::config::PermissionMode;
 mod controls;
 mod input;
+mod logo;
 mod markdown;
 mod panels;
 mod text;
@@ -11,6 +13,7 @@ use crate::agent::Agent;
 use crate::agent::event::{SessionCommand, TaskView, UiEvent};
 use crate::agent::session::{self, SessionHandle};
 use crate::config::Config;
+use crate::i18n::{self, Key, Lang};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use ratatui::style::Style;
@@ -23,6 +26,22 @@ use tui_textarea::TextArea;
 use view::draw;
 
 enum Panel {
+    Sessions {
+        selected: usize,
+        loading: bool,
+    },
+    Permissions {
+        selected: usize,
+    },
+    Model {
+        selected: usize,
+    },
+    Effort {
+        selected: usize,
+    },
+    Todos {
+        scroll: usize,
+    },
     Help {
         scroll: usize,
     },
@@ -52,11 +71,19 @@ struct App {
     menu_dismissed: bool,
     panel: Option<Panel>,
     tasks: Vec<TaskView>,
+    sessions: Vec<crate::agent::transcripts::SessionView>,
     tasks_received: Instant,
-    todos_expanded: bool,
     model: String,
+    models: Vec<String>,
+    reasoning_efforts: Vec<String>,
+    reasoning_effort: Option<String>,
+    context_window: Option<u64>,
+    context_used: Option<u64>,
     directory: String,
     plan_mode: bool,
+    permission_mode: PermissionMode,
+    /// Interface language; drives every label and the system prompt.
+    lang: Lang,
     background_count: usize,
     detailed: bool,
     compact_viewport: Option<(usize, bool)>,
@@ -78,9 +105,9 @@ struct App {
     quit: bool,
 }
 
-fn new_input() -> TextArea<'static> {
+fn new_input(lang: Lang) -> TextArea<'static> {
     let mut input = TextArea::default();
-    input.set_placeholder_text("输入消息 · / 命令 · ? 帮助");
+    input.set_placeholder_text(i18n::text(lang, Key::InputPlaceholder));
     input.set_placeholder_style(theme::subtle());
     input.set_cursor_line_style(Style::default());
     input
@@ -95,16 +122,23 @@ impl App {
             menu_dismissed: false,
             panel: None,
             tasks: Vec::new(),
+            sessions: Vec::new(),
             tasks_received: Instant::now(),
-            todos_expanded: true,
             model: String::new(),
+            models: Vec::new(),
+            reasoning_efforts: Vec::new(),
+            reasoning_effort: None,
+            context_window: None,
+            context_used: None,
             directory: String::new(),
             plan_mode: false,
+            permission_mode: PermissionMode::Normal,
+            lang: Lang::default(),
             background_count: 0,
             detailed: false,
             compact_viewport: None,
             rendered: None,
-            input: new_input(),
+            input: new_input(Lang::default()),
             entries: Vec::new(),
             assistant_open: false,
             last_todos: None,
@@ -164,10 +198,23 @@ impl App {
         }
     }
 
+    /// Switch the interface language. Labels are baked into rendered lines, so
+    /// the render cache is dropped; draft, cursor and scroll stay untouched.
+    fn set_lang(&mut self, lang: Lang) {
+        if self.lang == lang {
+            return;
+        }
+        self.lang = lang;
+        self.input
+            .set_placeholder_text(i18n::text(lang, Key::InputPlaceholder));
+        self.rendered = None;
+        self.hint = None;
+    }
+
     fn cancel(&mut self) {
         if self.busy && !self.restarting {
             self.session.send(SessionCommand::Cancel);
-            self.status = "正在中断".into();
+            self.status = i18n::text(self.lang, Key::StatusInterrupting).into();
             self.permission = None;
         }
     }
@@ -176,6 +223,7 @@ impl App {
 pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     let (handle, events) = session::spawn(Agent::new(cfg)?);
     let mut app = App::new(handle);
+    app.set_lang(cfg.lang);
     app.model = cfg.llm.model.clone();
     app.directory = std::env::current_dir()?.display().to_string();
     match input::History::load(
@@ -183,7 +231,11 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
         app.directory.clone(),
     ) {
         Ok(history) => app.history = history,
-        Err(e) => app.push(EntryKind::Note(format!("输入历史读取失败：{e}"))),
+        Err(e) => app.push(EntryKind::Note(i18n::fill(
+            app.lang,
+            Key::NoteHistoryLoadFailed,
+            &[("e", &e.to_string())],
+        ))),
     }
     let mut terminal = ratatui::init();
     let result =
@@ -238,6 +290,7 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
         app.rendered = None;
     }
     match ev {
+        UiEvent::ContextUsage(tokens) => app.context_used = tokens,
         UiEvent::Tasks(tasks) => {
             app.tasks = tasks;
             app.tasks_received = Instant::now();
@@ -247,7 +300,24 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
                 *selected = app.tasks.first().map(|t| t.id);
             }
         }
+        UiEvent::PermissionMode(mode) => app.permission_mode = mode,
         UiEvent::PlanMode(on) => app.plan_mode = on,
+        UiEvent::ModelSettings {
+            model,
+            models,
+            reasoning_efforts,
+            reasoning_effort,
+            context_window,
+        } => {
+            if app.model != model {
+                app.context_used = None;
+            }
+            app.model = model;
+            app.models = models;
+            app.reasoning_efforts = reasoning_efforts;
+            app.reasoning_effort = reasoning_effort;
+            app.context_window = context_window;
+        }
         UiEvent::BackgroundCount(n) => app.background_count = n,
         UiEvent::Status(status) => app.status = status,
         UiEvent::Text(delta) => {
@@ -266,7 +336,7 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
             summary,
             arguments,
         } => {
-            app.status = format!("正在执行 {name}");
+            app.status = i18n::fill(app.lang, Key::StatusRunningTool, &[("name", &name)]);
             app.push(EntryKind::Tool(ToolEntry {
                 id,
                 name,
@@ -297,7 +367,7 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
                 };
                 tool.duration_ms = Some(duration_ms);
             }
-            app.status = "正在处理结果".into();
+            app.status = i18n::text(app.lang, Key::StatusProcessing).into();
             app.unread |= !app.follow;
         }
         UiEvent::Todos(items) => {
@@ -313,7 +383,7 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
         UiEvent::Note(text) => app.push(EntryKind::Note(text)),
         UiEvent::Info(text) => app.push(EntryKind::Info(text)),
         UiEvent::PermissionRequest { text, respond } => {
-            app.status = "等待权限确认".into();
+            app.status = i18n::text(app.lang, Key::StatusAwaitingApproval).into();
             app.permission = Some(PermissionPrompt {
                 text,
                 respond,
@@ -328,15 +398,23 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
                     && tool.state == ToolState::Running
                 {
                     tool.state = ToolState::Cancelled;
-                    tool.output = Some("已中断（已完成的操作不会撤销）".into());
+                    tool.output = Some(i18n::text(app.lang, Key::NoteToolInterrupted).into());
                 }
             }
             app.finish();
             app.push(EntryKind::Note(
-                "已中断，可以继续输入。后台任务仍会继续运行。".into(),
+                i18n::text(app.lang, Key::InfoCancelled).into(),
             ));
         }
-        UiEvent::SessionReset => {
+        UiEvent::Sessions(items) => {
+            app.sessions = items;
+            if let Some(Panel::Sessions { selected, loading }) = &mut app.panel {
+                *selected = 0;
+                *loading = false;
+            }
+        }
+        UiEvent::SessionRestored { id, records } => {
+            app.context_used = None;
             controls::close_panel(app);
             app.entries.clear();
             app.detailed = false;
@@ -349,7 +427,42 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
             app.scroll = 0;
             app.bottom = 0;
             app.hint = None;
-            app.push(EntryKind::Info("新会话已开始".into()));
+            for record in records {
+                app.push(if record.role == "user" {
+                    EntryKind::User(record.content)
+                } else {
+                    EntryKind::Assistant(record.content)
+                });
+            }
+            app.push(EntryKind::Info(i18n::fill(
+                app.lang,
+                Key::InfoSessionRestored,
+                &[("id", &id)],
+            )));
+        }
+        UiEvent::SessionRestoreFailed(error) => {
+            app.restarting = false;
+            app.finish();
+            controls::close_panel(app);
+            app.push(EntryKind::Error(error));
+        }
+        UiEvent::SessionReset => {
+            app.context_used = None;
+            controls::close_panel(app);
+            app.entries.clear();
+            app.detailed = false;
+            app.compact_viewport = None;
+            app.last_todos = None;
+            app.restarting = false;
+            app.finish();
+            app.follow = true;
+            app.unread = false;
+            app.scroll = 0;
+            app.bottom = 0;
+            app.hint = None;
+            app.push(EntryKind::Info(
+                i18n::text(app.lang, Key::InfoNewSession).into(),
+            ));
         }
         UiEvent::Error(err) => {
             app.permission = None;
@@ -400,7 +513,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 if app.busy {
                     app.cancel();
                 } else {
-                    app.input = new_input();
+                    app.input = new_input(app.lang);
                     app.history.reset_navigation();
                 }
                 return;
@@ -434,13 +547,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         if let Some(allow) = decision {
             let prompt = app.permission.take().unwrap();
             let _ = prompt.respond.send(allow);
-            app.status = "正在继续".into();
+            app.status = i18n::text(app.lang, Key::StatusContinuing).into();
             app.push(EntryKind::Note(
-                if allow {
-                    "已允许本次操作"
-                } else {
-                    "已拒绝本次操作"
-                }
+                i18n::text(
+                    app.lang,
+                    if allow {
+                        Key::InfoAllowedOnce
+                    } else {
+                        Key::InfoDeniedOnce
+                    },
+                )
                 .into(),
             ));
         }
@@ -521,9 +637,13 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
 fn consume_input(app: &mut App, text: &str) {
     if let Err(e) = app.history.record(text) {
-        app.push(EntryKind::Note(format!("输入历史保存失败：{e}")));
+        app.push(EntryKind::Note(i18n::fill(
+            app.lang,
+            Key::NoteHistorySaveFailed,
+            &[("e", &e.to_string())],
+        )));
     }
-    app.input = new_input();
+    app.input = new_input(app.lang);
     app.menu_selected = 0;
     app.menu_dismissed = false;
 }
@@ -541,17 +661,24 @@ fn submit(app: &mut App) {
     if text == "/new" && !app.restarting {
         consume_input(app, &text);
         app.restarting = true;
-        app.start("正在创建新会话");
+        app.start(i18n::text(app.lang, Key::StatusNewSession));
         app.session.send(SessionCommand::NewSession);
         return;
     }
-    if matches!(text.as_str(), "/help" | "/tasks" | "/todos") {
-        consume_input(app, &text);
-        handle_command(app, text.trim_start_matches('/'));
+    // Language is a pure frontend setting, so /lang works mid-turn like the
+    // panels handled here.
+    if matches!(text.as_str(), "/help" | "/tasks" | "/todos")
+        || text == "/lang"
+        || text.starts_with("/lang ")
+    {
+        // A rejected command (bad /lang argument) keeps the draft for editing.
+        if handle_command(app, text.trim_start_matches('/')) {
+            consume_input(app, &text);
+        }
         return;
     }
     if app.busy {
-        app.hint = Some("正在执行，草稿已保留；Esc 中断后可发送".into());
+        app.hint = Some(i18n::text(app.lang, Key::NoteBusyDraftKept).into());
         return;
     }
     if let Some(cmd) = text.strip_prefix('/') {
@@ -564,23 +691,120 @@ fn submit(app: &mut App) {
     app.follow = true;
     app.unread = false;
     app.push(EntryKind::User(text.clone()));
-    app.start("正在生成");
+    app.start(i18n::text(app.lang, Key::StatusGenerating));
     app.session.send(SessionCommand::Submit(text));
 }
 
 fn handle_command(app: &mut App, cmd: &str) -> bool {
+    let mut words = cmd.split_whitespace();
+    let command = words.next();
+    if command == Some("permissions") {
+        let value = words.next();
+        if words.next().is_some() || value.is_some_and(|v| PermissionMode::parse(v).is_none()) {
+            app.hint = Some(i18n::text(app.lang, Key::UsagePermissions).into());
+            return false;
+        }
+        if let Some(mode) = value.and_then(PermissionMode::parse) {
+            app.session.send(SessionCommand::SetPermissionMode(mode));
+        } else {
+            let selected = PermissionMode::ALL
+                .iter()
+                .position(|m| *m == app.permission_mode)
+                .unwrap_or(0);
+            app.panel = Some(Panel::Permissions { selected });
+        }
+        return true;
+    }
+    if command == Some("model") {
+        let name = words.next();
+        if words.next().is_some() {
+            app.hint = Some(i18n::text(app.lang, Key::UsageModel).into());
+            return false;
+        }
+        if let Some(name) = name {
+            app.session.send(SessionCommand::SelectModel(name.into()));
+        } else if app.models.is_empty() {
+            app.push(EntryKind::Note(
+                i18n::text(app.lang, Key::NoteNoModels).into(),
+            ));
+        } else {
+            let selected = app.models.iter().position(|m| m == &app.model).unwrap_or(0);
+            app.panel = Some(Panel::Model { selected });
+        }
+        return true;
+    }
+    if command == Some("effort") {
+        let value = words.next().map(str::to_owned);
+        if words.next().is_some() {
+            app.hint = Some(i18n::text(app.lang, Key::UsageEffort).into());
+            return false;
+        }
+        if let Some(value) = value {
+            app.session.send(SessionCommand::SetReasoningEffort(value));
+        } else if app.reasoning_efforts.is_empty() {
+            app.push(EntryKind::Note(
+                i18n::text(app.lang, Key::NoteNoReasoningEfforts).into(),
+            ));
+        } else {
+            let selected = app
+                .reasoning_efforts
+                .iter()
+                .position(|v| Some(v) == app.reasoning_effort.as_ref())
+                .unwrap_or(0);
+            app.panel = Some(Panel::Effort { selected });
+        }
+        return true;
+    }
+    if command == Some("lang") {
+        let value = words.next();
+        if words.next().is_some() {
+            app.hint = Some(i18n::text(app.lang, Key::UsageLang).into());
+            return false;
+        }
+        let lang = match value {
+            None => app.lang.toggled(),
+            Some(value) => match Lang::parse(value) {
+                Some(lang) => lang,
+                None => {
+                    app.hint = Some(i18n::text(app.lang, Key::UsageLang).into());
+                    return false;
+                }
+            },
+        };
+        app.set_lang(lang);
+        // The agent renders its system prompt in the same language.
+        app.session.send(SessionCommand::SetLang(lang));
+        app.push(EntryKind::Info(i18n::fill(
+            lang,
+            Key::InfoLanguageSet,
+            &[("label", lang.label())],
+        )));
+        return true;
+    }
     match cmd {
         "plan" => controls::toggle_mode(app),
         "help" => app.panel = Some(Panel::Help { scroll: 0 }),
-        "todos" => app.todos_expanded = !app.todos_expanded,
+        "todos" => app.panel = Some(Panel::Todos { scroll: 0 }),
         "tasks" => controls::open_tasks(app),
+        "sessions" => {
+            app.sessions.clear();
+            app.panel = Some(Panel::Sessions {
+                selected: 0,
+                loading: true,
+            });
+            app.session.send(SessionCommand::ShowSessions);
+        }
         "skills" => app.session.send(SessionCommand::ShowSkills),
         "compact" => {
-            app.start("压缩上下文中");
+            app.start(i18n::text(app.lang, Key::StatusCompacting));
             app.session.send(SessionCommand::Compact);
         }
         _ => {
-            app.hint = Some(format!("未知命令：/{cmd}"));
+            app.hint = Some(i18n::fill(
+                app.lang,
+                Key::NoteUnknownCommand,
+                &[("cmd", cmd)],
+            ));
             return false;
         }
     }
@@ -591,9 +815,345 @@ fn handle_command(app: &mut App, cmd: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn sessions_picker_restores_on_enter_and_preserves_conversation_on_failure() {
+        let (session, mut commands) = SessionHandle::test_channel();
+        let mut app = test_app(session);
+        app.push(EntryKind::User("current conversation".into()));
+        app.input = input::editor("/sessions", Lang::Zh);
+        submit(&mut app);
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            SessionCommand::ShowSessions
+        ));
+        assert!(render(&mut app, 100, 24).contains("正在读取会话"));
+        handle_ui_event(&mut app, UiEvent::Sessions(Vec::new()));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(commands.try_recv().is_err());
+        assert!(render(&mut app, 100, 24).contains("暂无已保存的会话"));
+        let items = ["first", "second"]
+            .into_iter()
+            .map(|id| crate::agent::transcripts::SessionView {
+                id: id.into(),
+                title: format!("title {id}"),
+                updated: "2026-09-18 10:00".into(),
+                current: false,
+            })
+            .collect();
+        handle_ui_event(&mut app, UiEvent::Sessions(items));
+        assert!(render(&mut app, 100, 24).contains("title first"));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        render(&mut app, 20, 8);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(commands.try_recv().is_err());
+        assert!(
+            app.entries
+                .iter()
+                .any(|e| matches!(e, EntryKind::User(s) if s == "current conversation"))
+        );
+        app.panel = Some(Panel::Sessions {
+            selected: 1,
+            loading: false,
+        });
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(commands.try_recv().unwrap(), SessionCommand::RestoreSession(id) if id == "second")
+        );
+        assert!(app.busy);
+        handle_ui_event(
+            &mut app,
+            UiEvent::SessionRestoreFailed("missing file".into()),
+        );
+        assert!(!app.busy);
+        assert!(
+            app.entries
+                .iter()
+                .any(|e| matches!(e, EntryKind::User(s) if s == "current conversation"))
+        );
+        handle_ui_event(
+            &mut app,
+            UiEvent::SessionRestored {
+                id: "first".into(),
+                records: vec![crate::agent::transcripts::Record {
+                    ts: "then".into(),
+                    role: "user".into(),
+                    content: "restored conversation".into(),
+                }],
+            },
+        );
+        assert!(!app.busy);
+        assert!(
+            app.entries
+                .iter()
+                .any(|e| matches!(e, EntryKind::User(s) if s == "restored conversation"))
+        );
+        assert!(
+            !app.entries
+                .iter()
+                .any(|e| matches!(e, EntryKind::User(s) if s == "current conversation"))
+        );
+        app.busy = true;
+        app.input = input::editor("/sessions", Lang::Zh);
+        submit(&mut app);
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn permission_picker_commands_events_cancel_and_busy_guard() {
+        let (session, mut commands) = SessionHandle::test_channel();
+        let mut app = test_app(session);
+        app.input.insert_str("/permissions");
+        submit(&mut app);
+        assert!(matches!(
+            app.panel,
+            Some(Panel::Permissions { selected: 0 })
+        ));
+        let screen = render(&mut app, 110, 24);
+        assert!(screen.contains("Ask When Need"));
+        assert!(screen.contains("Never Ask"));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            SessionCommand::SetPermissionMode(PermissionMode::AskWhenNeed)
+        ));
+        assert_eq!(app.permission_mode, PermissionMode::Normal);
+        handle_ui_event(
+            &mut app,
+            UiEvent::PermissionMode(PermissionMode::AskWhenNeed),
+        );
+        assert!(render(&mut app, 110, 24).contains("Ask When Need"));
+        assert!(handle_command(&mut app, "permissions"));
+        assert!(matches!(
+            app.panel,
+            Some(Panel::Permissions { selected: 1 })
+        ));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(commands.try_recv().is_err());
+        assert!(!handle_command(&mut app, "permissions typo"));
+        assert!(!handle_command(&mut app, "permissions never_ask extra"));
+        assert!(commands.try_recv().is_err());
+        app.input = input::editor("/permissions never_ask", Lang::Zh);
+        app.busy = true;
+        submit(&mut app);
+        assert!(commands.try_recv().is_err());
+        assert_eq!(app.input.lines()[0], "/permissions never_ask");
+        app.busy = false;
+        submit(&mut app);
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            SessionCommand::SetPermissionMode(PermissionMode::NeverAsk)
+        ));
+        handle_ui_event(&mut app, UiEvent::PermissionMode(PermissionMode::NeverAsk));
+        assert!(handle_command(&mut app, "permissions"));
+        render(&mut app, 20, 8);
+    }
+
+    #[test]
+    fn model_picker_confirms_cancels_and_waits_for_authoritative_settings() {
+        let (session, mut commands) = SessionHandle::test_channel();
+        let mut app = test_app(session);
+        handle_ui_event(
+            &mut app,
+            UiEvent::ModelSettings {
+                model: "a".into(),
+                models: vec!["a".into(), "b".into()],
+                reasoning_efforts: vec!["high".into()],
+                reasoning_effort: Some("high".into()),
+                context_window: Some(128000),
+            },
+        );
+        app.input.insert_str("/model");
+        submit(&mut app);
+        assert!(matches!(app.panel, Some(Panel::Model { selected: 0 })));
+        assert!(render(&mut app, 100, 30).contains("a（当前）"));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(commands.try_recv().is_err());
+        handle_command(&mut app, "model");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(commands.try_recv().unwrap(), SessionCommand::SelectModel(v) if v == "b"));
+        assert!(app.panel.is_none());
+        assert_eq!(app.model, "a");
+        handle_ui_event(
+            &mut app,
+            UiEvent::ModelSettings {
+                model: "b".into(),
+                models: vec!["a".into(), "b".into()],
+                reasoning_efforts: vec![],
+                reasoning_effort: None,
+                context_window: None,
+            },
+        );
+        let screen = render(&mut app, 100, 30);
+        assert_eq!(app.model, "b");
+        assert!(!screen.contains(" · high"));
+        assert!(!screen.contains("128000"));
+        app.busy = true;
+        app.input.insert_str("/model");
+        submit(&mut app);
+        assert!(app.panel.is_none());
+        assert!(commands.try_recv().is_err());
+        assert_eq!(app.input.lines()[0], "/model");
+    }
+
+    #[test]
+    fn effort_picker_selects_current_cancels_and_confirms() {
+        let (session, mut commands) = SessionHandle::test_channel();
+        let mut app = test_app(session);
+        handle_ui_event(
+            &mut app,
+            UiEvent::ModelSettings {
+                model: "test".into(),
+                models: vec!["test".into()],
+                reasoning_efforts: vec!["low".into(), "high".into()],
+                reasoning_effort: Some("low".into()),
+                context_window: Some(128000),
+            },
+        );
+        app.input.insert_str("/effort");
+        submit(&mut app);
+        assert!(matches!(app.panel, Some(Panel::Effort { selected: 0 })));
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("low（当前）"));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.panel.is_none());
+        assert!(commands.try_recv().is_err());
+        handle_command(&mut app, "effort");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(commands.try_recv().unwrap(), SessionCommand::SetReasoningEffort(v) if v == "high")
+        );
+        assert!(app.panel.is_none());
+        // The authoritative session event, not merely focusing a row, updates the bar.
+        assert_eq!(app.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn status_colors_are_not_dimmed_by_the_right_hand_hint() {
+        use ratatui::{Terminal, backend::TestBackend, style::Modifier};
+        for (mode, color) in [
+            (PermissionMode::Normal, theme::TEXT),
+            (PermissionMode::AskWhenNeed, theme::WARNING),
+            (PermissionMode::NeverAsk, theme::ERROR),
+        ] {
+            let mut app = app();
+            app.permission_mode = mode;
+            app.model = "test-model".into();
+            app.reasoning_effort = Some("medium".into());
+            app.context_window = Some(100);
+            app.context_used = Some(1);
+            let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(1, 23)].fg, color);
+            let status = format!("{} · test-model · medium · CTX [1%]", mode.label());
+            for x in 1..=Line::from(status).width() as u16 {
+                assert!(!buffer[(x, 23)].modifier.contains(Modifier::DIM));
+            }
+            let model_x = 1 + Line::from(format!("{} · ", mode.label())).width() as u16;
+            assert_eq!(buffer[(model_x, 23)].fg, theme::TEXT);
+            assert!(buffer[(113, 23)].modifier.contains(Modifier::DIM));
+        }
+    }
+
+    #[test]
+    fn statusbar_shows_usage_without_explanatory_labels() {
+        let mut app = app();
+        app.model = "deepseek-v4-flash".into();
+        app.reasoning_effort = Some("medium".into());
+        app.context_window = Some(1_000_000);
+        handle_ui_event(&mut app, UiEvent::ContextUsage(Some(120_000)));
+        let screen = render(&mut app, 120, 24);
+        assert!(screen.contains("Normal · deepseek-v4-flash · medium · CTX [12%]"));
+        for label in ["权限", "思考", "上下文", "tokens", "1000000"] {
+            assert!(!screen.contains(label), "unexpected label: {label}");
+        }
+        handle_ui_event(&mut app, UiEvent::ContextUsage(Some(0)));
+        assert!(render(&mut app, 120, 24).contains("CTX [0%]"));
+        handle_ui_event(&mut app, UiEvent::ContextUsage(None));
+        assert!(render(&mut app, 120, 24).contains("CTX [--%]"));
+        handle_ui_event(&mut app, UiEvent::ContextUsage(Some(120_000)));
+        handle_ui_event(&mut app, UiEvent::SessionReset);
+        assert!(render(&mut app, 120, 24).contains("CTX [--%]"));
+        app.context_used = Some(120_000);
+        handle_ui_event(
+            &mut app,
+            UiEvent::SessionRestored {
+                id: "saved".into(),
+                records: vec![],
+            },
+        );
+        assert!(app.context_used.is_none());
+        app.context_used = Some(120_000);
+        handle_ui_event(
+            &mut app,
+            UiEvent::ModelSettings {
+                model: "other".into(),
+                models: vec![],
+                reasoning_efforts: vec![],
+                reasoning_effort: None,
+                context_window: Some(128_000),
+            },
+        );
+        assert!(render(&mut app, 120, 24).contains("CTX [--%]"));
+        for (width, height) in [(40, 10), (20, 8), (1, 1)] {
+            render(&mut app, width, height);
+        }
+    }
+
+    #[test]
+    fn model_metadata_is_independently_optional_and_effort_requires_support() {
+        let mut app = app();
+        assert!(!render(&mut app, 100, 30).contains("tokens"));
+        handle_command(&mut app, "effort");
+        assert!(app.panel.is_none());
+        assert!(render(&mut app, 100, 30).contains("未配置思考档位"));
+        handle_ui_event(
+            &mut app,
+            UiEvent::ModelSettings {
+                model: "test".into(),
+                models: vec!["test".into()],
+                reasoning_efforts: vec![],
+                reasoning_effort: None,
+                context_window: Some(128000),
+            },
+        );
+        assert!(render(&mut app, 100, 30).contains("CTX [--%]"));
+        handle_ui_event(
+            &mut app,
+            UiEvent::ModelSettings {
+                model: "test".into(),
+                models: vec!["test".into()],
+                reasoning_efforts: vec!["high".into()],
+                reasoning_effort: Some("high".into()),
+                context_window: None,
+            },
+        );
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains(" · high"));
+        assert!(!screen.contains("tokens"));
+        app.busy = true;
+        app.input.insert_str("/effort");
+        submit(&mut app);
+        assert!(app.panel.is_none());
+        assert_eq!(app.input.lines()[0], "/effort");
+    }
+
     fn app() -> App {
         let (session, _) = SessionHandle::test_channel();
-        App::new(session)
+        test_app(session)
+    }
+
+    /// TUI tests assert Chinese labels, so they run in Chinese; English
+    /// rendering is covered by the `i18n` unit tests and the /lang test.
+    fn test_app(session: SessionHandle) -> App {
+        let mut app = App::new(session);
+        app.set_lang(Lang::Zh);
+        app
     }
 
     #[test]
@@ -637,6 +1197,83 @@ mod tests {
     }
 
     #[test]
+    fn lang_command_toggles_labels_and_tells_the_agent() {
+        let (session, mut commands) = SessionHandle::test_channel();
+        // The default is English, so a fresh app starts in English.
+        let mut app = App::new(session);
+        app.input = input::editor("/lang", Lang::En);
+        submit(&mut app);
+        assert_eq!(app.lang, Lang::Zh);
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            SessionCommand::SetLang(Lang::Zh)
+        ));
+        assert!(
+            app.entries
+                .iter()
+                .any(|e| matches!(e, EntryKind::Info(s) if s == "语言：中文"))
+        );
+        assert!(render(&mut app, 100, 24).contains("? 帮助"));
+        // An explicit code pins the language instead of toggling.
+        app.input = input::editor("/lang en", Lang::Zh);
+        submit(&mut app);
+        assert_eq!(app.lang, Lang::En);
+        assert!(render(&mut app, 100, 24).contains("? help"));
+        // Unknown codes are refused, and the unparsed argument is kept.
+        app.input = input::editor("/lang klingon", Lang::En);
+        submit(&mut app);
+        assert_eq!(app.lang, Lang::En);
+        assert!(app.hint.as_deref().unwrap().contains("Usage: /lang"));
+        assert_eq!(app.input.lines(), ["/lang klingon"]);
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            SessionCommand::SetLang(Lang::En)
+        ));
+    }
+
+    #[test]
+    fn switching_language_rerenders_cached_labels_but_keeps_the_draft() {
+        let (session, _) = SessionHandle::test_channel();
+        let mut app = App::new(session);
+        app.input = input::editor("未发送草稿", Lang::En);
+        app.push(EntryKind::Tool(ToolEntry {
+            id: "1".into(),
+            name: "bash".into(),
+            summary: String::new(),
+            arguments: "{}".into(),
+            output: None,
+            state: ToolState::Running,
+            duration_ms: None,
+        }));
+        assert!(render(&mut app, 90, 24).contains("running"));
+        app.set_lang(Lang::Zh);
+        assert!(render(&mut app, 90, 24).contains("进行中"));
+        assert_eq!(app.input.lines(), ["未发送草稿"]);
+        // The composer placeholder follows the language too.
+        app.set_lang(Lang::En);
+        assert!(render(&mut app, 90, 24).contains("running"));
+    }
+
+    #[test]
+    fn language_command_is_listed_in_the_completion_menu_and_help() {
+        assert!(
+            input::commands(Lang::En)
+                .iter()
+                .any(|(n, d)| *n == "lang" && *d == "Switch the interface language")
+        );
+        assert!(
+            input::commands(Lang::Zh)
+                .iter()
+                .any(|(n, d)| *n == "lang" && *d == "切换界面语言")
+        );
+        let mut app = app();
+        app.input = input::editor("/la", Lang::Zh);
+        assert!(!input::matches(&app.input).is_empty());
+        app.panel = Some(Panel::Help { scroll: 0 });
+        assert!(render(&mut app, 100, 40).contains("/lang"));
+    }
+
+    #[test]
     fn escape_does_not_exit() {
         let mut app = app();
         handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -674,7 +1311,7 @@ mod tests {
         handle_ui_event(&mut app, UiEvent::Note("background finished".into()));
         let screen = render(&mut app, 80, 24);
         assert_eq!(app.scroll, bottom - 10);
-        assert!(screen.contains("有新内容"));
+        assert!(screen.contains("新内容"));
         for _ in 0..20 {
             handle_key(
                 &mut app,
@@ -714,7 +1351,7 @@ mod tests {
     #[test]
     fn reset_waits_for_backend_and_clears_old_view_state() {
         let (session, mut commands) = SessionHandle::test_channel();
-        let mut app = App::new(session);
+        let mut app = test_app(session);
         app.push(EntryKind::Assistant("old session".into()));
         app.busy = true;
         app.input.insert_str("/new");
@@ -737,7 +1374,7 @@ mod tests {
     #[test]
     fn cancel_keeps_draft_and_sends_command_instead_of_quitting() {
         let (session, mut commands) = SessionHandle::test_channel();
-        let mut app = App::new(session);
+        let mut app = test_app(session);
         app.start("正在生成");
         app.input.insert_str("draft");
         handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -746,6 +1383,66 @@ mod tests {
         assert_eq!(app.input.lines().join("\n"), "draft");
         assert!(!app.quit);
         assert!(!app.busy);
+    }
+
+    #[test]
+    fn modal_band_hides_transcript_fragments_and_restores_on_close() {
+        let mut app = app();
+        app.push(EntryKind::Assistant(
+            (0..60).map(|_| "Z".repeat(110) + "\n\n").collect(),
+        ));
+        app.input.insert_str("draft");
+        let before = render(&mut app, 120, 32);
+        app.panel = Some(Panel::Permissions { selected: 0 });
+        let screen = render(&mut app, 120, 32);
+        let lines: Vec<_> = screen.lines().collect();
+        let top = lines
+            .iter()
+            .position(|line| line.contains("权限等级"))
+            .unwrap();
+        let bottom = lines
+            .iter()
+            .position(|line| line.contains("Enter 确认"))
+            .unwrap();
+        for line in &lines[top.saturating_sub(1)..=(bottom + 1)] {
+            assert!(!line.contains('Z'), "transcript leaks beside modal: {line}");
+        }
+        assert!(screen.contains("Never Ask"));
+        assert!(screen.contains("draft"));
+        assert!(
+            lines[..top.saturating_sub(1)]
+                .iter()
+                .any(|line| line.contains('Z'))
+        );
+        controls::close_panel(&mut app);
+        assert_eq!(render(&mut app, 120, 32), before);
+        let (tx, _rx) = oneshot::channel();
+        handle_ui_event(
+            &mut app,
+            UiEvent::PermissionRequest {
+                text: "run command".into(),
+                respond: tx,
+            },
+        );
+        let screen = render(&mut app, 120, 32);
+        let lines: Vec<_> = screen.lines().collect();
+        let top = lines
+            .iter()
+            .position(|line| line.contains("权限确认"))
+            .unwrap();
+        let hint = lines
+            .iter()
+            .position(|line| line.contains("方向键选择"))
+            .unwrap();
+        for line in &lines[top.saturating_sub(1)..=(hint + 2)] {
+            assert!(
+                !line.contains('Z'),
+                "transcript leaks beside permission: {line}"
+            );
+        }
+        for (width, height) in [(40, 12), (20, 8), (1, 1)] {
+            render(&mut app, width, height);
+        }
     }
 
     #[test]
@@ -831,7 +1528,7 @@ mod tests {
         handle_ui_event(&mut app, UiEvent::PlanMode(true));
         handle_ui_event(&mut app, UiEvent::BackgroundCount(2));
         let screen = render(&mut app, 100, 28);
-        assert!(screen.contains("Airplane"));
+        assert!(screen.contains("koala"));
         assert!(screen.contains("local-model"));
         assert!(screen.contains("/workspace/kb-agent"));
         assert!(screen.contains("Plan · 后台 2"));
@@ -847,7 +1544,7 @@ mod tests {
             render(&mut app, width, height);
         }
         handle_ui_event(&mut app, UiEvent::BackgroundCount(0));
-        assert!(render(&mut app, 100, 28).contains("Plan · 后台 0"));
+        assert!(!render(&mut app, 100, 28).contains("后台 0"));
     }
     #[test]
     fn layout_fixture() {
@@ -879,12 +1576,12 @@ mod tests {
         println!("{screen}");
         assert!(screen.contains("检查结果"));
         assert!(screen.contains("成功 · 0.8s"));
-        assert!(screen.contains("Normal · 后台 1 · local-model"));
+        assert!(screen.contains("后台 1 · local-model"));
     }
     #[test]
     fn command_menu_filters_completes_and_does_not_send_on_tab() {
         let (session, mut commands) = SessionHandle::test_channel();
-        let mut app = App::new(session);
+        let mut app = test_app(session);
         app.input.insert_str("/ta");
         assert!(render(&mut app, 90, 24).contains("/tasks"));
         handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
@@ -896,7 +1593,7 @@ mod tests {
         assert!(matches!(commands.try_recv(), Ok(SessionCommand::ShowTasks)));
         handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(commands.try_recv(), Ok(SessionCommand::HideTasks)));
-        app.input = input::editor("/does-not-exist");
+        app.input = input::editor("/does-not-exist", Lang::Zh);
         app.busy = false;
         submit(&mut app);
         assert!(app.hint.as_deref().unwrap().contains("未知命令"));
@@ -906,7 +1603,7 @@ mod tests {
     #[test]
     fn paste_and_multiline_shortcuts_never_submit() {
         let (session, mut commands) = SessionHandle::test_channel();
-        let mut app = App::new(session);
+        let mut app = test_app(session);
         handle_paste(&mut app, "第一行\r\n第二行\n/quit");
         assert_eq!(app.input.lines(), ["第一行", "第二行", "/quit"]);
         handle_key(
@@ -925,7 +1622,7 @@ mod tests {
     #[test]
     fn history_search_accepts_without_sending_and_cancel_keeps_draft() {
         let (session, mut commands) = SessionHandle::test_channel();
-        let mut app = App::new(session);
+        let mut app = test_app(session);
         app.history.record("检查代码\n运行测试").unwrap();
         app.history.record("另一个任务").unwrap();
         app.input.insert_str("当前草稿");
@@ -951,7 +1648,7 @@ mod tests {
     fn arrows_move_within_multiline_before_recalling_history() {
         let mut app = app();
         app.history.record("old input").unwrap();
-        app.input = input::editor("first\nsecond");
+        app.input = input::editor("first\nsecond", Lang::Zh);
         handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.input.lines(), ["first", "second"]);
         handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
@@ -963,7 +1660,7 @@ mod tests {
     #[test]
     fn mode_shortcut_waits_for_backend_and_busy_mode_is_unchanged() {
         let (session, mut commands) = SessionHandle::test_channel();
-        let mut app = App::new(session);
+        let mut app = test_app(session);
         app.input.insert_str("draft");
         handle_key(
             &mut app,
@@ -987,7 +1684,60 @@ mod tests {
     }
 
     #[test]
-    fn todo_panel_highlights_active_and_collapses_without_losing_data() {
+    fn todo_shortcut_shows_full_list_without_opening_tool_details() {
+        use crate::agent::event::{TodoState, TodoView};
+        let mut app = app();
+        app.input.insert_str("keep draft");
+        handle_ui_event(
+            &mut app,
+            UiEvent::Todos(
+                (0..30)
+                    .map(|i| TodoView {
+                        content: format!("todo item {i:02}"),
+                        status: TodoState::Pending,
+                    })
+                    .collect(),
+            ),
+        );
+        let compact = render(&mut app, 90, 24);
+        assert!(
+            compact.contains("Ctrl+T"),
+            "Todo overflow must advertise its own shortcut"
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+        );
+        assert!(!app.detailed);
+        for (width, height) in [(40, 12), (20, 8), (1, 1)] {
+            render(&mut app, width, height);
+        }
+        let mut visible = String::new();
+        for _ in 0..40 {
+            visible.push_str(&render(&mut app, 90, 24));
+            handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        for i in 0..30 {
+            assert!(
+                visible.contains(&format!("todo item {i:02}")),
+                "missing todo {i}"
+            );
+        }
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+        );
+        assert!(app.panel.is_none());
+        assert_eq!(app.input.lines(), ["keep draft"]);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        assert!(app.detailed);
+    }
+
+    #[test]
+    fn todo_panel_highlights_active_and_closes_without_losing_data() {
         use crate::agent::event::{TodoState, TodoView};
         let mut app = app();
         handle_ui_event(
@@ -1004,15 +1754,17 @@ mod tests {
             ]),
         );
         let screen = render(&mut app, 90, 24);
-        assert!(screen.contains("Todo 1/2"));
+        assert!(screen.contains("▾ 1/2"));
         assert!(screen.contains("◐ 当前正在处理"));
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
         );
-        let collapsed = render(&mut app, 90, 24);
-        assert!(!collapsed.contains("当前正在处理"));
-        assert!(collapsed.contains("Todo 1/2"));
+        assert!(matches!(app.panel, Some(Panel::Todos { .. })));
+        assert!(render(&mut app, 90, 24).contains("◐ 当前正在处理"));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.panel.is_none());
+        assert!(render(&mut app, 90, 24).contains("▾ 1/2"));
         assert_eq!(panels::todos(&app).len(), 2);
     }
 
@@ -1020,7 +1772,7 @@ mod tests {
     fn task_output_stop_and_panels_preserve_drafts_and_render_narrow() {
         use crate::agent::event::TaskState;
         let (session, mut commands) = SessionHandle::test_channel();
-        let mut app = App::new(session);
+        let mut app = test_app(session);
         app.input.insert_str("keep me");
         controls::open_tasks(&mut app);
         assert!(matches!(commands.try_recv(), Ok(SessionCommand::ShowTasks)));
@@ -1052,7 +1804,7 @@ mod tests {
         handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.input.lines(), ["keep me"]);
-        app.input = new_input();
+        app.input = new_input(Lang::Zh);
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),

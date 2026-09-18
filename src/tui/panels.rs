@@ -1,5 +1,6 @@
 use super::{App, Panel, input, text, theme, transcript};
 use crate::agent::event::{TaskState, TodoState};
+use crate::i18n::{self, Key};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -9,18 +10,32 @@ use ratatui::{
 
 /// Title and shortcut hint for the modal dialog chrome drawn by `view`.
 pub(super) fn dialog_chrome(app: &App) -> Option<(&'static str, &'static str)> {
+    let lang = app.lang;
+    let t = |key| i18n::text(lang, key);
     match app.panel {
-        Some(Panel::Help { .. }) => Some(("帮助", "↑↓ / PgUp/PgDn 滚动 · Esc 返回")),
-        Some(Panel::History { .. }) => {
-            Some(("搜索输入历史", "↑↓ 选择 · Enter/Tab 回填 · Esc 取消"))
+        Some(Panel::Sessions { .. }) => {
+            Some((t(Key::PanelSessions), t(Key::HintSelectResumeCancel)))
         }
+        Some(Panel::Permissions { .. } | Panel::Model { .. } | Panel::Effort { .. }) => Some((
+            t(dialog_list_title(&app.panel)),
+            t(Key::HintSelectConfirmCancel),
+        )),
+        Some(Panel::Todos { .. }) => Some((t(Key::PanelTodos), t(Key::HintScrollBack))),
+        Some(Panel::Help { .. }) => Some((t(Key::PanelHelp), t(Key::HintScrollBack))),
+        Some(Panel::History { .. }) => Some((t(Key::PanelHistory), t(Key::HintHistorySelect))),
         Some(Panel::Tasks { output: true, .. }) => {
-            Some(("任务输出", "PgUp/PgDn 滚动 · x 停止 · Esc 返回列表"))
+            Some((t(Key::PanelTaskOutput), t(Key::HintTaskOutput)))
         }
-        Some(Panel::Tasks { .. }) => {
-            Some(("后台任务", "↑↓ 选择 · Enter 查看输出 · x 停止 · Esc 返回"))
-        }
+        Some(Panel::Tasks { .. }) => Some((t(Key::PanelTasks), t(Key::HintTasksSelect))),
         None => None,
+    }
+}
+
+fn dialog_list_title(panel: &Option<Panel>) -> Key {
+    match panel {
+        Some(Panel::Permissions { .. }) => Key::PanelPermissions,
+        Some(Panel::Model { .. }) => Key::PanelModel,
+        _ => Key::PanelEffort,
     }
 }
 
@@ -28,9 +43,14 @@ pub(super) fn dialog_chrome(app: &App) -> Option<(&'static str, &'static str)> {
 /// its content instead of stretching to the full transcript height.
 pub(super) fn content_height(app: &App) -> usize {
     match &app.panel {
+        Some(Panel::Sessions { .. }) => (app.sessions.len() * 2).clamp(1, 16),
+        Some(Panel::Permissions { .. }) => 3,
+        Some(Panel::Model { .. }) => app.models.len(),
+        Some(Panel::Effort { .. }) => app.reasoning_efforts.len(),
+        Some(Panel::Todos { .. }) => todos(app).len().clamp(1, 16),
         Some(Panel::Help { .. }) => {
-            // Sectioned help text plus the command list.
-            22 + input::COMMANDS.len()
+            // Sectioned help text plus the command list, in the active language.
+            i18n::text(app.lang, Key::HelpText).lines().count() + input::COMMANDS.len()
         }
         Some(Panel::History { query, .. }) => 2 + app.history.search(query).len().clamp(1, 10),
         Some(Panel::Tasks { output: false, .. }) => app.tasks.len().clamp(1, 12),
@@ -40,16 +60,167 @@ pub(super) fn content_height(app: &App) -> usize {
 }
 
 pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
+    if let Some(Panel::Todos { scroll }) = app.panel {
+        let mut lines = Vec::new();
+        for item in ordered_todos(app) {
+            let (mark, style) = todo_marker(item.status);
+            lines.extend(transcript::literal(
+                &format!("{mark} {}", text::clean(&item.content)),
+                area.width as usize,
+                style,
+            ));
+        }
+        let mut scroll = scroll;
+        render_scrolled(f, lines, &mut scroll, area);
+        app.panel = Some(Panel::Todos { scroll });
+        return;
+    }
     match app.panel.as_mut() {
+        Some(Panel::Sessions { selected, loading }) => {
+            if *loading || app.sessions.is_empty() {
+                f.render_widget(
+                    Paragraph::new(if *loading {
+                        i18n::text(app.lang, Key::LoadingSessions)
+                    } else {
+                        i18n::text(app.lang, Key::NoSessions)
+                    })
+                    .style(theme::muted()),
+                    area,
+                );
+                return;
+            }
+            let capacity = (area.height as usize / 2).max(1);
+            let start = selected.saturating_sub(capacity.saturating_sub(1));
+            let mut lines = Vec::new();
+            for (index, item) in app.sessions.iter().enumerate().skip(start).take(capacity) {
+                lines.push(Line::styled(
+                    format!(
+                        "{}{}{}",
+                        if index == *selected { "❯ " } else { "  " },
+                        text::clean(&item.title),
+                        if item.current {
+                            i18n::text(app.lang, Key::Current)
+                        } else {
+                            ""
+                        }
+                    ),
+                    if index == *selected {
+                        theme::suggestion()
+                    } else {
+                        theme::text()
+                    },
+                ));
+                lines.push(Line::styled(
+                    format!("  {} · {}", item.updated, item.id),
+                    theme::muted(),
+                ));
+            }
+            f.render_widget(Paragraph::new(Text::from(lines)), area);
+        }
+        Some(Panel::Permissions { selected }) => {
+            let capacity = area.height as usize;
+            let start = selected.saturating_sub(capacity.saturating_sub(1));
+            let lines: Vec<_> = super::PermissionMode::ALL
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(capacity)
+                .map(|(index, mode)| {
+                    Line::styled(
+                        format!(
+                            "{}{}{} · {}",
+                            if index == *selected { "❯ " } else { "  " },
+                            mode.label(),
+                            if *mode == app.permission_mode {
+                                i18n::text(app.lang, Key::Current)
+                            } else {
+                                ""
+                            },
+                            mode.description(app.lang)
+                        ),
+                        if index == *selected {
+                            theme::suggestion()
+                        } else {
+                            theme::muted()
+                        },
+                    )
+                })
+                .collect();
+            f.render_widget(Paragraph::new(Text::from(lines)), area);
+        }
+        Some(Panel::Model { selected }) => {
+            let capacity = area.height as usize;
+            let start = selected.saturating_sub(capacity.saturating_sub(1));
+            let lines: Vec<_> = app
+                .models
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(capacity)
+                .map(|(index, effort)| {
+                    let current = effort == &app.model;
+                    Line::styled(
+                        format!(
+                            "{}{}{}",
+                            if index == *selected { "❯ " } else { "  " },
+                            text::clean(effort),
+                            if current {
+                                i18n::text(app.lang, Key::Current)
+                            } else {
+                                ""
+                            }
+                        ),
+                        if index == *selected {
+                            theme::suggestion()
+                        } else {
+                            theme::muted()
+                        },
+                    )
+                })
+                .collect();
+            f.render_widget(Paragraph::new(Text::from(lines)), area);
+        }
+        Some(Panel::Effort { selected }) => {
+            let capacity = area.height as usize;
+            let start = selected.saturating_sub(capacity.saturating_sub(1));
+            let lines: Vec<_> = app
+                .reasoning_efforts
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(capacity)
+                .map(|(index, effort)| {
+                    let current = Some(effort) == app.reasoning_effort.as_ref();
+                    Line::styled(
+                        format!(
+                            "{}{}{}",
+                            if index == *selected { "❯ " } else { "  " },
+                            text::clean(effort),
+                            if current {
+                                i18n::text(app.lang, Key::Current)
+                            } else {
+                                ""
+                            }
+                        ),
+                        if index == *selected {
+                            theme::suggestion()
+                        } else {
+                            theme::muted()
+                        },
+                    )
+                })
+                .collect();
+            f.render_widget(Paragraph::new(Text::from(lines)), area);
+        }
         Some(Panel::Help { scroll }) => {
             let mut lines = Vec::new();
-            let help = "输入与导航\nEnter 发送 · Shift+Enter / Ctrl+J / \\+Enter 换行\n↑↓ 在多行中移动，到首尾后召回历史\nCtrl+R 搜索历史，Enter/Tab 回填，Esc 保留原草稿\n粘贴多行作为一段草稿，不会自动发送\n\n命令与面板\n/ 筛选命令 · ↑↓ 选择 · Tab 补全 · Enter 执行\nShift+Tab 切换 Normal / Plan（空闲时）\nCtrl+T 展开/收起 Todo · Ctrl+O 详细记录\n/tasks 查看后台任务：↑↓ 选择 · Enter 输出 · x 停止\n?（空输入）或 /help 打开帮助\n\n运行与退出\nEsc 关闭面板；无面板时中断前台工作\nCtrl+C 中断前台工作；空闲时清空输入\n权限确认：方向键选择 · Enter 确认 · Esc 拒绝\nCtrl+D（空输入）或 /quit 退出\nPgUp/PgDn 历史 · Ctrl+End 回到底部\n\n命令列表";
+            let help = i18n::text(app.lang, Key::HelpText);
             lines.extend(transcript::literal(
                 help,
                 area.width as usize,
                 ratatui::style::Style::default(),
             ));
-            for (name, description) in input::COMMANDS {
+            for (name, description) in input::commands(app.lang) {
                 lines.extend(transcript::literal(
                     &format!("/{name}  {description}"),
                     area.width as usize,
@@ -65,12 +236,25 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                 Line::from(vec![
                     Span::styled("⌕ ", theme::suggestion()),
                     Span::styled(format!("{}▏", text::clean(query)), theme::text()),
-                    Span::styled(format!("  · {} 条", matches.len()), theme::subtle()),
+                    Span::styled(
+                        format!(
+                            "  · {}",
+                            i18n::fill(
+                                app.lang,
+                                Key::HistoryCount,
+                                &[("n", &matches.len().to_string())]
+                            )
+                        ),
+                        theme::subtle(),
+                    ),
                 ]),
                 Line::default(),
             ];
             if matches.is_empty() {
-                lines.push(Line::styled("没有匹配的输入历史", theme::muted()));
+                lines.push(Line::styled(
+                    i18n::text(app.lang, Key::NoHistoryMatches),
+                    theme::muted(),
+                ));
             }
             let capacity = area.height.saturating_sub(2) as usize;
             let start = selected.saturating_sub(capacity.saturating_sub(1));
@@ -105,7 +289,10 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         }) => {
             let mut lines = Vec::new();
             if app.tasks.is_empty() {
-                lines.push(Line::styled("暂无后台任务", theme::muted()));
+                lines.push(Line::styled(
+                    i18n::text(app.lang, Key::NoTasks),
+                    theme::muted(),
+                ));
             } else if *output {
                 if let Some(task) = app.tasks.iter().find(|t| Some(t.id) == *selected) {
                     lines.extend(transcript::literal(
@@ -113,7 +300,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                             "#{} [{}] {} · {:.1}s\n{}",
                             task.id,
                             task.kind,
-                            task.status.label(),
+                            task.status.label(app.lang),
                             elapsed(task.elapsed_ms, task.status, app.tasks_received),
                             task.description
                         ),
@@ -123,11 +310,11 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                     lines.push(Line::default());
                     let output = if task.output.is_empty() {
                         if task.status == TaskState::Running {
-                            "任务执行中，完成后可查看完整输出。"
+                            i18n::text(app.lang, Key::TaskOutputRunning)
                         } else if task.status == TaskState::Stopped {
-                            "任务已停止，没有已收集的输出。"
+                            i18n::text(app.lang, Key::TaskOutputStopped)
                         } else {
-                            "（无输出）"
+                            i18n::text(app.lang, Key::NoOutput)
                         }
                     } else {
                         &task.output
@@ -170,7 +357,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                                 "#{} [{}] {} · {:.1}s  {}",
                                 task.id,
                                 task.kind,
-                                task.status.label(),
+                                task.status.label(app.lang),
                                 elapsed(task.elapsed_ms, task.status, app.tasks_received),
                                 text::clean(&task.description).replace('\n', " ")
                             ),
@@ -181,7 +368,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             }
             f.render_widget(Paragraph::new(Text::from(lines)), area);
         }
-        None => {}
+        Some(Panel::Todos { .. }) | None => {}
     }
 }
 
@@ -234,14 +421,14 @@ pub(super) fn draw_menu(f: &mut Frame, app: &App, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(theme::border())
         .title(Span::styled(
-            " 命令 · ↑↓ 选择 · Tab 补全 · Enter 执行 ",
+            format!(" {} ", i18n::text(app.lang, Key::PanelCommands)),
             theme::subtle(),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let mut lines = Vec::new();
     for (row, index) in matches.iter().enumerate().skip(start).take(capacity) {
-        let (name, description) = input::COMMANDS[*index];
+        let (name, description) = input::command(*index, app.lang);
         let focused = row == selected;
         lines.push(Line::from(vec![
             Span::styled(
@@ -283,48 +470,50 @@ pub(super) fn draw_todos(f: &mut Frame, app: &App, area: Rect) {
     }
     let done = items.iter().filter(|t| t.status == TodoState::Done).count();
     let mut lines = vec![Line::styled(
-        format!(
-            "{} Todo {done}/{} · Ctrl+T {}",
-            if app.todos_expanded { "▾" } else { "▸" },
-            items.len(),
-            if app.todos_expanded {
-                "收起"
-            } else {
-                "展开"
-            }
-        ),
+        format!("▾ {done}/{}", items.len()),
         theme::subtle(),
     )];
-    if app.todos_expanded {
-        let mut ordered: Vec<_> = items.iter().collect();
-        ordered.sort_by_key(|t| match t.status {
-            TodoState::InProgress => 0,
-            TodoState::Pending => 1,
-            TodoState::Done => 2,
-        });
-        let capacity = area.height.saturating_sub(1) as usize;
-        let shown = if ordered.len() > capacity {
-            capacity.saturating_sub(1)
-        } else {
-            capacity
-        };
-        for item in ordered.iter().take(shown) {
-            let (mark, style) = match item.status {
-                TodoState::InProgress => ("◐", theme::heading()),
-                TodoState::Pending => ("☐", theme::muted()),
-                TodoState::Done => ("☒", theme::muted()),
-            };
-            lines.push(Line::from(vec![Span::styled(
-                format!("  {mark} {}", text::clean(&item.content).replace('\n', " ")),
-                style,
-            )]));
-        }
-        if ordered.len() > shown {
-            lines.push(Line::styled(
-                format!("  … 另 {} 项 · Ctrl+O 查看完整列表", ordered.len() - shown),
-                theme::muted(),
-            ));
-        }
+    let ordered = ordered_todos(app);
+    let capacity = area.height.saturating_sub(1) as usize;
+    let shown = if ordered.len() > capacity {
+        capacity.saturating_sub(1)
+    } else {
+        capacity
+    };
+    for item in ordered.iter().take(shown) {
+        let (mark, style) = todo_marker(item.status);
+        lines.push(Line::from(vec![Span::styled(
+            format!("  {mark} {}", text::clean(&item.content).replace('\n', " ")),
+            style,
+        )]));
+    }
+    if ordered.len() > shown {
+        lines.push(Line::styled(
+            i18n::fill(
+                app.lang,
+                Key::MoreTodos,
+                &[("n", &(ordered.len() - shown).to_string())],
+            ),
+            theme::key_hint(),
+        ));
     }
     f.render_widget(Paragraph::new(Text::from(lines)), area);
+}
+
+fn ordered_todos(app: &App) -> Vec<&crate::agent::event::TodoView> {
+    let mut items: Vec<_> = todos(app).iter().collect();
+    items.sort_by_key(|t| match t.status {
+        TodoState::InProgress => 0,
+        TodoState::Pending => 1,
+        TodoState::Done => 2,
+    });
+    items
+}
+
+fn todo_marker(status: TodoState) -> (&'static str, ratatui::style::Style) {
+    match status {
+        TodoState::InProgress => ("◐", theme::heading()),
+        TodoState::Pending => ("☐", theme::muted()),
+        TodoState::Done => ("☒", theme::muted()),
+    }
 }

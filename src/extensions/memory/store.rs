@@ -99,7 +99,7 @@ impl FileStore {
     }
 
     pub fn rebuild(&mut self) -> Result<(), MemoryError> {
-        self.files.clear();
+        let mut files = BTreeMap::new();
         for sub in ["daily", "digest"] {
             let dir = self.workspace.join(sub);
             let mut paths = Vec::new();
@@ -110,16 +110,17 @@ impl FileStore {
                     .strip_prefix(&self.workspace)
                     .map(|p| p.to_string_lossy().replace('\\', "/"))
                     .map_err(|_| MemoryError::InvalidPath(abs.display().to_string()))?;
-                self.index_file(&rel)?;
+                files.insert(rel.clone(), self.read_entry(&rel)?);
             }
         }
+        self.files = files;
+        self.rebuild_index();
         Ok(())
     }
 
     /// Re-read a file from disk and refresh its index entries.
     pub fn upsert_file(&mut self, rel: &str) -> Result<(), MemoryError> {
         validate_rel_path(rel)?;
-        self.files.remove(rel);
         self.index_file(rel)
     }
 
@@ -131,7 +132,7 @@ impl FileStore {
             fs::create_dir_all(parent).map_err(io_err(parent))?;
         }
         fs::write(&abs, content).map_err(io_err(&abs))?;
-        self.upsert_file(rel)
+        self.index_file(rel)
     }
 
     pub fn search(&self, query: &str, limit: usize) -> Vec<SearchHit> {
@@ -139,16 +140,16 @@ impl FileStore {
         self.bm25
             .search(&tokens, limit)
             .into_iter()
-            .filter_map(|(doc, score)| {
+            .map(|(doc, score)| {
                 let (path, idx) = &self.doc_index[doc];
-                let chunk = self.files.get(path)?.chunks.get(*idx)?;
-                Some(SearchHit {
+                let chunk = &self.files[path].chunks[*idx];
+                SearchHit {
                     path: path.clone(),
                     start_line: chunk.start_line,
                     end_line: chunk.end_line,
                     score,
                     text: chunk.text.clone(),
-                })
+                }
             })
             .collect()
     }
@@ -190,16 +191,25 @@ impl FileStore {
         validate_rel_path(rel)?;
         let abs = self.workspace.join(rel);
         let text = fs::read_to_string(&abs).map_err(io_err(&abs))?;
-        let lines: Vec<&str> = text.lines().collect();
-        if lines.is_empty() || start > lines.len() {
-            return Ok(String::new());
-        }
         let start = start.max(1);
-        let end = end.min(lines.len());
-        Ok(lines[start - 1..end].join("\n"))
+        Ok(text
+            .lines()
+            .enumerate()
+            .skip(start - 1)
+            .take_while(|(index, _)| *index < end)
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n"))
     }
 
     fn index_file(&mut self, rel: &str) -> Result<(), MemoryError> {
+        let entry = self.read_entry(rel)?;
+        self.files.insert(rel.to_string(), entry);
+        self.rebuild_index();
+        Ok(())
+    }
+
+    fn read_entry(&self, rel: &str) -> Result<FileEntry, MemoryError> {
         let abs = self.workspace.join(rel);
         let text = fs::read_to_string(&abs).map_err(io_err(&abs))?;
         let parsed =
@@ -216,16 +226,11 @@ impl FileStore {
             description.as_deref(),
         );
         let outlinks = extract_wikilinks(&text);
-        self.files.insert(
-            rel.to_string(),
-            FileEntry {
-                meta: FileMeta { name, description },
-                chunks,
-                outlinks,
-            },
-        );
-        self.rebuild_index();
-        Ok(())
+        Ok(FileEntry {
+            meta: FileMeta { name, description },
+            chunks,
+            outlinks,
+        })
     }
 
     fn rebuild_index(&mut self) {
@@ -438,5 +443,42 @@ mod tests {
         assert!(Catalog::path(&ws.0).is_file());
         let loaded = Catalog::load(&ws.0).unwrap();
         assert_eq!(loaded, catalog);
+    }
+
+    #[test]
+    fn reversed_and_extreme_line_ranges_are_empty() {
+        let (_ws, store) = open_seeded();
+        for (start, end) in [(7, 2), (1, 0), (usize::MAX, usize::MAX)] {
+            assert!(
+                store
+                    .read_lines("digest/wiki/borrow.md", start, end)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            store.read_lines("digest/wiki/borrow.md", 0, 1).unwrap(),
+            "---"
+        );
+    }
+
+    #[test]
+    fn rebuild_clears_search_and_links_when_all_files_are_removed() {
+        let (ws, mut store) = open_seeded();
+        fs::remove_dir_all(ws.0.join("daily")).unwrap();
+        fs::remove_dir_all(ws.0.join("digest")).unwrap();
+        store.rebuild().unwrap();
+        assert!(store.search("rust", 5).is_empty());
+        assert!(store.expand_links("digest/wiki/borrow.md").is_empty());
+    }
+
+    #[test]
+    fn failed_refresh_preserves_the_previous_index() {
+        let (ws, mut store) = open_seeded();
+        fs::write(ws.0.join("digest/wiki/borrow.md"), [0xff]).unwrap();
+        assert!(store.upsert_file("digest/wiki/borrow.md").is_err());
+        assert_eq!(store.search("借用检查", 5)[0].path, "digest/wiki/borrow.md");
+        assert!(store.rebuild().is_err());
+        assert_eq!(store.search("借用检查", 5)[0].path, "digest/wiki/borrow.md");
     }
 }

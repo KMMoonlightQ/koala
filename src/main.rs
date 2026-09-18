@@ -1,12 +1,12 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use kb_agent::llm::LlmClient;
-use kb_agent::{config, memory, tui};
+use koala::llm::LlmClient;
+use koala::{config, memory, tui};
 use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(
-    name = "kb-agent",
+    name = "koala",
     version,
     about = "Chat agent with a file-based knowledge base"
 )]
@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Chat) {
         Command::ExtensionInstall { source, directory } => {
             let manifest =
-                kb_agent::extensions::install(&source, &directory).map_err(anyhow::Error::msg)?;
+                koala::extensions::install(&source, &directory).map_err(anyhow::Error::msg)?;
             println!(
                 "Installed. Add to [extensions].manifests in config.toml:\n{}",
                 serde_json::to_string(&manifest)?

@@ -49,7 +49,7 @@ pub fn definitions() -> Vec<crate::llm::Tool> {
                     "description": {"type": "string", "description": "one-line summary (frontmatter)"},
                     "content": {"type": "string", "description": "Markdown body"}
                 },
-                "required": ["path", "name", "description", "content"]
+                "required": ["path", "name", "content"]
             }),
         ),
     ]
@@ -63,44 +63,51 @@ pub fn dispatch(kb: &mut FileStore, call: &ToolCall) -> String {
 pub fn dispatch_result(kb: &mut FileStore, call: &ToolCall) -> Result<String, String> {
     let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
         .map_err(|e| format!("invalid arguments: {e}"))?;
-    match call.function.name.as_str() {
-        "memory_search" => Ok(exec_search(kb, &args)),
-        "memory_read" => exec_read(kb, &args),
-        "memory_write" => exec_write(kb, &args),
+    execute(kb, &call.function.name, &args)
+}
+
+pub fn execute(kb: &mut FileStore, name: &str, args: &serde_json::Value) -> Result<String, String> {
+    match name {
+        "memory_search" => exec_search(kb, args),
+        "memory_read" => exec_read(kb, args),
+        "memory_write" => exec_write(kb, args),
         other => Err(format!("unknown tool: {other}")),
     }
 }
 
-fn exec_search(kb: &FileStore, args: &serde_json::Value) -> String {
-    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-    let limit = args
-        .get("limit")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .unwrap_or(5);
-    let hits = kb.search(query, limit);
-    if hits.is_empty() {
-        return "no matches".to_string();
+fn exec_search(kb: &FileStore, args: &serde_json::Value) -> Result<String, String> {
+    #[derive(serde::Deserialize)]
+    struct Args<'a> {
+        query: &'a str,
+        limit: Option<usize>,
     }
-    hits.iter()
+    let args: Args =
+        serde::Deserialize::deserialize(args).map_err(|e| format!("invalid arguments: {e}"))?;
+    let hits = kb.search(args.query, args.limit.unwrap_or(5));
+    if hits.is_empty() {
+        return Ok("no matches".to_string());
+    }
+    Ok(hits
+        .iter()
         .map(|h| format!("{}:{}-{}\n{}", h.path, h.start_line, h.end_line, h.text))
         .collect::<Vec<_>>()
-        .join("\n\n")
+        .join("\n\n"))
 }
 
 fn exec_read(kb: &FileStore, args: &serde_json::Value) -> Result<String, String> {
-    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    let start = args
-        .get("start_line")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .unwrap_or(1);
-    let end = args
-        .get("end_line")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .unwrap_or(usize::MAX);
-    match kb.read_lines(path, start, end) {
+    #[derive(serde::Deserialize)]
+    struct Args<'a> {
+        path: &'a str,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+    }
+    let args: Args =
+        serde::Deserialize::deserialize(args).map_err(|e| format!("invalid arguments: {e}"))?;
+    match kb.read_lines(
+        args.path,
+        args.start_line.unwrap_or(1),
+        args.end_line.unwrap_or(usize::MAX),
+    ) {
         Ok(text) if text.is_empty() => Ok("empty range".to_string()),
         Ok(text) => Ok(text),
         Err(e) => Err(format!("read failed: {e}")),
@@ -108,13 +115,20 @@ fn exec_read(kb: &FileStore, args: &serde_json::Value) -> Result<String, String>
 }
 
 fn exec_write(kb: &mut FileStore, args: &serde_json::Value) -> Result<String, String> {
-    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
-    let description = args
-        .get("description")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+    #[derive(serde::Deserialize)]
+    struct Args<'a> {
+        path: &'a str,
+        name: &'a str,
+        #[serde(default)]
+        description: &'a str,
+        content: &'a str,
+    }
+    let Args {
+        path,
+        name,
+        description,
+        content,
+    } = serde::Deserialize::deserialize(args).map_err(|e| format!("invalid arguments: {e}"))?;
     if name.is_empty() || content.is_empty() {
         return Err("name and content must not be empty".to_string());
     }
@@ -134,14 +148,10 @@ fn exec_write(kb: &mut FileStore, args: &serde_json::Value) -> Result<String, St
         description: Some(description.to_string()),
         extra: serde_yml::Mapping::default(),
     };
-    let rendered = match markdown::render(&fm, content) {
-        Ok(r) => r,
-        Err(e) => return Err(format!("render failed: {e}")),
-    };
-    match kb.write_file(&path, &rendered) {
-        Ok(()) => Ok(format!("written: {path}")),
-        Err(e) => Err(format!("write failed: {e}")),
-    }
+    let rendered = markdown::render(&fm, content).map_err(|e| format!("render failed: {e}"))?;
+    kb.write_file(&path, &rendered)
+        .map_err(|e| format!("write failed: {e}"))?;
+    Ok(format!("written: {path}"))
 }
 
 #[cfg(test)]
@@ -237,5 +247,30 @@ mod tests {
         );
         assert_eq!(out, "name: a");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wrong_argument_types_do_not_fall_back_to_defaults() {
+        let (dir, mut store) = temp_store();
+        for (name, args) in [
+            ("memory_search", serde_json::json!({})),
+            (
+                "memory_search",
+                serde_json::json!({"query": "rust", "limit": "5"}),
+            ),
+            (
+                "memory_read",
+                serde_json::json!({"path": "daily/a.md", "start_line": -1}),
+            ),
+            (
+                "memory_write",
+                serde_json::json!({"path": "daily/a.md", "name": "a", "content": "body", "description": 42}),
+            ),
+        ] {
+            let error = dispatch_result(&mut store, &call(name, args)).unwrap_err();
+            assert!(error.starts_with("invalid arguments:"), "{error}");
+        }
+        assert!(!dir.join("daily/a.md").exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

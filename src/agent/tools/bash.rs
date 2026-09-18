@@ -4,7 +4,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 
-const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+#[derive(serde::Deserialize)]
+struct Args {
+    command: String,
+    timeout: Option<u64>,
+    #[serde(default)]
+    background: bool,
+}
 
 pub struct Bash;
 
@@ -36,19 +42,21 @@ impl Tool for Bash {
         args: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
-            let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            let Args {
+                command,
+                timeout,
+                background,
+            } = match serde_json::from_value::<Args>(args) {
+                Ok(args) => args,
+                Err(e) => return ToolResult::err(format!("invalid arguments: {e}")),
+            };
             if command.is_empty() {
                 return ToolResult::err("command must not be empty");
             }
-            let background = args
-                .get("background")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
             if background {
-                let id = ctx.background.register("bash", command);
+                let id = ctx.background.register("bash", &command);
                 let bg = ctx.background.clone();
                 let events = ctx.events.clone();
-                let command = command.to_string();
                 let handle = tokio::spawn(async move {
                     let outcome = run_command(&command, Duration::from_secs(3600)).await;
                     let (success, output) = match outcome {
@@ -67,12 +75,8 @@ impl Tool for Bash {
                 ctx.background.attach(id, handle);
                 return ToolResult::ok(format!("background task #{id} started"));
             }
-            let timeout = args
-                .get("timeout")
-                .and_then(|v| v.as_u64())
-                .map(Duration::from_secs)
-                .unwrap_or(DEFAULT_TIMEOUT);
-            match run_command(command, timeout).await {
+            let timeout = Duration::from_secs(timeout.unwrap_or(30));
+            match run_command(&command, timeout).await {
                 Ok(out) => ToolResult::shell_output(out.text, out.success),
                 Err(e) => ToolResult::err(e),
             }

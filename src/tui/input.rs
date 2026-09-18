@@ -1,19 +1,40 @@
+use crate::i18n::{self, Key, Lang};
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use tui_textarea::TextArea;
 
-pub(super) const COMMANDS: &[(&str, &str)] = &[
-    ("help", "查看快捷键与命令"),
-    ("new", "中断前台工作并开始新会话"),
-    ("plan", "切换 Normal / Plan 模式"),
-    ("tasks", "查看、停止后台任务"),
-    ("todos", "展开或收起 Todo"),
-    ("skills", "列出已加载 skills"),
-    ("compact", "压缩对话上下文"),
-    ("quit", "退出"),
+/// Slash commands in completion order, each with the key of its description.
+/// Names are never translated: they are the typed identifiers themselves.
+pub(super) const COMMANDS: &[(&str, Key)] = &[
+    ("help", Key::CmdHelp),
+    ("sessions", Key::CmdSessions),
+    ("new", Key::CmdNew),
+    ("plan", Key::CmdPlan),
+    ("model", Key::CmdModel),
+    ("permissions", Key::CmdPermissions),
+    ("effort", Key::CmdEffort),
+    ("tasks", Key::CmdTasks),
+    ("todos", Key::CmdTodos),
+    ("skills", Key::CmdSkills),
+    ("compact", Key::CmdCompact),
+    ("lang", Key::CmdLang),
+    ("quit", Key::CmdQuit),
 ];
 
+/// Name and translated description of the command at `index` in [`COMMANDS`].
+pub(super) fn command(index: usize, lang: Lang) -> (&'static str, &'static str) {
+    let (name, key) = COMMANDS[index];
+    (name, i18n::text(lang, key))
+}
+
+/// The whole command list, described in `lang`; used by the help panel.
+pub(super) fn commands(lang: Lang) -> Vec<(&'static str, &'static str)> {
+    (0..COMMANDS.len()).map(|i| command(i, lang)).collect()
+}
+
+/// Slash-command names matching the current prefix; descriptions live in the
+/// command table and are resolved per language at render time.
 pub(super) fn matches(input: &TextArea<'_>) -> Vec<usize> {
     if input.lines().len() != 1 {
         return Vec::new();
@@ -111,7 +132,7 @@ impl History {
         self.draft = None;
     }
 
-    pub fn previous(&mut self, input: &mut TextArea<'static>) {
+    pub fn previous(&mut self, input: &mut TextArea<'static>, lang: Lang) {
         if self.entries.is_empty() {
             return;
         }
@@ -123,15 +144,15 @@ impl History {
             }
         };
         self.position = Some(index);
-        *input = editor(&self.entries[index]);
+        *input = editor(&self.entries[index], lang);
         input.move_cursor(tui_textarea::CursorMove::Top);
     }
 
-    pub fn next(&mut self, input: &mut TextArea<'static>) {
+    pub fn next(&mut self, input: &mut TextArea<'static>, lang: Lang) {
         let Some(index) = self.position else { return };
         if index + 1 < self.entries.len() {
             self.position = Some(index + 1);
-            *input = editor(&self.entries[index + 1]);
+            *input = editor(&self.entries[index + 1], lang);
         } else {
             if let Some(draft) = self.draft.take() {
                 *input = draft;
@@ -151,8 +172,8 @@ impl History {
     }
 }
 
-pub(super) fn editor(text: &str) -> TextArea<'static> {
-    let mut input = super::new_input();
+pub(super) fn editor(text: &str, lang: Lang) -> TextArea<'static> {
+    let mut input = super::new_input(lang);
     input.insert_str(text);
     input
 }
@@ -181,15 +202,15 @@ mod tests {
         let mut history = History::default();
         history.record("older").unwrap();
         history.record("newer").unwrap();
-        let mut draft = editor("未发送\n草稿");
+        let mut draft = editor("未发送\n草稿", Lang::Zh);
         draft.move_cursor(tui_textarea::CursorMove::Back);
         let cursor = draft.cursor();
-        history.previous(&mut draft);
+        history.previous(&mut draft, Lang::Zh);
         assert_eq!(draft.lines(), ["newer"]);
-        history.previous(&mut draft);
+        history.previous(&mut draft, Lang::Zh);
         assert_eq!(draft.lines(), ["older"]);
-        history.next(&mut draft);
-        history.next(&mut draft);
+        history.next(&mut draft, Lang::Zh);
+        history.next(&mut draft, Lang::Zh);
         assert_eq!(draft.lines(), ["未发送", "草稿"]);
         assert_eq!(draft.cursor(), cursor);
     }

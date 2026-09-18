@@ -2,6 +2,7 @@ use crate::extensions::memory::distill::slugify;
 use crate::extensions::memory::{BUCKET_NAMES, Catalog, FileStore, MemoryError, tools};
 use crate::llm::{LlmClient, LlmError, Message};
 use serde::Deserialize;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use thiserror::Error;
@@ -14,6 +15,8 @@ pub enum DreamError {
     Memory(#[from] MemoryError),
     #[error("extract step returned no parseable units")]
     ExtractFailed,
+    #[error("memory integration did not complete: {0}")]
+    Incomplete(String),
 }
 
 #[derive(Debug, Default)]
@@ -88,19 +91,27 @@ pub async fn dream(
     let units = extract_units(llm, &corpus, max_units).await?;
     let mut catalog = catalog;
     let mut dirty = false;
+    let mut sources = BTreeMap::<&str, bool>::new();
 
     for unit in &units {
-        match integrate_unit(llm, store, unit).await {
+        let outcome = integrate_unit(llm, store, unit).await;
+        for src in &unit.paths {
+            sources
+                .entry(src)
+                .and_modify(|success| *success &= outcome.is_ok())
+                .or_insert(outcome.is_ok());
+        }
+        match outcome {
             Ok(path) => {
                 report.integrated.push(path);
-                for src in &unit.paths {
-                    if let Some((_, mtime)) = changed.iter().find(|(rel, _)| rel == src) {
-                        catalog.checkpoints.insert(src.clone(), *mtime);
-                        dirty = true;
-                    }
-                }
             }
             Err(_) => report.failed.push(unit.name.clone()),
+        }
+    }
+    for (src, mtime) in &changed {
+        if sources.get(src.as_str()) == Some(&true) {
+            catalog.checkpoints.insert(src.clone(), *mtime);
+            dirty = true;
         }
     }
     if dirty {
@@ -168,20 +179,48 @@ async fn integrate_unit(
     );
     let mut messages = vec![Message::system(system), Message::user(user)];
     let tool_defs = tools::definitions();
+    let mut written = BTreeSet::new();
+    let mut unresolved_error = false;
     for _ in 0..MAX_UNIT_ROUNDS {
         let reply = llm.chat(&messages, Some(&tool_defs)).await?;
         match &reply.tool_calls {
             Some(calls) if !calls.is_empty() => {
                 messages.push(reply.clone());
                 for call in calls {
-                    let result = tools::dispatch(store, call);
-                    messages.push(Message::tool(call.id.clone(), result));
+                    let result = tools::dispatch_result(store, call);
+                    match &result {
+                        Ok(content) if call.function.name == "memory_write" => {
+                            // Only a successful write to a digest node proves integration.
+                            if let Some(path) = content.strip_prefix("written: ").filter(|path| {
+                                path.starts_with("digest/")
+                                    && Path::new(path)
+                                        .components()
+                                        .all(|c| matches!(c, std::path::Component::Normal(_)))
+                            }) {
+                                written.insert(path.to_owned());
+                                unresolved_error = false;
+                            } else {
+                                unresolved_error = true;
+                            }
+                        }
+                        Err(_) => unresolved_error = true,
+                        _ => {}
+                    }
+                    messages.push(Message::tool(call.id.clone(), result.unwrap_or_else(|e| e)));
                 }
             }
-            _ => return Ok(target),
+            _ => {
+                return if written.len() == 1 && !unresolved_error {
+                    Ok(written.into_iter().next().unwrap())
+                } else {
+                    Err(DreamError::Incomplete(
+                        "expected one successfully written digest node".into(),
+                    ))
+                };
+            }
         }
     }
-    Ok(target)
+    Err(DreamError::Incomplete("tool round limit reached".into()))
 }
 
 /// All `daily/**/*.md` as (workspace-relative path, mtime unix secs).
@@ -230,6 +269,89 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, i64)>) -> Result<(), Dre
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unit(name: &str) -> serde_json::Value {
+        serde_json::json!({"name": name, "bucket": "wiki", "summary": "fact", "paths": ["daily/a.md"]})
+    }
+
+    fn write_reply(path: &str) -> (u16, String) {
+        crate::test_support::reply(Message {
+            role: "assistant".into(),
+            tool_calls: Some(vec![crate::llm::ToolCall {
+                id: "write".into(), kind: "function".into(),
+                function: crate::llm::FunctionCall {
+                    name: "memory_write".into(),
+                    arguments: serde_json::json!({"path": path, "name": "fact", "content": "remember this"}).to_string(),
+                },
+            }]),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn missing_failed_or_unfinished_writes_do_not_checkpoint() {
+        use crate::test_support::{MockLlm, reply};
+        for responses in [
+            vec![reply(Message::assistant("done"))],
+            vec![write_reply("outside/a"), reply(Message::assistant("done"))],
+            vec![write_reply("digest/wiki/a"); MAX_UNIT_ROUNDS],
+        ] {
+            let root = std::env::temp_dir().join(format!("kb-dream-{}", uuid::Uuid::new_v4()));
+            let mut store = FileStore::open(&root).unwrap();
+            store.write_file("daily/a.md", "daily fact").unwrap();
+            let mut script = vec![reply(Message::assistant(
+                serde_json::json!([unit("a")]).to_string(),
+            ))];
+            script.extend(responses);
+            let mock = MockLlm::start(script).await;
+            let report = dream(&mock.client, &mut store, 5).await.unwrap();
+            assert!(report.integrated.is_empty());
+            assert_eq!(report.failed, ["a"]);
+            assert!(Catalog::load(&root).unwrap().checkpoints.is_empty());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_failure_stays_pending_and_reports_actual_write_path() {
+        use crate::test_support::{MockLlm, reply};
+        let root = std::env::temp_dir().join(format!("kb-dream-{}", uuid::Uuid::new_v4()));
+        let mut store = FileStore::open(&root).unwrap();
+        store.write_file("daily/a.md", "two facts").unwrap();
+        let mock = MockLlm::start(vec![
+            reply(Message::assistant(
+                serde_json::json!([unit("a"), unit("b")]).to_string(),
+            )),
+            write_reply("digest/wiki/existing"),
+            reply(Message::assistant("done")),
+            (500, "unavailable".into()),
+        ])
+        .await;
+        let report = dream(&mock.client, &mut store, 5).await.unwrap();
+        assert_eq!(report.integrated, ["digest/wiki/existing.md"]);
+        assert_eq!(report.failed, ["b"]);
+        assert!(Catalog::load(&root).unwrap().checkpoints.is_empty());
+        let retry = MockLlm::start(vec![
+            reply(Message::assistant(
+                serde_json::json!([unit("a"), unit("b")]).to_string(),
+            )),
+            write_reply("digest/wiki/existing"),
+            reply(Message::assistant("done")),
+            write_reply("digest/wiki/b"),
+            reply(Message::assistant("done")),
+        ])
+        .await;
+        let report = dream(&retry.client, &mut store, 5).await.unwrap();
+        assert_eq!(report.changed, 1);
+        assert_eq!(report.integrated.len(), 2);
+        assert!(
+            Catalog::load(&root)
+                .unwrap()
+                .checkpoints
+                .contains_key("daily/a.md")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn parse_units_lenient() {

@@ -34,7 +34,11 @@ pub async fn compact(llm: &LlmClient, history: &mut Vec<Message>) -> Result<bool
         transcript.push_str(content);
         transcript.push_str("\n\n");
         if transcript.len() > MAX_SUMMARY_INPUT_CHARS {
-            transcript.truncate(MAX_SUMMARY_INPUT_CHARS);
+            let mut end = MAX_SUMMARY_INPUT_CHARS;
+            while !transcript.is_char_boundary(end) {
+                end -= 1;
+            }
+            transcript.truncate(end);
             break;
         }
     }
@@ -62,6 +66,24 @@ pub async fn compact(llm: &LlmClient, history: &mut Vec<Message>) -> Result<bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn long_unicode_history_is_compacted_without_panicking() {
+        let mock = crate::test_support::MockLlm::start(vec![crate::test_support::reply(
+            Message::assistant("summary"),
+        )])
+        .await;
+        let mut history = vec![
+            Message::user("中".repeat(7000)),
+            Message::assistant("ok"),
+            Message::user("2"),
+            Message::assistant("ok"),
+            Message::user("3"),
+            Message::assistant("ok"),
+        ];
+        assert!(compact(&mock.client, &mut history).await.unwrap());
+        assert!(history[0].content.as_ref().unwrap().contains("summary"));
+    }
 
     #[test]
     fn split_point_keeps_recent_four() {

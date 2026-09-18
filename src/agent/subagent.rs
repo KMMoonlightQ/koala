@@ -7,7 +7,7 @@ use crate::llm::Message;
 pub async fn run(ctx: &mut ToolContext<'_>, task_prompt: &str) -> Result<String, AgentError> {
     let extension = ctx.shared.extensions.hook(crate::extensions::Stage::TurnStart,
         serde_json::json!({"input": task_prompt, "depth": ctx.depth, "plan_mode": ctx.plan_mode})).await.map_err(AgentError::Extension)?;
-    let mut system = prompt::subagent_system();
+    let mut system = prompt::subagent_system(ctx.shared.lang.get());
     if let Some(context) = extension.context {
         system.push_str(&context);
     }

@@ -10,7 +10,6 @@ use super::event::EventSender;
 use super::plan::TodoList;
 use super::skills::Skills;
 use super::{AgentError, SharedState};
-use crate::llm::ToolCall;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -157,14 +156,15 @@ impl ToolRegistry {
             .collect()
     }
 
-    pub async fn execute(&self, ctx: &mut ToolContext<'_>, call: &ToolCall) -> ToolResult {
-        let args: serde_json::Value = match serde_json::from_str(&call.function.arguments) {
-            Ok(v) => v,
-            Err(e) => return ToolResult::err(format!("invalid arguments: {e}")),
-        };
-        match self.tools.iter().find(|t| t.name() == call.function.name) {
+    pub async fn execute(
+        &self,
+        ctx: &mut ToolContext<'_>,
+        name: &str,
+        args: serde_json::Value,
+    ) -> ToolResult {
+        match self.tools.iter().find(|t| t.name() == name) {
             Some(tool) => tool.execute(ctx, args).await,
-            None => ToolResult::err(format!("unknown tool: {}", call.function.name)),
+            None => ToolResult::err(format!("unknown tool: {name}")),
         }
     }
 }
@@ -222,7 +222,6 @@ impl From<std::io::Error> for AgentError {
 
 #[cfg(test)]
 mod tests {
-    use super::super::hooks::Hooks;
     use super::super::permissions::Permissions;
     use super::*;
     use crate::config::{HooksConfig, PermissionsConfig};
@@ -237,18 +236,14 @@ mod tests {
                 &std::collections::HashMap::new(),
             ),
             permissions: Permissions::new(&PermissionsConfig::default()),
-            hooks: Hooks::new(&HooksConfig {
-                pre_tool_use: vec![],
-                post_tool_use: vec![],
-                turn_start: vec![],
-                turn_end: vec![],
-            }),
+            hooks: HooksConfig::default(),
             extensions: crate::extensions::Extensions::default(),
-            max_tool_rounds: 4,
+            max_tool_rounds: Some(4),
             max_retries: 0,
             compact_threshold: 1000,
-            subagent_max_rounds: 2,
+            subagent_max_rounds: Some(2),
             memory_file: std::path::PathBuf::from("/tmp/kb-agent-ctx-test.md"),
+            lang: crate::i18n::LangCell::new(crate::i18n::Lang::En),
         })
     }
 
@@ -287,5 +282,61 @@ mod tests {
         assert!(result.content.len() < 8200);
         assert!(result.content.contains("truncated"));
         assert!(!result.content.ends_with("END"));
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_arguments_leave_state_unchanged() {
+        let mut todos = TodoList::default();
+        let mem = AgentMemory::load(
+            std::env::temp_dir().join(format!("kb-args-{}", uuid::Uuid::new_v4())),
+        );
+        let skills = Arc::new(Skills::default());
+        let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let shared = shared_state();
+        let mut ctx = ToolContext {
+            todos: &mut todos,
+            agent_memory: &mem,
+            background: BackgroundManager::default(),
+            skills: &skills,
+            events: &events,
+            shared: &shared,
+            depth: 0,
+            plan_mode: false,
+        };
+        let registry = ToolRegistry::build(0);
+        let valid =
+            serde_json::json!({"todos": [{"content": "keep this", "status": "in_progress"}]});
+        assert!(
+            !registry
+                .execute(&mut ctx, "todo_write", valid)
+                .await
+                .is_error
+        );
+        for (name, args) in [
+            (
+                "todo_write",
+                serde_json::json!({"todos": [{"content": "bad", "status": "typo"}]}),
+            ),
+            (
+                "todo_write",
+                serde_json::json!({"todos": [{"content": "missing status"}]}),
+            ),
+            (
+                "bash",
+                serde_json::json!({"command": "must-not-execute", "background": "true"}),
+            ),
+            (
+                "bash",
+                serde_json::json!({"command": "must-not-execute", "timeout": -1}),
+            ),
+            ("task", serde_json::json!({"prompt": "missing description"})),
+            ("remember", serde_json::json!({"text": 123})),
+            ("skill", serde_json::json!({"name": 123})),
+        ] {
+            let result = registry.execute(&mut ctx, name, args).await;
+            assert!(result.is_error, "{name}: {}", result.content);
+        }
+        assert_eq!(ctx.todos.render_prompt(), "1. [~] keep this");
+        assert_eq!(mem.content().unwrap(), "");
     }
 }

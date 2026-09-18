@@ -54,9 +54,9 @@ pub fn chunk_markdown(
                 );
             }
             let sec_end = section_ends(&headings, n);
-            let top = headings.iter().map(|h| h.level).min().unwrap();
+            let mut covered_until = 0;
             for i in 0..headings.len() {
-                if headings[i].level == top {
+                if headings[i].line > covered_until {
                     chunk_section(
                         &mut out,
                         path,
@@ -68,6 +68,7 @@ pub fn chunk_markdown(
                         max_chunk_lines,
                         offset,
                     );
+                    covered_until = sec_end[i];
                 }
             }
         }
@@ -186,20 +187,21 @@ fn chunk_section(
         push_chunk(out, path, lines, start, end, bc, offset);
         return;
     }
-    let child_level = headings[i + 1..]
-        .iter()
-        .take_while(|c| c.line <= end)
-        .filter(|c| c.level > h.level)
-        .map(|c| c.level)
-        .min();
-    let Some(child_level) = child_level else {
+    let mut children = Vec::new();
+    let mut covered_until = start;
+    for j in i + 1..headings.len() {
+        if headings[j].line > end {
+            break;
+        }
+        if headings[j].line > covered_until {
+            children.push(j);
+            covered_until = sec_end[j];
+        }
+    }
+    if children.is_empty() {
         split_lines(out, path, lines, start, end, &bc, max, offset);
         return;
-    };
-    let children: Vec<usize> = (i + 1..headings.len())
-        .take_while(|&j| headings[j].line <= end)
-        .filter(|&j| headings[j].level == child_level)
-        .collect();
+    }
     let intro_end = headings[children[0]].line - 1;
     emit_or_split(out, path, lines, start, intro_end, &bc, max, offset);
     for &c in &children {
@@ -286,6 +288,31 @@ mod tests {
 
     fn chunks(text: &str, max: usize) -> Vec<Chunk> {
         chunk_markdown("test.md", text, max, None, None)
+    }
+
+    #[test]
+    fn mixed_heading_levels_cover_every_line_once() {
+        for text in [
+            "## Earlier\nuniqueearlierword\n# Later\nuniquelaterword\n",
+            "# Root\nintro\n### Early\nearly body\n## Later\nlater body\n#### Deep\ndeep body\n## Last\nlast body\n",
+        ] {
+            for max in [1, 3, 80] {
+                let chunks = chunk_markdown("daily/a.md", text, max, None, None);
+                let covered: Vec<_> = chunks
+                    .iter()
+                    .flat_map(|c| c.start_line..=c.end_line)
+                    .collect();
+                assert_eq!(covered, (1..=text.lines().count()).collect::<Vec<_>>());
+                assert_eq!(
+                    chunks
+                        .iter()
+                        .map(|c| c.text.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    text.trim_end()
+                );
+            }
+        }
     }
 
     #[test]

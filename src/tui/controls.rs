@@ -1,5 +1,6 @@
 use super::{App, Panel, input};
 use crate::agent::event::{SessionCommand, TaskState};
+use crate::i18n::{self, Key};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 pub(super) fn close_panel(app: &mut App) {
@@ -21,7 +22,7 @@ pub(super) fn open_tasks(app: &mut App) {
 
 pub(super) fn toggle_mode(app: &mut App) {
     if app.busy {
-        app.hint = Some("当前轮正在执行，请先按 Esc 中断再切换模式".into());
+        app.hint = Some(i18n::text(app.lang, Key::NoteBusyInterruptFirst).into());
     } else {
         app.session.send(SessionCommand::TogglePlanMode);
     }
@@ -48,7 +49,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             return true;
         }
         KeyCode::Char('t') if ctrl => {
-            app.todos_expanded = !app.todos_expanded;
+            app.panel = Some(Panel::Todos { scroll: 0 });
             return true;
         }
         KeyCode::Char('j') if ctrl => {
@@ -79,7 +80,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             }
             KeyCode::Tab | KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
                 let selected = matches[app.menu_selected.min(matches.len() - 1)];
-                app.input = input::editor(&format!("/{}", input::COMMANDS[selected].0));
+                app.input = input::editor(&format!("/{}", input::COMMANDS[selected].0), app.lang);
                 app.menu_dismissed = true;
                 if key.code == KeyCode::Enter {
                     super::submit(app);
@@ -95,12 +96,12 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     }
     match key.code {
         KeyCode::Up if app.input.cursor().0 == 0 => {
-            app.history.previous(&mut app.input);
+            app.history.previous(&mut app.input, app.lang);
             app.menu_dismissed = true;
             true
         }
         KeyCode::Down if app.input.cursor().0 + 1 == app.input.lines().len() => {
-            app.history.next(&mut app.input);
+            app.history.next(&mut app.input, app.lang);
             app.menu_dismissed = true;
             true
         }
@@ -110,6 +111,10 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent) -> bool {
 
 fn panel_key(app: &mut App, key: KeyEvent) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if ctrl && key.code == KeyCode::Char('t') && matches!(app.panel, Some(Panel::Todos { .. })) {
+        close_panel(app);
+        return true;
+    }
     if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c')) {
         if let Some(Panel::Tasks { output, scroll, .. }) = &mut app.panel
             && *output
@@ -122,7 +127,57 @@ fn panel_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
     match app.panel.as_mut().unwrap() {
-        Panel::Help { scroll } => match key.code {
+        Panel::Sessions { selected, loading } => match key.code {
+            KeyCode::Up => *selected = selected.saturating_sub(1),
+            KeyCode::Down => *selected = (*selected + 1).min(app.sessions.len().saturating_sub(1)),
+            KeyCode::Enter if !*loading && !app.busy => {
+                if let Some(item) = app.sessions.get(*selected) {
+                    app.session
+                        .send(SessionCommand::RestoreSession(item.id.clone()));
+                    close_panel(app);
+                    app.restarting = true;
+                    app.start(i18n::text(app.lang, Key::StatusRestoringSession));
+                }
+            }
+            _ => {}
+        },
+        Panel::Permissions { selected } => match key.code {
+            KeyCode::Up => *selected = selected.saturating_sub(1),
+            KeyCode::Down => *selected = (*selected + 1).min(2),
+            KeyCode::Enter => {
+                app.session.send(SessionCommand::SetPermissionMode(
+                    super::PermissionMode::ALL[*selected],
+                ));
+                close_panel(app);
+            }
+            _ => {}
+        },
+        Panel::Model { selected } => match key.code {
+            KeyCode::Up => *selected = selected.saturating_sub(1),
+            KeyCode::Down => *selected = (*selected + 1).min(app.models.len().saturating_sub(1)),
+            KeyCode::Enter => {
+                if let Some(name) = app.models.get(*selected) {
+                    app.session.send(SessionCommand::SelectModel(name.clone()));
+                }
+                close_panel(app);
+            }
+            _ => {}
+        },
+        Panel::Effort { selected } => match key.code {
+            KeyCode::Up => *selected = selected.saturating_sub(1),
+            KeyCode::Down => {
+                *selected = (*selected + 1).min(app.reasoning_efforts.len().saturating_sub(1))
+            }
+            KeyCode::Enter => {
+                if let Some(value) = app.reasoning_efforts.get(*selected) {
+                    app.session
+                        .send(SessionCommand::SetReasoningEffort(value.clone()));
+                }
+                close_panel(app);
+            }
+            _ => {}
+        },
+        Panel::Help { scroll } | Panel::Todos { scroll } => match key.code {
             KeyCode::Down | KeyCode::PageDown => {
                 *scroll = scroll.saturating_add(if key.code == KeyCode::Down { 1 } else { 8 })
             }
@@ -144,7 +199,7 @@ fn panel_key(app: &mut App, key: KeyEvent) -> bool {
                 }
                 KeyCode::Enter | KeyCode::Tab => {
                     if let Some(index) = matches.get(*selected) {
-                        app.input = input::editor(&app.history.entries[*index]);
+                        app.input = input::editor(&app.history.entries[*index], app.lang);
                         app.history.reset_navigation();
                         app.menu_dismissed = true;
                         close_panel(app);

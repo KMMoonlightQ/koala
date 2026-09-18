@@ -1,5 +1,6 @@
 use super::{markdown, text, theme};
 use crate::agent::event::{TodoState, TodoView};
+use crate::i18n::{self, Key, Lang};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
@@ -34,10 +35,18 @@ pub(super) struct ToolEntry {
 pub(super) struct Rendered {
     pub width: u16,
     pub detailed: bool,
+    /// Localised labels are baked into `lines`, so a language switch invalidates
+    /// the cache just like a width or detail change does.
+    pub lang: Lang,
     pub lines: Vec<Line<'static>>,
 }
 
-pub(super) fn render_entry(entry: &EntryKind, width: usize, detailed: bool) -> Vec<Line<'static>> {
+pub(super) fn render_entry(
+    entry: &EntryKind,
+    width: usize,
+    detailed: bool,
+    lang: Lang,
+) -> Vec<Line<'static>> {
     let body_width = width.saturating_sub(2).max(1);
     match entry {
         EntryKind::User(source) => {
@@ -49,11 +58,11 @@ pub(super) fn render_entry(entry: &EntryKind, width: usize, detailed: bool) -> V
             )
         }
         EntryKind::Assistant(source) => text::prefixed_styled(
-            markdown::render(source, body_width),
+            markdown::render(source, body_width, lang),
             Span::styled("⏺ ", theme::accent()),
             Span::raw("  "),
         ),
-        EntryKind::Tool(tool) => render_tool(tool, width, detailed),
+        EntryKind::Tool(tool) => render_tool(tool, width, detailed, lang),
         EntryKind::Todos(items) => items
             .iter()
             .flat_map(|item| {
@@ -89,13 +98,14 @@ pub(super) fn literal(source: &str, width: usize, style: Style) -> Vec<Line<'sta
         .collect()
 }
 
-fn render_tool(tool: &ToolEntry, width: usize, detailed: bool) -> Vec<Line<'static>> {
-    let (mark, label, style) = match tool.state {
-        ToolState::Running => ("◐", "进行中", theme::warning()),
-        ToolState::Succeeded => ("✓", "成功", theme::success()),
-        ToolState::Failed => ("✗", "失败", theme::error()),
-        ToolState::Cancelled => ("■", "已中断", theme::muted()),
+fn render_tool(tool: &ToolEntry, width: usize, detailed: bool, lang: Lang) -> Vec<Line<'static>> {
+    let (mark, key, style) = match tool.state {
+        ToolState::Running => ("◐", Key::ToolRunning, theme::warning()),
+        ToolState::Succeeded => ("✓", Key::ToolSucceeded, theme::success()),
+        ToolState::Failed => ("✗", Key::ToolFailed, theme::error()),
+        ToolState::Cancelled => ("■", Key::ToolCancelled, theme::muted()),
     };
+    let label = i18n::text(lang, key);
     let elapsed = tool
         .duration_ms
         .map(|ms| format!(" · {:.1}s", ms as f64 / 1000.0))
@@ -117,23 +127,32 @@ fn render_tool(tool: &ToolEntry, width: usize, detailed: bool) -> Vec<Line<'stat
     let mut lines = text::wrap(header, width);
     if !detailed && lines.len() > 2 {
         lines.truncate(1);
-        lines.push(Line::styled("  … Ctrl+O 查看完整参数", theme::muted()));
+        lines.push(Line::styled(
+            i18n::text(lang, Key::ViewFullArgs),
+            theme::key_hint(),
+        ));
     }
     if detailed {
         let arguments = serde_json::from_str::<serde_json::Value>(&tool.arguments)
             .and_then(|value| serde_json::to_string_pretty(&value))
             .unwrap_or_else(|_| tool.arguments.clone());
-        lines.push(Line::styled("  参数", theme::muted()));
+        lines.push(Line::styled(
+            i18n::text(lang, Key::ArgsLabel),
+            theme::muted(),
+        ));
         lines.extend(text::prefixed(
             literal(&arguments, width.saturating_sub(4), theme::muted()),
             "    ",
             "    ",
         ));
-        lines.push(Line::styled("  输出", theme::muted()));
+        lines.push(Line::styled(
+            i18n::text(lang, Key::OutputLabel),
+            theme::muted(),
+        ));
     }
     if let Some(output) = &tool.output {
         let output = if output.is_empty() {
-            "（无输出）"
+            i18n::text(lang, Key::NoOutput)
         } else {
             output
         };
@@ -158,8 +177,8 @@ fn render_tool(tool: &ToolEntry, width: usize, detailed: bool) -> Vec<Line<'stat
         lines.extend(text::prefixed(content, "  ⎿ ", "    "));
         if hidden > 0 {
             lines.push(Line::styled(
-                format!("    … 另 {hidden} 行 · Ctrl+O 展开"),
-                theme::muted(),
+                i18n::fill(lang, Key::MoreLines, &[("n", &hidden.to_string())]),
+                theme::key_hint(),
             ));
         }
     }

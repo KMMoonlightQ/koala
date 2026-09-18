@@ -1,13 +1,15 @@
 //! Terminal Markdown, separate from the knowledge-base frontmatter parser.
 use super::{text, theme};
+use crate::i18n::{self, Key, Lang};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
-pub fn render(source: &str, width: usize) -> Vec<Line<'static>> {
+pub fn render(source: &str, width: usize, lang: Lang) -> Vec<Line<'static>> {
     let source = text::clean(source);
     let mut view = Renderer {
         width: width.max(1),
+        lang,
         lines: Vec::new(),
         spans: Vec::new(),
         styles: vec![Style::default()],
@@ -34,6 +36,7 @@ pub fn render(source: &str, width: usize) -> Vec<Line<'static>> {
 
 struct Renderer {
     width: usize,
+    lang: Lang,
     lines: Vec<Line<'static>>,
     spans: Vec<Span<'static>>,
     styles: Vec<Style>,
@@ -241,7 +244,14 @@ impl Renderer {
         if cell_width < 6 {
             // Narrow terminals get labeled rows rather than clipped columns.
             for (index, row) in rows.iter().enumerate().skip(1) {
-                self.styled(format!("记录 {index}"), theme::heading());
+                self.styled(
+                    i18n::fill(
+                        self.lang,
+                        Key::RecordTitle,
+                        &[("index", &index.to_string())],
+                    ),
+                    theme::heading(),
+                );
                 self.flush();
                 for (col, cell) in row.iter().enumerate() {
                     let label = rows[0].get(col).map(String::as_str).unwrap_or("");
@@ -405,6 +415,7 @@ mod tests {
         let lines = render(
             "# 标题\n\n**粗体** 和 *斜体* 与 `代码`\n\n- 第一项\n  - 子项\n\n> 引用\n\n[文档](https://example.com)\n",
             60,
+            Lang::Zh,
         );
         let text = plain(&lines);
         assert!(!text.contains("**"));
@@ -423,7 +434,7 @@ mod tests {
 
     #[test]
     fn incomplete_streaming_code_fence_and_highlighting_are_safe() {
-        let lines = render("```rust\nlet 中文 = 42;\n", 24);
+        let lines = render("```rust\nlet 中文 = 42;\n", 24, Lang::Zh);
         let text = plain(&lines);
         assert!(text.contains("let 中文 = 42;"));
         assert!(!text.contains("```"));
@@ -438,17 +449,17 @@ mod tests {
     #[test]
     fn tables_wrap_cjk_and_fall_back_to_labeled_rows() {
         let source = "| 项目 | 状态 |\n|---|---|\n| 中文长项目名称 | 已完成 |";
-        let wide = render(source, 30);
+        let wide = render(source, 30, Lang::Zh);
         assert!(plain(&wide).contains("已完成"));
         assert!(wide.iter().all(|l| l.width() <= 30));
-        let narrow = plain(&render(source, 14));
+        let narrow = plain(&render(source, 14, Lang::Zh));
         assert!(narrow.contains("记录 1"));
         assert!(narrow.contains("状态: 已完成"));
     }
 
     #[test]
     fn long_lines_preserve_quote_and_list_continuations() {
-        let lines = render("> - 中文中文中文中文中文中文中文中文", 18);
+        let lines = render("> - 中文中文中文中文中文中文中文中文", 18, Lang::Zh);
         assert!(lines.iter().all(|l| l.width() <= 18));
         assert!(
             plain(&lines)
@@ -456,5 +467,19 @@ mod tests {
                 .filter(|l| !l.is_empty())
                 .all(|l| l.starts_with("│ "))
         );
+    }
+
+    #[test]
+    fn narrow_tables_use_labelled_rows_in_the_active_language() {
+        let source = "| a | b |\n| --- | --- |\n| 1 | 2 |";
+        let plain = |lang: Lang| {
+            // Narrow enough that the table falls back to labelled rows.
+            render(source, 14, lang)
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<String>()
+        };
+        assert!(plain(Lang::En).contains("Record 1"));
+        assert!(plain(Lang::Zh).contains("记录 1"));
     }
 }

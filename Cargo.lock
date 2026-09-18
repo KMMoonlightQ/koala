@@ -934,7 +934,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "kb-agent"
+name = "koala"
 version = "0.1.0"
 dependencies = [
  "anyhow",

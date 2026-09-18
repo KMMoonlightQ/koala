@@ -1,3 +1,4 @@
+use crate::i18n::{self, Key, Lang};
 use serde::Deserialize;
 use std::fs;
 use std::path::PathBuf;
@@ -14,6 +15,8 @@ pub enum ConfigError {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct Config {
+    /// Interface language for the TUI and system prompts; `/lang` toggles it.
+    pub lang: Lang,
     pub llm: LlmConfig,
     pub memory: MemoryConfig,
     pub agent: AgentConfig,
@@ -22,11 +25,50 @@ pub struct Config {
     pub extensions: ExtensionsConfig,
 }
 
+/// Approval level, independent of the agent's Normal / Plan execution mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionMode {
+    #[default]
+    Normal,
+    AskWhenNeed,
+    NeverAsk,
+}
+
+impl PermissionMode {
+    pub const ALL: [Self; 3] = [Self::Normal, Self::AskWhenNeed, Self::NeverAsk];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::AskWhenNeed => "Ask When Need",
+            Self::NeverAsk => "Never Ask",
+        }
+    }
+
+    pub fn description(self, lang: Lang) -> &'static str {
+        match self {
+            Self::Normal => i18n::text(lang, Key::PermNormalDesc),
+            Self::AskWhenNeed => i18n::text(lang, Key::PermAskDesc),
+            Self::NeverAsk => i18n::text(lang, Key::PermNeverDesc),
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "normal" => Some(Self::Normal),
+            "ask_when_need" => Some(Self::AskWhenNeed),
+            "never_ask" => Some(Self::NeverAsk),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct PermissionsConfig {
-    /// Fallback when a tool matches neither allow nor deny: "allow" | "ask" | "deny".
-    pub default: String,
+    pub mode: PermissionMode,
+    /// Explicit trusted tools in Ask When Need only.
     pub allow: Vec<String>,
     pub deny: Vec<String>,
 }
@@ -34,8 +76,8 @@ pub struct PermissionsConfig {
 impl Default for PermissionsConfig {
     fn default() -> Self {
         Self {
-            default: "ask".into(),
-            allow: vec!["todo_write".into(), "remember".into(), "skill".into()],
+            mode: PermissionMode::Normal,
+            allow: Vec::new(),
             deny: Vec::new(),
         }
     }
@@ -56,6 +98,14 @@ pub struct LlmConfig {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    /// Additional selectable models using this endpoint and credentials.
+    pub models: Vec<ModelConfig>,
+    /// Provider-supported values, in the order shown by /effort.
+    pub reasoning_efforts: Vec<String>,
+    /// Initial value; defaults to the first configured effort.
+    pub reasoning_effort: Option<String>,
+    /// Model capacity in tokens, used as the context usage percentage denominator.
+    pub context_window: Option<std::num::NonZeroU64>,
     /// Extra HTTP headers sent with every request, for endpoints that require
     /// routing headers beyond OpenAI auth (e.g. x-opencode-session).
     pub headers: std::collections::HashMap<String, String>,
@@ -67,8 +117,73 @@ impl Default for LlmConfig {
             base_url: "https://api.openai.com/v1".into(),
             api_key: String::new(),
             model: String::new(),
+            models: Vec::new(),
+            reasoning_efforts: Vec::new(),
+            reasoning_effort: None,
+            context_window: None,
             headers: std::collections::HashMap::new(),
         }
+    }
+}
+
+/// Model-specific capabilities; omitted metadata is never inherited from another model.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ModelConfig {
+    pub model: String,
+    pub reasoning_efforts: Vec<String>,
+    pub reasoning_effort: Option<String>,
+    pub context_window: Option<std::num::NonZeroU64>,
+}
+
+impl LlmConfig {
+    pub fn selectable_models(&self) -> Result<Vec<ModelConfig>, String> {
+        let mut models = self.models.clone();
+        if !models.iter().any(|m| m.model == self.model) {
+            models.insert(
+                0,
+                ModelConfig {
+                    model: self.model.clone(),
+                    reasoning_efforts: self.reasoning_efforts.clone(),
+                    reasoning_effort: self.reasoning_effort.clone(),
+                    context_window: self.context_window,
+                },
+            );
+        }
+        for (index, model) in models.iter().enumerate() {
+            if model.model.trim().is_empty()
+                || model.model.chars().any(char::is_whitespace)
+                || model.model.chars().any(char::is_control)
+                || models[..index].iter().any(|m| m.model == model.model)
+            {
+                return Err(
+                    "model names must be nonempty, unique and contain no whitespace".into(),
+                );
+            }
+            let efforts = &model.reasoning_efforts;
+            if efforts.iter().enumerate().any(|(i, v)| {
+                v.is_empty()
+                    || v.chars().any(char::is_whitespace)
+                    || v.chars().any(char::is_control)
+                    || efforts[..i].contains(v)
+            }) {
+                return Err(format!(
+                    "{}: reasoning_efforts must contain unique, nonempty values without whitespace",
+                    model.model
+                ));
+            }
+            if model
+                .reasoning_effort
+                .as_ref()
+                .is_some_and(|v| !efforts.contains(v))
+            {
+                return Err(format!(
+                    "{}: reasoning_effort must be listed in reasoning_efforts",
+                    model.model
+                ));
+            }
+        }
+        Ok(models)
     }
 }
 
@@ -89,11 +204,14 @@ impl Default for MemoryConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AgentConfig {
-    pub max_tool_rounds: usize,
+    /// None means unlimited; zero disables tool execution.
+    #[serde(deserialize_with = "deserialize_round_limit")]
+    pub max_tool_rounds: Option<usize>,
     pub max_retries: usize,
     /// Compact history when its estimated size (chars) exceeds this.
     pub compact_threshold: usize,
-    pub subagent_max_rounds: usize,
+    #[serde(deserialize_with = "deserialize_round_limit")]
+    pub subagent_max_rounds: Option<usize>,
     /// Directory where chat transcripts (session jsonl) are appended.
     /// Extensions can use the path supplied on successful root turn_end.
     pub session_dir: PathBuf,
@@ -104,13 +222,33 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_tool_rounds: 8,
-            max_retries: 3,
+            max_tool_rounds: None,
+            max_retries: 5,
             compact_threshold: 40_000,
-            subagent_max_rounds: 8,
+            subagent_max_rounds: None,
             session_dir: PathBuf::from(".kb/session"),
             memory_file: default_memory_file(),
         }
+    }
+}
+
+/// Accept a nonnegative round budget or the explicit TOML string "unlimited".
+fn deserialize_round_limit<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Limit {
+        Rounds(usize),
+        Name(String),
+    }
+    match Limit::deserialize(deserializer)? {
+        Limit::Rounds(rounds) => Ok(Some(rounds)),
+        Limit::Name(name) if name == "unlimited" => Ok(None),
+        Limit::Name(_) => Err(serde::de::Error::custom(
+            "round limit must be a nonnegative integer or \"unlimited\"",
+        )),
     }
 }
 
@@ -159,12 +297,56 @@ impl Config {
         if let Some(v) = get("KBA_WORKSPACE") {
             self.memory.workspace = PathBuf::from(v);
         }
+        if let Some(v) = get("KBA_LANG").and_then(|v| Lang::parse(&v)) {
+            self.lang = v;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_profiles_override_legacy_metadata_without_leaking_to_other_models() {
+        let cfg: Config = toml::from_str(
+            r#"
+[llm]
+model = "a"
+reasoning_efforts = ["legacy"]
+context_window = 1000
+[[llm.models]]
+model = "a"
+reasoning_efforts = ["high"]
+[[llm.models]]
+model = "b"
+context_window = 2000
+"#,
+        )
+        .unwrap();
+        let models = cfg.llm.selectable_models().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].reasoning_efforts, vec!["high"]);
+        assert!(models[0].context_window.is_none());
+        assert!(models[1].reasoning_efforts.is_empty());
+        let mut cfg = cfg;
+        cfg.llm.models.push(cfg.llm.models[0].clone());
+        assert!(cfg.llm.selectable_models().is_err());
+        cfg.llm.models.pop();
+        cfg.llm.models[1].reasoning_effort = Some("unsupported".into());
+        assert!(cfg.llm.selectable_models().is_err());
+    }
+
+    #[test]
+    fn model_capacity_must_be_positive_and_metadata_is_optional() {
+        let cfg: Config = toml::from_str("[llm]\nmodel = 'test'").unwrap();
+        assert!(cfg.llm.context_window.is_none());
+        assert!(cfg.llm.reasoning_efforts.is_empty());
+        assert!(cfg.llm.reasoning_effort.is_none());
+        for value in ["0", "-1"] {
+            assert!(toml::from_str::<Config>(&format!("[llm]\ncontext_window = {value}")).is_err());
+        }
+    }
 
     #[test]
     fn parses_full_config() {
@@ -195,8 +377,30 @@ max_tool_rounds = 2
             Some("kb-agent")
         );
         assert_eq!(cfg.memory.workspace, PathBuf::from(".kb"));
-        assert_eq!(cfg.agent.max_tool_rounds, 2);
+        assert_eq!(cfg.agent.max_tool_rounds, Some(2));
         assert_eq!(cfg.agent.session_dir, PathBuf::from(".kb/session"));
+    }
+
+    #[test]
+    fn permission_descriptions_follow_the_language() {
+        for mode in PermissionMode::ALL {
+            assert_ne!(mode.description(Lang::En), mode.description(Lang::Zh));
+        }
+    }
+
+    #[test]
+    fn permission_levels_parse_and_invalid_or_legacy_settings_fail() {
+        for (name, mode) in [
+            ("normal", PermissionMode::Normal),
+            ("ask_when_need", PermissionMode::AskWhenNeed),
+            ("never_ask", PermissionMode::NeverAsk),
+        ] {
+            let cfg: Config =
+                toml::from_str(&format!("[permissions]\nmode = \"{name}\"\n")).unwrap();
+            assert_eq!(cfg.permissions.mode, mode);
+        }
+        assert!(toml::from_str::<Config>("[permissions]\nmode = \"typo\"").is_err());
+        assert!(toml::from_str::<Config>("[permissions]\ndefault = \"deny\"").is_err());
     }
 
     #[test]
@@ -204,11 +408,54 @@ max_tool_rounds = 2
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.llm.base_url, "https://api.openai.com/v1");
         assert_eq!(cfg.memory.workspace, PathBuf::from(".kb"));
-        assert_eq!(cfg.agent.max_tool_rounds, 8);
-        assert_eq!(cfg.agent.max_retries, 3);
+        assert_eq!(cfg.agent.max_tool_rounds, None);
+        assert_eq!(cfg.agent.subagent_max_rounds, None);
+        assert_eq!(cfg.agent.max_retries, 5);
         assert_eq!(cfg.agent.compact_threshold, 40_000);
-        assert_eq!(cfg.permissions.default, "ask");
-        assert!(cfg.permissions.allow.contains(&"todo_write".to_string()));
+        assert_eq!(cfg.permissions.mode, PermissionMode::Normal);
+        assert!(cfg.permissions.allow.is_empty());
+        // English is the default interface language.
+        assert_eq!(cfg.lang, Lang::En);
+    }
+
+    #[test]
+    fn lang_defaults_to_english_and_accepts_codes_or_env_override() {
+        assert_eq!(toml::from_str::<Config>("").unwrap().lang, Lang::En);
+        assert_eq!(
+            toml::from_str::<Config>("lang = \"zh\"").unwrap().lang,
+            Lang::Zh
+        );
+        assert_eq!(
+            toml::from_str::<Config>("lang = \"en\"").unwrap().lang,
+            Lang::En
+        );
+        assert!(toml::from_str::<Config>("lang = \"fr\"").is_err());
+        let mut cfg: Config = toml::from_str("lang = \"en\"").unwrap();
+        cfg.apply_env_with(|key| (key == "KBA_LANG").then(|| "zh".to_string()));
+        assert_eq!(cfg.lang, Lang::Zh);
+        // An unparsable value is ignored rather than silently switching language.
+        cfg.apply_env_with(|key| (key == "KBA_LANG").then(|| "klingon".to_string()));
+        assert_eq!(cfg.lang, Lang::Zh);
+    }
+
+    #[test]
+    fn round_limits_accept_unlimited_and_nonnegative_integers() {
+        for field in ["max_tool_rounds", "subagent_max_rounds"] {
+            for (value, expected) in [("\"unlimited\"", None), ("0", Some(0)), ("50", Some(50))] {
+                let cfg: Config = toml::from_str(&format!("[agent]\n{field} = {value}\n")).unwrap();
+                let actual = if field == "max_tool_rounds" {
+                    cfg.agent.max_tool_rounds
+                } else {
+                    cfg.agent.subagent_max_rounds
+                };
+                assert_eq!(actual, expected);
+            }
+            for value in ["-1", "1.5", "true", "\"typo\"", "\"8\""] {
+                assert!(
+                    toml::from_str::<Config>(&format!("[agent]\n{field} = {value}\n")).is_err()
+                );
+            }
+        }
     }
 
     #[test]

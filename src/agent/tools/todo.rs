@@ -1,10 +1,15 @@
 use super::super::event::{TodoView, UiEvent};
-use super::super::plan::{TodoItem, TodoStatus};
+use super::super::plan::TodoItem;
 use super::{Tool, ToolContext, ToolResult};
 use std::future::Future;
 use std::pin::Pin;
 
 pub struct TodoWrite;
+
+#[derive(serde::Deserialize)]
+struct Args {
+    todos: Vec<TodoItem>,
+}
 
 impl Tool for TodoWrite {
     fn name(&self) -> &'static str {
@@ -42,25 +47,12 @@ impl Tool for TodoWrite {
         args: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
-            let Some(items) = args.get("todos").and_then(|v| v.as_array()) else {
-                return ToolResult::err("todos must be an array");
+            let Args { todos } = match serde_json::from_value::<Args>(args) {
+                Ok(args) => args,
+                Err(e) => return ToolResult::err(format!("invalid arguments: {e}")),
             };
-            let mut todos = Vec::with_capacity(items.len());
-            for item in items {
-                let content = item
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if content.is_empty() {
-                    return ToolResult::err("todo content must not be empty");
-                }
-                let status = match item.get("status").and_then(|v| v.as_str()) {
-                    Some("done") => TodoStatus::Done,
-                    Some("in_progress") => TodoStatus::InProgress,
-                    _ => TodoStatus::Pending,
-                };
-                todos.push(TodoItem { content, status });
+            if todos.iter().any(|item| item.content.trim().is_empty()) {
+                return ToolResult::err("todo content must not be empty");
             }
             ctx.todos.replace(todos);
             let _ = ctx.events.send(UiEvent::Todos(

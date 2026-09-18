@@ -81,17 +81,7 @@ impl super::Extension for MemoryExtension {
     ) -> super::ExtensionFuture<'a> {
         Box::pin(async move {
             let mut store = FileStore::open(&self.workspace).map_err(|e| e.to_string())?;
-            let result = tools::dispatch_result(
-                &mut store,
-                &crate::llm::ToolCall {
-                    id: String::new(),
-                    kind: "function".into(),
-                    function: crate::llm::FunctionCall {
-                        name: name.into(),
-                        arguments: args.to_string(),
-                    },
-                },
-            );
+            let result = tools::execute(&mut store, name, args);
             let is_error = result.is_err();
             let content = result.unwrap_or_else(|error| error);
             Ok(super::Response {

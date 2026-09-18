@@ -32,7 +32,9 @@ impl Tool for Remember {
         args: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
-            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let Some(text) = args.get("text").and_then(|v| v.as_str()) else {
+                return ToolResult::err("text must be a string");
+            };
             if text.trim().is_empty() {
                 return ToolResult::err("text must not be empty");
             }

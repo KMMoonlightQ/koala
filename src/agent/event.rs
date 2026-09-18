@@ -1,4 +1,5 @@
 use super::plan::{TodoItem, TodoStatus};
+use crate::i18n::{self, Key, Lang};
 use tokio::sync::oneshot;
 
 /// Commands a frontend (TUI, CLI, tests, ...) can send to a running session.
@@ -12,8 +13,14 @@ pub enum SessionCommand {
     Shutdown,
     /// Start a fresh session (clears history and todos).
     NewSession,
+    ShowSessions,
+    RestoreSession(String),
     /// Toggle plan mode; the new state is reported back as `UiEvent::PlanMode`.
     TogglePlanMode,
+    /// Select one of the configured reasoning efforts.
+    SetReasoningEffort(String),
+    SelectModel(String),
+    SetPermissionMode(crate::config::PermissionMode),
     /// Compact the conversation history now.
     Compact,
     /// Subscribe to structured task snapshots.
@@ -22,6 +29,8 @@ pub enum SessionCommand {
     StopTask(usize),
     /// Report the skills listing as `UiEvent::Info`.
     ShowSkills,
+    /// Switch the language of agent-side messages and of the system prompt.
+    SetLang(Lang),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,14 +43,17 @@ pub enum TaskState {
 }
 
 impl TaskState {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Running => "进行中",
-            Self::Stopping => "停止中",
-            Self::Done => "已完成",
-            Self::Failed => "失败",
-            Self::Stopped => "已停止",
-        }
+    pub fn label(self, lang: Lang) -> &'static str {
+        i18n::text(
+            lang,
+            match self {
+                Self::Running => Key::TaskRunning,
+                Self::Stopping => Key::TaskStopping,
+                Self::Done => Key::TaskDone,
+                Self::Failed => Key::TaskFailed,
+                Self::Stopped => Key::TaskStopped,
+            },
+        )
     }
 }
 
@@ -84,10 +96,26 @@ impl From<&TodoItem> for TodoView {
 
 /// Everything the agent core can tell a frontend during a session.
 pub enum UiEvent {
+    /// Latest foreground request input + output tokens; None means unavailable.
+    ContextUsage(Option<u64>),
+    ModelSettings {
+        model: String,
+        models: Vec<String>,
+        reasoning_efforts: Vec<String>,
+        reasoning_effort: Option<String>,
+        context_window: Option<u64>,
+    },
     Status(String),
     Cancelled,
     SessionReset,
+    Sessions(Vec<super::transcripts::SessionView>),
+    SessionRestored {
+        id: String,
+        records: Vec<super::transcripts::Record>,
+    },
+    SessionRestoreFailed(String),
     PlanMode(bool),
+    PermissionMode(crate::config::PermissionMode),
     BackgroundCount(usize),
     Tasks(Vec<TaskView>),
     /// Streaming assistant text delta.
@@ -121,9 +149,19 @@ pub enum UiEvent {
 impl std::fmt::Debug for UiEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            UiEvent::ContextUsage(tokens) => write!(f, "ContextUsage({tokens:?})"),
+            UiEvent::ModelSettings {
+                reasoning_effort,
+                context_window,
+                ..
+            } => write!(f, "ModelSettings({reasoning_effort:?}, {context_window:?})"),
             UiEvent::Status(s) => write!(f, "Status({s:?})"),
             UiEvent::Cancelled => write!(f, "Cancelled"),
+            UiEvent::Sessions(items) => write!(f, "Sessions({} items)", items.len()),
+            UiEvent::SessionRestored { id, .. } => write!(f, "SessionRestored({id})"),
+            UiEvent::SessionRestoreFailed(error) => write!(f, "SessionRestoreFailed({error})"),
             UiEvent::SessionReset => write!(f, "SessionReset"),
+            UiEvent::PermissionMode(mode) => write!(f, "PermissionMode({mode:?})"),
             UiEvent::PlanMode(on) => write!(f, "PlanMode({on})"),
             UiEvent::Tasks(tasks) => write!(f, "Tasks({} items)", tasks.len()),
             UiEvent::BackgroundCount(n) => write!(f, "BackgroundCount({n})"),
@@ -142,16 +180,8 @@ impl std::fmt::Debug for UiEvent {
 
 pub type EventSender = tokio::sync::mpsc::UnboundedSender<UiEvent>;
 
-/// Event sink for sub-agents and background tasks: drops streaming noise,
-/// keeps nothing on screen. Completion is reported by the task itself.
+/// Closed event sink for sub-agents: drops display events and permission senders.
+/// The permission receiver observes cancellation, which the tool runner rejects.
 pub fn null_events() -> EventSender {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UiEvent>();
-    tokio::spawn(async move {
-        while let Some(ev) = rx.recv().await {
-            if let UiEvent::PermissionRequest { respond, .. } = ev {
-                let _ = respond.send(false);
-            }
-        }
-    });
-    tx
+    tokio::sync::mpsc::unbounded_channel().0
 }

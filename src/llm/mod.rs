@@ -14,6 +14,10 @@ pub enum LlmError {
     Api { status: u16, body: String },
     #[error("invalid SSE payload: {0}")]
     Sse(#[from] serde_json::Error),
+    #[error("stream error: {0}")]
+    Stream(String),
+    #[error("stream ended before the model completed its response")]
+    UnexpectedEof,
     #[error("response contained no choices")]
     EmptyResponse,
 }
@@ -113,8 +117,16 @@ impl Tool {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StreamDelta {
+    pub usage: Option<TokenUsage>,
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCallDelta>,
+}
+
+/// Usage for one request, including cached input tokens in prompt_tokens.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct TokenUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -127,13 +139,18 @@ pub struct ToolCallDelta {
 
 #[derive(Debug, Deserialize)]
 struct ChatChunk {
+    usage: Option<TokenUsage>,
     #[serde(default)]
     choices: Vec<ChunkChoice>,
+    #[serde(default)]
+    error: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ChunkChoice {
     delta: ChunkDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,6 +184,7 @@ struct ChunkFunction {
 pub struct SseParser {
     buf: Vec<u8>,
     done: bool,
+    completed: bool,
 }
 
 impl SseParser {
@@ -192,7 +210,10 @@ impl SseParser {
 
     pub fn finish(&mut self) -> Vec<Result<StreamDelta, LlmError>> {
         let rest = std::mem::take(&mut self.buf);
-        let out: Vec<_> = self.parse_line(&rest).into_iter().collect();
+        let mut out: Vec<_> = self.parse_line(&rest).into_iter().collect();
+        if !self.done && !self.completed {
+            out.push(Err(LlmError::UnexpectedEof));
+        }
         self.done = true;
         out
     }
@@ -213,9 +234,30 @@ impl SseParser {
         }
         let chunk: ChatChunk = match serde_json::from_str(payload) {
             Ok(c) => c,
-            Err(e) => return Some(Err(LlmError::Sse(e))),
+            Err(e) => {
+                self.done = true;
+                return Some(Err(LlmError::Sse(e)));
+            }
         };
-        let choice = chunk.choices.into_iter().next()?;
+        if let Some(error) = chunk.error {
+            self.done = true;
+            return Some(Err(LlmError::Stream(error.to_string())));
+        }
+        let Some(choice) = chunk.choices.into_iter().next() else {
+            return chunk.usage.map(|usage| {
+                Ok(StreamDelta {
+                    usage: Some(usage),
+                    ..StreamDelta::default()
+                })
+            });
+        };
+        if let Some(reason) = choice.finish_reason {
+            if !matches!(reason.as_str(), "stop" | "tool_calls" | "function_call") {
+                self.done = true;
+                return Some(Err(LlmError::Stream(format!("response stopped: {reason}"))));
+            }
+            self.completed = true;
+        }
         let tool_calls = choice
             .delta
             .tool_calls
@@ -235,6 +277,7 @@ impl SseParser {
             })
             .collect();
         Some(Ok(StreamDelta {
+            usage: chunk.usage,
             content: choice.delta.content,
             tool_calls,
         }))
@@ -308,7 +351,7 @@ impl DeltaAggregator {
 pub struct LlmClient {
     base_url: String,
     api_key: String,
-    model: String,
+    selection: std::sync::RwLock<(String, Option<String>)>,
     headers: Vec<(String, String)>,
     http: reqwest::Client,
 }
@@ -316,10 +359,19 @@ pub struct LlmClient {
 #[derive(Serialize)]
 struct ChatRequest<'a> {
     model: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
     messages: &'a [Message],
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [Tool]>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Deserialize)]
@@ -342,13 +394,29 @@ impl LlmClient {
         Self {
             base_url: base_url.into(),
             api_key: api_key.into(),
-            model: model.into(),
+            selection: std::sync::RwLock::new((model.into(), None)),
             headers: headers
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             http: reqwest::Client::new(),
         }
+    }
+
+    pub fn reasoning_effort(&self) -> Option<String> {
+        self.selection.read().unwrap().1.clone()
+    }
+
+    pub(crate) fn set_reasoning_effort(&self, effort: Option<String>) {
+        self.selection.write().unwrap().1 = effort;
+    }
+
+    pub fn model(&self) -> String {
+        self.selection.read().unwrap().0.clone()
+    }
+
+    pub(crate) fn select_model(&self, model: String, effort: Option<String>) {
+        *self.selection.write().unwrap() = (model, effort);
     }
 
     fn endpoint(&self) -> String {
@@ -361,11 +429,16 @@ impl LlmClient {
         tools: Option<&[Tool]>,
         stream: bool,
     ) -> Result<reqwest::Response, LlmError> {
+        let (model, reasoning_effort) = self.selection.read().unwrap().clone();
         let request = ChatRequest {
-            model: &self.model,
+            model: &model,
+            reasoning_effort,
             messages,
             tools,
             stream,
+            stream_options: stream.then_some(StreamOptions {
+                include_usage: true,
+            }),
         };
         let mut req = self.http.post(self.endpoint()).bearer_auth(&self.api_key);
         for (key, value) in &self.headers {
@@ -444,6 +517,37 @@ mod tests {
     }
 
     #[test]
+    fn stream_error_is_not_silently_ignored() {
+        let mut parser = SseParser::new();
+        let events =
+            parser.feed(b"data: {\"error\":{\"message\":\"upstream failed\"}}\n\ndata: [DONE]\n");
+        assert!(events.iter().any(Result::is_err));
+    }
+
+    #[test]
+    fn incomplete_stream_fails_at_eof() {
+        let mut parser = SseParser::new();
+        parser.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n");
+        assert!(parser.finish().iter().any(Result::is_err));
+    }
+
+    #[test]
+    fn explicit_finish_reason_allows_eof_without_done() {
+        let mut parser = SseParser::new();
+        parser.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n");
+        assert!(parser.finish().iter().all(Result::is_ok));
+    }
+
+    #[test]
+    fn length_limit_does_not_commit_truncated_tool_arguments() {
+        let mut parser = SseParser::new();
+        let events = parser.feed(
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n",
+        );
+        assert!(events.iter().any(Result::is_err));
+    }
+
+    #[test]
     fn parses_content_deltas_split_across_feeds() {
         let mut p = SseParser::new();
         assert!(
@@ -472,7 +576,9 @@ mod tests {
     fn finish_flushes_trailing_partial_line() {
         let mut p = SseParser::new();
         p.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\n");
-        let events = collect(p.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"y\"}}]}"));
+        let events = collect(p.feed(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"y\"},\"finish_reason\":\"stop\"}]}",
+        ));
         assert!(events.is_empty());
         let events = collect(p.finish());
         assert_eq!(events.len(), 1);
@@ -565,13 +671,17 @@ mod tests {
         )];
         let request = ChatRequest {
             model: "m",
+            reasoning_effort: None,
             messages: &[Message::user("hi")],
             tools: Some(&tools),
             stream: false,
+            stream_options: None,
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["tools"][0]["type"], "function");
         assert_eq!(json["tools"][0]["function"]["name"], "memory_search");
         assert_eq!(json["stream"], false);
+        assert!(json.get("stream_options").is_none());
+        assert!(json.get("reasoning_effort").is_none());
     }
 }

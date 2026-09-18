@@ -36,6 +36,12 @@ pub fn muted() -> Style {
 pub fn subtle() -> Style {
     Style::default().fg(SUBTLE)
 }
+/// Keyboard hints stay visually subordinate; terminal cells share one font size.
+pub fn key_hint() -> Style {
+    subtle()
+        .add_modifier(Modifier::DIM)
+        .remove_modifier(Modifier::BOLD)
+}
 pub fn accent() -> Style {
     Style::default().fg(ACCENT)
 }

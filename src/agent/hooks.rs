@@ -1,34 +1,7 @@
-use crate::config::HooksConfig;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 
 const HOOK_TIMEOUT: Duration = Duration::from_secs(10);
-
-#[derive(Debug, Clone)]
-pub struct Hooks {
-    pub pre_tool_use: Vec<String>,
-    pub post_tool_use: Vec<String>,
-    pub turn_start: Vec<String>,
-    pub turn_end: Vec<String>,
-}
-
-impl Hooks {
-    pub fn new(cfg: &HooksConfig) -> Self {
-        Self {
-            pre_tool_use: cfg.pre_tool_use.clone(),
-            post_tool_use: cfg.post_tool_use.clone(),
-            turn_start: cfg.turn_start.clone(),
-            turn_end: cfg.turn_end.clone(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.pre_tool_use.is_empty()
-            && self.post_tool_use.is_empty()
-            && self.turn_start.is_empty()
-            && self.turn_end.is_empty()
-    }
-}
 
 #[derive(Debug, PartialEq)]
 pub enum HookOutcome {
@@ -53,7 +26,7 @@ pub async fn run_hook(command: &str, payload: &serde_json::Value) -> HookOutcome
         Err(e) => return HookOutcome::Failed(format!("spawn failed: {e}")),
     };
     if let Some(mut stdin) = child.stdin.take() {
-        let data = serde_json::to_vec(payload).unwrap_or_default();
+        let data = payload.to_string().into_bytes();
         let _ = stdin.write_all(&data).await;
         let _ = stdin.shutdown().await;
     }

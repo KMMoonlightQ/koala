@@ -8,6 +8,14 @@ use std::pin::Pin;
 
 pub struct TaskTool;
 
+#[derive(serde::Deserialize)]
+struct Args {
+    description: String,
+    prompt: String,
+    #[serde(default)]
+    background: bool,
+}
+
 impl Tool for TaskTool {
     fn name(&self) -> &'static str {
         "task"
@@ -37,19 +45,17 @@ impl Tool for TaskTool {
         args: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
-            let description = args
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("subtask")
-                .to_string();
-            let prompt = args.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+            let Args {
+                description,
+                prompt,
+                background,
+            } = match serde_json::from_value::<Args>(args) {
+                Ok(args) => args,
+                Err(e) => return ToolResult::err(format!("invalid arguments: {e}")),
+            };
             if prompt.is_empty() {
                 return ToolResult::err("prompt must not be empty");
             }
-            let background = args
-                .get("background")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
 
             if background {
                 let id = ctx.background.register("task", &description);
@@ -57,7 +63,6 @@ impl Tool for TaskTool {
                 let bg = ctx.background.clone();
                 let events = ctx.events.clone();
                 let memory_file = ctx.shared.memory_file.clone();
-                let prompt = prompt.to_string();
                 let handle = tokio::spawn(async move {
                     let outcome = async {
                         let mut todos = TodoList::default();
@@ -94,7 +99,7 @@ impl Tool for TaskTool {
             let mut sub_todos = TodoList::default();
             let null_tx = null_events();
             let mut sub_ctx = seed.build(&mut sub_todos, ctx.agent_memory, &null_tx);
-            match subagent::run(&mut sub_ctx, prompt).await {
+            match subagent::run(&mut sub_ctx, &prompt).await {
                 Ok(text) => ToolResult::ok(text),
                 Err(e) => ToolResult::err(format!("sub-agent failed: {e}")),
             }

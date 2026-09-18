@@ -1,5 +1,6 @@
 use super::Agent;
 use super::event::{EventSender, SessionCommand, UiEvent};
+use crate::i18n::{self, Key, Lang};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
@@ -29,8 +30,13 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
     let (ev_tx, ev_rx) = mpsc::unbounded_channel();
     let (mut work_tx, mut work_rx) = mpsc::unbounded_channel();
     let background = agent.background.clone();
+    // Shared language cell, cloned out before the agent goes behind its mutex:
+    // /lang neither waits for a running turn nor blocks cancellation.
+    let shared = agent.shared.clone();
     let mut background_count = background.subscribe_count();
     let _ = ev_tx.send(UiEvent::PlanMode(agent.plan_mode()));
+    let _ = ev_tx.send(agent.model_settings());
+    let _ = ev_tx.send(UiEvent::PermissionMode(agent.shared.permissions.mode()));
     let _ = ev_tx.send(UiEvent::BackgroundCount(*background_count.borrow()));
     let agent = Arc::new(Mutex::new(agent));
     tokio::spawn(async move {
@@ -43,7 +49,7 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                 biased;
                 result = async { active.as_mut().unwrap().await }, if active.is_some() => {
                     active = None;
-                    drain(&mut work_rx, &ev_tx, &mut progress);
+                    drain(&mut work_rx, &ev_tx, &mut progress, shared.lang.get());
                     // A failed turn also leaves a pending input. Preserve its
                     // visible progress before another operation can begin.
                     if let Err(e) = agent.lock().await.record_interruption(&progress) {
@@ -56,21 +62,21 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                 }
                 cmd = cmd_rx.recv() => {
                     let Some(cmd) = cmd else {
-                        stop(&mut active, &agent, &mut work_rx, &ev_tx, &mut progress).await;
+                        stop(&mut active, &agent, &mut work_rx, &ev_tx, &mut progress, shared.lang.get()).await;
                         break;
                     };
                     match cmd {
                         SessionCommand::Cancel => {
-                            if stop(&mut active, &agent, &mut work_rx, &ev_tx, &mut progress).await {
+                            if stop(&mut active, &agent, &mut work_rx, &ev_tx, &mut progress, shared.lang.get()).await {
                                 let _ = ev_tx.send(UiEvent::Cancelled);
                             }
                         }
                         SessionCommand::Shutdown => {
-                            stop(&mut active, &agent, &mut work_rx, &ev_tx, &mut progress).await;
+                            stop(&mut active, &agent, &mut work_rx, &ev_tx, &mut progress, shared.lang.get()).await;
                             break;
                         }
                         SessionCommand::NewSession => {
-                            stop(&mut active, &agent, &mut work_rx, &ev_tx, &mut progress).await;
+                            stop(&mut active, &agent, &mut work_rx, &ev_tx, &mut progress, shared.lang.get()).await;
                             agent.lock().await.new_session();
                             (work_tx, work_rx) = mpsc::unbounded_channel();
                             progress.clear();
@@ -92,11 +98,21 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                             progress.clear();
                             let agent = agent.clone();
                             let events = work_tx.clone();
+                            // Read the language before the closure takes the
+                            // shared state by value.
+                            let lang = shared.lang.get();
                             active = Some(tokio::spawn(async move {
-                                let _ = events.send(UiEvent::Status("压缩上下文中".into()));
+                                let _ = events.send(UiEvent::Status(
+                                    i18n::text(lang, Key::StatusCompacting).into(),
+                                ));
                                 let ev = match agent.lock().await.compact_now().await {
-                                    Ok(true) => UiEvent::Note("上下文已压缩".into()),
-                                    Ok(false) => UiEvent::Note("暂无需要压缩的内容".into()),
+                                    Ok(true) => {
+                                        let _ = events.send(UiEvent::ContextUsage(None));
+                                        UiEvent::Note(i18n::text(lang, Key::InfoContextCompacted).into())
+                                    },
+                                    Ok(false) => UiEvent::Note(
+                                        i18n::text(lang, Key::InfoNothingToCompact).into(),
+                                    ),
                                     Err(e) => UiEvent::Error(e.to_string()),
                                 };
                                 let _ = events.send(ev);
@@ -109,15 +125,99 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                         SessionCommand::HideTasks => watch_tasks = false,
                         SessionCommand::StopTask(id) => {
                             let stopped = background.stop(id).await;
-                            if !stopped { let _ = ev_tx.send(UiEvent::Note(format!("任务 #{id} 已结束或不可停止"))); }
+                            if !stopped {
+                                let lang = shared.lang.get();
+                                let _ = ev_tx.send(UiEvent::Note(i18n::fill(
+                                    lang,
+                                    Key::NoteTaskNotStoppable,
+                                    &[("id", &id.to_string())],
+                                )));
+                            }
                             let _ = ev_tx.send(UiEvent::Tasks(background.list()));
                         }
-                        _ if active.is_some() => {
-                            let _ = ev_tx.send(UiEvent::Note("正在执行，请先按 Esc 中断".into()));
+                        SessionCommand::RestoreSession(_) if active.is_some() => {
+                            let lang = shared.lang.get();
+                            let _ = ev_tx.send(UiEvent::SessionRestoreFailed(
+                                i18n::text(lang, Key::NoteBusyInterruptFirst).into(),
+                            ));
                         }
+                        _ if active.is_some() => {
+                            let lang = shared.lang.get();
+                            let _ = ev_tx.send(UiEvent::Note(
+                                i18n::text(lang, Key::NoteBusyInterruptFirst).into(),
+                            ));
+                        }
+                        SessionCommand::ShowSessions => {
+                            match agent.lock().await.list_sessions() {
+                                Ok(items) => { let _ = ev_tx.send(UiEvent::Sessions(items)); }
+                                Err(error) => {
+                                    let _ = ev_tx.send(UiEvent::Sessions(Vec::new()));
+                                    let _ = ev_tx.send(UiEvent::Note(error));
+                                }
+                            }
+                        }
+                        SessionCommand::RestoreSession(id) => {
+                            match agent.lock().await.restore_session(&id) {
+                                Ok(records) => {
+                                    (work_tx, work_rx) = mpsc::unbounded_channel();
+                                    progress.clear();
+                                    watch_tasks = false;
+                                    let _ = ev_tx.send(UiEvent::SessionRestored { id, records });
+                                    let _ = ev_tx.send(UiEvent::PlanMode(false));
+                                    let _ = ev_tx.send(UiEvent::PermissionMode(crate::config::PermissionMode::Normal));
+                                }
+                                Err(error) => { let _ = ev_tx.send(UiEvent::SessionRestoreFailed(error)); }
+                            }
+                        }
+                        SessionCommand::SetPermissionMode(mode) => {
+                            let guard = agent.lock().await;
+                            guard.shared.permissions.set_mode(mode);
+                            let lang = guard.lang();
+                            drop(guard);
+                            let _ = ev_tx.send(UiEvent::PermissionMode(mode));
+                            let _ = ev_tx.send(UiEvent::Info(i18n::fill(
+                                lang,
+                                Key::InfoPermissionSwitched,
+                                &[
+                                    ("mode", mode.label()),
+                                    ("description", mode.description(lang)),
+                                ],
+                            )));
+                        }
+                        SessionCommand::SetLang(value) => shared.lang.set(value),
                         SessionCommand::TogglePlanMode => {
                             let on = agent.lock().await.toggle_plan_mode();
                             let _ = ev_tx.send(UiEvent::PlanMode(on));
+                        }
+                        SessionCommand::SelectModel(name) => {
+                            let mut agent = agent.lock().await;
+                            match agent.select_model(&name) {
+                                Ok(()) => {
+                                    let _ = ev_tx.send(agent.model_settings());
+                                    let lang = agent.lang();
+                                    let _ = ev_tx.send(UiEvent::Info(i18n::fill(
+                                        lang,
+                                        Key::InfoModelSwitched,
+                                        &[("name", &name)],
+                                    )));
+                                }
+                                Err(message) => { let _ = ev_tx.send(UiEvent::Note(message)); }
+                            }
+                        }
+                        SessionCommand::SetReasoningEffort(value) => {
+                            let agent = agent.lock().await;
+                            match agent.set_reasoning_effort(&value) {
+                                Ok(effort) => {
+                                    let _ = ev_tx.send(agent.model_settings());
+                                    let lang = agent.lang();
+                                    let _ = ev_tx.send(UiEvent::Info(i18n::fill(
+                                        lang,
+                                        Key::InfoEffortSwitched,
+                                        &[("effort", &effort)],
+                                    )));
+                                }
+                                Err(message) => { let _ = ev_tx.send(UiEvent::Note(message)); }
+                            }
                         }
                         SessionCommand::ShowSkills => {
                             let text = agent.lock().await.skills().listing();
@@ -130,31 +230,41 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                     let _ = ev_tx.send(UiEvent::BackgroundCount(*background_count.borrow_and_update()));
                     if watch_tasks { let _ = ev_tx.send(UiEvent::Tasks(background.list())); }
                 }
-                Some(ev) = work_rx.recv() => forward(ev, &ev_tx, &mut progress),
+                Some(ev) = work_rx.recv() => forward(ev, &ev_tx, &mut progress, shared.lang.get()),
             }
         }
     });
     (SessionHandle { tx: cmd_tx }, ev_rx)
 }
 
-fn forward(ev: UiEvent, events: &EventSender, progress: &mut String) {
+/// `progress` becomes the visible record of an interrupted turn, so it is
+/// written in the frontend's language too.
+fn forward(ev: UiEvent, events: &EventSender, progress: &mut String, lang: Lang) {
     match &ev {
         UiEvent::Text(text) => progress.push_str(text),
-        UiEvent::ToolStart { name, summary, .. } => {
-            progress.push_str(&format!("\n工具 {name}({summary})\n"))
-        }
-        UiEvent::ToolEnd { output, .. } => progress.push_str(&format!(
-            "\n结果：{}\n",
-            super::tools::result_preview(output)
+        UiEvent::ToolStart { name, summary, .. } => progress.push_str(&i18n::fill(
+            lang,
+            Key::ProgressToolCall,
+            &[("name", name), ("summary", summary)],
+        )),
+        UiEvent::ToolEnd { output, .. } => progress.push_str(&i18n::fill(
+            lang,
+            Key::ProgressToolResult,
+            &[("output", &super::tools::result_preview(output))],
         )),
         _ => {}
     }
     let _ = events.send(ev);
 }
 
-fn drain(rx: &mut mpsc::UnboundedReceiver<UiEvent>, events: &EventSender, progress: &mut String) {
+fn drain(
+    rx: &mut mpsc::UnboundedReceiver<UiEvent>,
+    events: &EventSender,
+    progress: &mut String,
+    lang: Lang,
+) {
     while let Ok(ev) = rx.try_recv() {
-        forward(ev, events, progress);
+        forward(ev, events, progress, lang);
     }
 }
 
@@ -164,13 +274,14 @@ async fn stop(
     rx: &mut mpsc::UnboundedReceiver<UiEvent>,
     events: &EventSender,
     progress: &mut String,
+    lang: Lang,
 ) -> bool {
     let Some(task) = active.take() else {
         return false;
     };
     task.abort();
     let _ = task.await;
-    drain(rx, events, progress);
+    drain(rx, events, progress, lang);
     if let Err(e) = agent.lock().await.record_interruption(progress) {
         let _ = events.send(UiEvent::Error(e.to_string()));
     }
@@ -184,6 +295,250 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn restored_session_reaches_model_and_appends_to_original_transcript() {
+        use crate::config::PermissionMode;
+        use crate::test_support::{MockLlm, stream};
+        let mut mock = MockLlm::start(vec![stream(
+            serde_json::json!({"content": "continued answer"}),
+        )])
+        .await;
+        let root = std::env::temp_dir().join(format!("kb-resume-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("saved.jsonl");
+        let old = concat!(
+            "{\"ts\":\"then\",\"role\":\"user\",\"content\":\"OLD_USER_CONTEXT\"}\n",
+            "{\"ts\":\"then\",\"role\":\"assistant\",\"content\":\"OLD_ANSWER\"}"
+        );
+        std::fs::write(&path, old).unwrap();
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.llm.base_url = mock.url.clone();
+        cfg.extensions.memory = false;
+        cfg.agent.session_dir = root.clone();
+        cfg.agent.memory_file = root.join("memory.md");
+        cfg.permissions.mode = PermissionMode::NeverAsk;
+        let agent = Agent::new(&cfg).unwrap();
+        let shared = agent.shared.clone();
+        let (session, mut events) = spawn(agent);
+        session.send(SessionCommand::ShowSessions);
+        receive_until(
+            &mut events,
+            |e| matches!(e, UiEvent::Sessions(items) if items.len() == 1 && items[0].id == "saved"),
+        )
+        .await;
+        session.send(SessionCommand::RestoreSession("saved".into()));
+        receive_until(&mut events, |e| matches!(e, UiEvent::SessionRestored { id, records } if id == "saved" && records.len() == 2)).await;
+        assert_eq!(shared.permissions.mode(), PermissionMode::Normal);
+        // Failure must preserve the restored conversation and its write target.
+        session.send(SessionCommand::RestoreSession("missing".into()));
+        receive_until(&mut events, |e| {
+            matches!(e, UiEvent::SessionRestoreFailed(_))
+        })
+        .await;
+        session.send(SessionCommand::Submit("continue".into()));
+        receive_until(&mut events, |e| matches!(e, UiEvent::Done)).await;
+        let request = mock.request().await;
+        let messages = request["messages"].as_array().unwrap();
+        assert!(
+            messages
+                .iter()
+                .any(|m| m["role"] == "user" && m["content"] == "OLD_USER_CONTEXT")
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| m["role"] == "assistant" && m["content"] == "OLD_ANSWER")
+        );
+        let records =
+            crate::agent::transcripts::read(&root, "saved", crate::i18n::Lang::En).unwrap();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[3].content, "continued answer");
+        assert!(std::fs::read_to_string(path).unwrap().starts_with(old));
+        session.send(SessionCommand::Shutdown);
+        while events.recv().await.is_some() {}
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn permission_switch_updates_shared_state_and_survives_new_session() {
+        use crate::config::PermissionMode;
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.extensions.memory = false;
+        cfg.permissions.mode = PermissionMode::AskWhenNeed;
+        let agent = Agent::new(&cfg).unwrap();
+        let shared = agent.shared.clone();
+        let (session, mut events) = spawn(agent);
+        receive_until(&mut events, |e| {
+            matches!(e, UiEvent::PermissionMode(PermissionMode::AskWhenNeed))
+        })
+        .await;
+        for mode in [PermissionMode::NeverAsk, PermissionMode::Normal] {
+            session.send(SessionCommand::SetPermissionMode(mode));
+            receive_until(
+                &mut events,
+                |e| matches!(e, UiEvent::PermissionMode(value) if *value == mode),
+            )
+            .await;
+            assert_eq!(shared.permissions.mode(), mode);
+        }
+        session.send(SessionCommand::NewSession);
+        receive_until(&mut events, |e| matches!(e, UiEvent::SessionReset)).await;
+        assert_eq!(shared.permissions.mode(), PermissionMode::Normal);
+        session.send(SessionCommand::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn streamed_usage_reaches_frontend_without_accumulating_requests() {
+        use crate::test_support::{MockLlm, stream};
+        let response = |prompt, completion| {
+            (
+                200,
+                format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"ok\"}},\"finish_reason\":\"stop\"}}]}}\n\ndata: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":{prompt},\"completion_tokens\":{completion}}}}}\n\ndata: [DONE]\n\n"
+                ),
+            )
+        };
+        let mut mock = MockLlm::start(vec![
+            response(110_000, 10_000),
+            response(20_000, 500),
+            stream(serde_json::json!({"content": "no usage"})),
+        ])
+        .await;
+        let root = std::env::temp_dir().join(format!("koala-usage-{}", uuid::Uuid::new_v4()));
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.llm.base_url = mock.url.clone();
+        cfg.extensions.memory = false;
+        cfg.agent.memory_file = root.join("memory.md");
+        cfg.agent.session_dir = root.join("sessions");
+        let (session, mut events) = spawn(Agent::new(&cfg).unwrap());
+        for expected in [Some(120_000), Some(20_500), None] {
+            session.send(SessionCommand::Submit("hi".into()));
+            let usage = timeout(Duration::from_secs(3), async {
+                let mut usage = Vec::new();
+                loop {
+                    match events.recv().await.expect("event stream closed") {
+                        UiEvent::ContextUsage(value) => usage.push(value),
+                        UiEvent::Done => break,
+                        UiEvent::Error(error) => panic!("{error}"),
+                        _ => {}
+                    }
+                }
+                usage
+            })
+            .await
+            .unwrap();
+            assert_eq!(usage.first(), Some(&None));
+            assert_eq!(usage.last(), Some(&expected));
+            assert_eq!(
+                mock.request().await["stream_options"]["include_usage"],
+                true
+            );
+        }
+        session.send(SessionCommand::Shutdown);
+        while events.recv().await.is_some() {}
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn effort_selection_updates_requests_and_rejects_unsupported_values() {
+        use crate::test_support::{MockLlm, stream};
+        let mut mock = MockLlm::start(vec![stream(serde_json::json!({"content": "ok"})); 2]).await;
+        let root = std::env::temp_dir().join(format!("kb-effort-{}", uuid::Uuid::new_v4()));
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.llm.base_url = mock.url.clone();
+        cfg.llm.reasoning_efforts = vec!["low".into(), "high".into()];
+        cfg.lang = crate::i18n::Lang::Zh;
+        cfg.llm.context_window = std::num::NonZeroU64::new(128000);
+        cfg.extensions.memory = false;
+        cfg.agent.memory_file = root.join("memory.md");
+        cfg.agent.session_dir = root.join("sessions");
+        let (session, mut events) = spawn(Agent::new(&cfg).unwrap());
+        receive_until(&mut events, |e| matches!(e, UiEvent::ModelSettings { reasoning_effort: Some(v), context_window: Some(128000), .. } if v == "low")).await;
+        session.send(SessionCommand::Submit("first".into()));
+        receive_until(&mut events, |e| matches!(e, UiEvent::Done)).await;
+        let request = mock.request().await;
+        assert_eq!(request["reasoning_effort"], "low");
+        assert!(request.get("context_window").is_none());
+        session.send(SessionCommand::SetReasoningEffort("high".into()));
+        receive_until(&mut events, |e| matches!(e, UiEvent::ModelSettings { reasoning_effort: Some(v), .. } if v == "high")).await;
+        session.send(SessionCommand::SetReasoningEffort("invalid".into()));
+        receive_until(
+            &mut events,
+            |e| matches!(e, UiEvent::Note(v) if v.contains("不支持")),
+        )
+        .await;
+        session.send(SessionCommand::NewSession);
+        receive_until(&mut events, |e| matches!(e, UiEvent::SessionReset)).await;
+        session.send(SessionCommand::Submit("second".into()));
+        receive_until(&mut events, |e| matches!(e, UiEvent::Done)).await;
+        assert_eq!(mock.request().await["reasoning_effort"], "high");
+        session.send(SessionCommand::Shutdown);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_switch_updates_requests_capabilities_and_preserves_history() {
+        use crate::config::ModelConfig;
+        use crate::test_support::{MockLlm, stream};
+        let mut mock = MockLlm::start(vec![stream(serde_json::json!({"content": "ok"})); 3]).await;
+        let root = std::env::temp_dir().join(format!("kb-model-{}", uuid::Uuid::new_v4()));
+        let mut cfg = Config::default();
+        cfg.llm.model = "reasoner".into();
+        cfg.llm.base_url = mock.url.clone();
+        cfg.llm.reasoning_efforts = vec!["low".into(), "high".into()];
+        cfg.llm.reasoning_effort = Some("high".into());
+        cfg.llm.context_window = std::num::NonZeroU64::new(128000);
+        cfg.llm.models = vec![ModelConfig {
+            model: "plain".into(),
+            ..Default::default()
+        }];
+        cfg.lang = crate::i18n::Lang::Zh;
+        cfg.extensions.memory = false;
+        cfg.agent.memory_file = root.join("memory.md");
+        cfg.agent.session_dir = root.join("sessions");
+        let (session, mut events) = spawn(Agent::new(&cfg).unwrap());
+        session.send(SessionCommand::Submit("KEEP_THIS_HISTORY".into()));
+        receive_until(&mut events, |e| matches!(e, UiEvent::Done)).await;
+        assert_eq!(mock.request().await["model"], "reasoner");
+        session.send(SessionCommand::SelectModel("plain".into()));
+        receive_until(&mut events, |e| matches!(e, UiEvent::ModelSettings { model, reasoning_efforts, reasoning_effort: None, context_window: None, .. } if model == "plain" && reasoning_efforts.is_empty())).await;
+        session.send(SessionCommand::SelectModel("unknown".into()));
+        receive_until(
+            &mut events,
+            |e| matches!(e, UiEvent::Note(v) if v.contains("未配置的模型")),
+        )
+        .await;
+        session.send(SessionCommand::SetReasoningEffort("high".into()));
+        receive_until(
+            &mut events,
+            |e| matches!(e, UiEvent::Note(v) if v.contains("未配置思考档位")),
+        )
+        .await;
+        session.send(SessionCommand::Submit("next".into()));
+        receive_until(&mut events, |e| matches!(e, UiEvent::Done)).await;
+        let request = mock.request().await;
+        assert_eq!(request["model"], "plain");
+        assert!(request.get("reasoning_effort").is_none());
+        assert!(
+            request["messages"]
+                .to_string()
+                .contains("KEEP_THIS_HISTORY")
+        );
+        session.send(SessionCommand::SelectModel("reasoner".into()));
+        receive_until(&mut events, |e| matches!(e, UiEvent::ModelSettings { model, reasoning_effort: Some(v), context_window: Some(128000), .. } if model == "reasoner" && v == "high")).await;
+        session.send(SessionCommand::Submit("back".into()));
+        receive_until(&mut events, |e| matches!(e, UiEvent::Done)).await;
+        let request = mock.request().await;
+        assert_eq!(request["model"], "reasoner");
+        assert_eq!(request["reasoning_effort"], "high");
+        session.send(SessionCommand::Shutdown);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     async fn request(socket: &mut TcpStream) -> serde_json::Value {
         let mut data = Vec::new();

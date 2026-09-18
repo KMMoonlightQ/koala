@@ -1,28 +1,46 @@
+# 界面语言：en（默认）或 zh。也可用 /lang 在对话中切换，或用 KBA_LANG 覆盖。
+# lang = "zh"
+
 [llm]
 base_url = "https://api.openai.com/v1"     # 任意 OpenAI 兼容端点，如 https://dashscope.aliyuncs.com/compatible-mode/v1
 api_key = "sk-xxx"                          # provider 的 key，或用环境变量 KBA_API_KEY 覆盖
 model = "gpt-4o-mini"                       # 模型名
 
+# 以下按模型/服务商实际能力填写；不配置则不展示对应信息。
+# reasoning_efforts = ["low", "medium", "high"] # 可选档位及弹窗顺序
+# reasoning_effort = "medium"                  # 初始档位，省略则取列表第一项
+# context_window = 128000                      # 上下文总容量（tokens），用于计算已用百分比
+
 # 额外的请求头：某些"OpenAI 兼容"端点要求额外的路由头时填这里，每个请求都会携带
 # [llm.headers]
 # x-opencode-session = "kb-agent"
+
+# /model 中的额外模型，共用上面的 base_url、api_key 和 headers。
+# 若列表包含 llm.model 的同名项，以该项的能力配置为准。
+# [[llm.models]]
+# model = "your-other-model"
+# reasoning_efforts = ["low", "medium", "high"]
+# reasoning_effort = "medium"
+# context_window = 128000
 
 [memory]
 workspace = ".kb"
 
 [agent]
-max_tool_rounds = 8
-max_retries = 3
+max_tool_rounds = "unlimited"           # 不限制轮数；非负整数设置上限，0 禁止工具调用
+max_retries = 5
 compact_threshold = 40000                # history 字符数超过即自动压缩
-subagent_max_rounds = 8
+subagent_max_rounds = "unlimited"
 session_dir = ".kb/session"              # 会话转录目录：Agent 与知识库之间唯一的接口
 # memory_file = "..."                    # Agent 私有记忆，默认 <config dir>/kb-agent/memory.md
 
-# 权限：按工具名匹配，allow 优先于 deny，其余走 default（allow/ask/deny）
-# ask 会在界面里请求你确认（y/n）
+# 权限等级：normal / ask_when_need / never_ask
+# 对话内 /permissions 切换；方向键选择，Enter 确认，Esc 取消
 [permissions]
-default = "ask"
-allow = ["todo_write", "remember", "skill"]
+mode = "normal"
+# allow 仅在 ask_when_need 下自动放行指定工具；deny 优先。
+# never_ask 自动放行全部工具，不应用 allow/deny。
+allow = []
 deny = []
 
 # hooks：每条是一个 shell 命令，stdin 收到 JSON 事件，超时 10s

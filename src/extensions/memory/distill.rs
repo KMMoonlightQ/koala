@@ -77,7 +77,11 @@ fn read_transcript(session_path: &Path) -> Result<String, DistillError> {
         out.push_str(content);
         out.push_str("\n\n");
         if out.len() > MAX_TRANSCRIPT_CHARS {
-            out.truncate(MAX_TRANSCRIPT_CHARS);
+            let mut end = MAX_TRANSCRIPT_CHARS;
+            while !out.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.truncate(end);
             break;
         }
     }
@@ -118,6 +122,20 @@ pub fn slugify(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_unicode_transcript_preserves_valid_text() {
+        let path = std::env::temp_dir().join(format!("kb-distill-{}", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            serde_json::json!({"role": "user", "content": "a中".repeat(5000)}).to_string(),
+        )
+        .unwrap();
+        let text = read_transcript(&path).unwrap();
+        assert!(text.starts_with("user: a中"));
+        assert!(text.len() <= MAX_TRANSCRIPT_CHARS);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn strip_fence_variants() {

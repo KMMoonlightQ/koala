@@ -29,7 +29,9 @@ impl Tool for SkillTool {
         args: serde_json::Value,
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>> {
         Box::pin(async move {
-            let name = args.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let Some(name) = args.get("name").and_then(|v| v.as_str()) else {
+                return ToolResult::err("name must be a string");
+            };
             match ctx.skills.get(name) {
                 Some(skill) => ToolResult::ok(skill.body.clone()),
                 None => ToolResult::err(format!("unknown skill: {name}")),

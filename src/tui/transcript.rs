@@ -41,12 +41,18 @@ pub(super) fn render_entry(entry: &EntryKind, width: usize, detailed: bool) -> V
     let body_width = width.saturating_sub(2).max(1);
     match entry {
         EntryKind::User(source) => {
-            let style = Style::default().add_modifier(Modifier::BOLD);
-            text::prefixed(literal(source, body_width, style), "❯ ", "  ")
+            let style = theme::text().add_modifier(Modifier::BOLD);
+            text::prefixed_styled(
+                literal(source, body_width, style),
+                Span::styled("› ", theme::user()),
+                Span::raw("  "),
+            )
         }
-        EntryKind::Assistant(source) => {
-            text::prefixed(markdown::render(source, body_width), "⏺ ", "  ")
-        }
+        EntryKind::Assistant(source) => text::prefixed_styled(
+            markdown::render(source, body_width),
+            Span::styled("⏺ ", theme::accent()),
+            Span::raw("  "),
+        ),
         EntryKind::Tool(tool) => render_tool(tool, width, detailed),
         EntryKind::Todos(items) => items
             .iter()
@@ -54,7 +60,7 @@ pub(super) fn render_entry(entry: &EntryKind, width: usize, detailed: bool) -> V
                 let (mark, style) = match item.status {
                     TodoState::Done => ("☒", theme::muted()),
                     TodoState::InProgress => ("◐", theme::accent()),
-                    TodoState::Pending => ("☐", Style::default()),
+                    TodoState::Pending => ("☐", theme::text()),
                 };
                 text::prefixed(
                     literal(&format!("{mark} {}", item.content), body_width, style),
@@ -63,10 +69,16 @@ pub(super) fn render_entry(entry: &EntryKind, width: usize, detailed: bool) -> V
                 )
             })
             .collect(),
-        EntryKind::Note(s) | EntryKind::Info(s) => {
-            text::prefixed(literal(s, body_width, theme::muted()), "  ", "  ")
-        }
-        EntryKind::Error(s) => text::prefixed(literal(s, body_width, theme::error()), "✗ ", "  "),
+        EntryKind::Note(s) | EntryKind::Info(s) => text::prefixed_styled(
+            literal(s, body_width, theme::muted()),
+            Span::styled("· ", theme::subtle()),
+            Span::raw("  "),
+        ),
+        EntryKind::Error(s) => text::prefixed_styled(
+            literal(s, body_width, theme::error()),
+            Span::styled("✗ ", theme::error()),
+            Span::raw("  "),
+        ),
     }
 }
 
@@ -89,16 +101,17 @@ fn render_tool(tool: &ToolEntry, width: usize, detailed: bool) -> Vec<Line<'stat
         .map(|ms| format!(" · {:.1}s", ms as f64 / 1000.0))
         .unwrap_or_default();
     let mut header = Line::from(vec![
+        Span::styled(format!("{mark} "), style),
         Span::styled(
-            format!("{mark} {}", text::clean(&tool.name)),
-            style.add_modifier(Modifier::BOLD),
+            text::clean(&tool.name),
+            theme::text().add_modifier(Modifier::BOLD),
         ),
-        Span::styled(format!(" · {label}{elapsed}"), theme::muted()),
+        Span::styled(format!(" · {label}{elapsed}"), style),
     ]);
     if !tool.summary.is_empty() {
         header.spans.push(Span::styled(
             format!("  {}", text::clean(&tool.summary).replace('\n', " ")),
-            theme::accent(),
+            theme::suggestion(),
         ));
     }
     let mut lines = text::wrap(header, width);

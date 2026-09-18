@@ -65,6 +65,23 @@ pub fn wrap(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
+/// Like [`prefixed`], but with styled prefix spans (e.g. a colored bullet).
+pub fn prefixed_styled(
+    lines: Vec<Line<'static>>,
+    first: Span<'static>,
+    rest: Span<'static>,
+) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut line)| {
+            line.spans
+                .insert(0, if i == 0 { first.clone() } else { rest.clone() });
+            line
+        })
+        .collect()
+}
+
 pub fn prefixed(lines: Vec<Line<'static>>, first: &str, rest: &str) -> Vec<Line<'static>> {
     lines
         .into_iter()

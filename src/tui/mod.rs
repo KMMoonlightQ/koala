@@ -81,7 +81,7 @@ struct App {
 fn new_input() -> TextArea<'static> {
     let mut input = TextArea::default();
     input.set_placeholder_text("输入消息 · / 命令 · ? 帮助");
-    input.set_placeholder_style(theme::muted());
+    input.set_placeholder_style(theme::subtle());
     input.set_cursor_line_style(Style::default());
     input
 }
@@ -831,12 +831,12 @@ mod tests {
         handle_ui_event(&mut app, UiEvent::PlanMode(true));
         handle_ui_event(&mut app, UiEvent::BackgroundCount(2));
         let screen = render(&mut app, 100, 28);
-        assert!(screen.contains("kb-agent"));
+        assert!(screen.contains("Airplane"));
         assert!(screen.contains("local-model"));
         assert!(screen.contains("/workspace/kb-agent"));
         assert!(screen.contains("Plan · 后台 2"));
         assert!(screen.contains("输入消息"));
-        assert!(!screen.contains("╭"));
+        assert!(screen.contains("╭"));
         handle_ui_event(
             &mut app,
             UiEvent::Text(

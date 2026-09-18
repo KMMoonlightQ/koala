@@ -4,8 +4,42 @@ use ratatui::{
     Frame,
     layout::Rect,
     text::{Line, Span, Text},
-    widgets::Paragraph,
+    widgets::{Block, BorderType, Paragraph},
 };
+
+/// Title and shortcut hint for the modal dialog chrome drawn by `view`.
+pub(super) fn dialog_chrome(app: &App) -> Option<(&'static str, &'static str)> {
+    match app.panel {
+        Some(Panel::Help { .. }) => Some(("帮助", "↑↓ / PgUp/PgDn 滚动 · Esc 返回")),
+        Some(Panel::History { .. }) => {
+            Some(("搜索输入历史", "↑↓ 选择 · Enter/Tab 回填 · Esc 取消"))
+        }
+        Some(Panel::Tasks { output: true, .. }) => {
+            Some(("任务输出", "PgUp/PgDn 滚动 · x 停止 · Esc 返回列表"))
+        }
+        Some(Panel::Tasks { .. }) => {
+            Some(("后台任务", "↑↓ 选择 · Enter 查看输出 · x 停止 · Esc 返回"))
+        }
+        None => None,
+    }
+}
+
+/// Approximate content height of the open panel, so the modal dialog hugs
+/// its content instead of stretching to the full transcript height.
+pub(super) fn content_height(app: &App) -> usize {
+    match &app.panel {
+        Some(Panel::Help { .. }) => {
+            // Sectioned help text plus the command list.
+            22 + input::COMMANDS.len()
+        }
+        Some(Panel::History { query, .. }) => {
+            2 + app.history.search(query).len().clamp(1, 10)
+        }
+        Some(Panel::Tasks { output: false, .. }) => app.tasks.len().clamp(1, 12),
+        Some(Panel::Tasks { output: true, .. }) => 14,
+        None => 0,
+    }
+}
 
 pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     match app.panel.as_mut() {
@@ -21,7 +55,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                 lines.extend(transcript::literal(
                     &format!("/{name}  {description}"),
                     area.width as usize,
-                    theme::accent(),
+                    theme::suggestion(),
                 ));
             }
             render_scrolled(f, lines, scroll, area);
@@ -30,10 +64,11 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             let matches = app.history.search(query);
             *selected = (*selected).min(matches.len().saturating_sub(1));
             let mut lines = vec![
-                Line::styled(
-                    format!("搜索：{}▏  · {} 条", text::clean(query), matches.len()),
-                    theme::accent(),
-                ),
+                Line::from(vec![
+                    Span::styled("⌕ ", theme::suggestion()),
+                    Span::styled(format!("{}▏", text::clean(query)), theme::text()),
+                    Span::styled(format!("  · {} 条", matches.len()), theme::subtle()),
+                ]),
                 Line::default(),
             ];
             if matches.is_empty() {
@@ -43,14 +78,25 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             let start = selected.saturating_sub(capacity.saturating_sub(1));
             for (row, index) in matches.iter().enumerate().skip(start).take(capacity) {
                 let value = text::clean(&app.history.entries[*index]).replace('\n', " ↵ ");
-                lines.push(Line::styled(
-                    format!("{} {value}", if row == *selected { "❯" } else { " " }),
-                    if row == *selected {
-                        theme::heading()
-                    } else {
-                        theme::muted()
-                    },
-                ));
+                let focused = row == *selected;
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        if focused { "❯ " } else { "  " },
+                        if focused {
+                            theme::suggestion()
+                        } else {
+                            theme::subtle()
+                        },
+                    ),
+                    Span::styled(
+                        value,
+                        if focused {
+                            theme::suggestion()
+                        } else {
+                            theme::muted()
+                        },
+                    ),
+                ]));
             }
             f.render_widget(Paragraph::new(Text::from(lines)), area);
         }
@@ -108,22 +154,31 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                     let style = if task.status == TaskState::Failed {
                         theme::error()
                     } else if i == index {
-                        theme::heading()
+                        theme::suggestion()
                     } else {
                         theme::muted()
                     };
-                    lines.push(Line::styled(
-                        format!(
-                            "{} #{} [{}] {} · {:.1}s  {}",
-                            if i == index { "❯" } else { " " },
-                            task.id,
-                            task.kind,
-                            task.status.label(),
-                            elapsed(task.elapsed_ms, task.status, app.tasks_received),
-                            text::clean(&task.description).replace('\n', " ")
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            if i == index { "❯ " } else { "  " },
+                            if i == index {
+                                theme::suggestion()
+                            } else {
+                                theme::subtle()
+                            },
                         ),
-                        style,
-                    ));
+                        Span::styled(
+                            format!(
+                                "#{} [{}] {} · {:.1}s  {}",
+                                task.id,
+                                task.kind,
+                                task.status.label(),
+                                elapsed(task.elapsed_ms, task.status, app.tasks_received),
+                                text::clean(&task.description).replace('\n', " ")
+                            ),
+                            style,
+                        ),
+                    ]));
                 }
             }
             f.render_widget(Paragraph::new(Text::from(lines)), area);
@@ -163,33 +218,51 @@ pub(super) fn menu_matches(app: &App) -> Vec<usize> {
     }
 }
 
+/// Rows the command menu occupies: at most five entries inside a rounded box.
+pub(super) fn menu_height(app: &App) -> u16 {
+    let matches = menu_matches(app).len().min(5) as u16;
+    if matches == 0 { 0 } else { matches + 2 }
+}
+
 pub(super) fn draw_menu(f: &mut Frame, app: &App, area: Rect) {
     let matches = menu_matches(app);
     if area.height == 0 || matches.is_empty() {
         return;
     }
     let selected = app.menu_selected.min(matches.len() - 1);
-    let capacity = area.height.saturating_sub(1) as usize;
+    let capacity = area.height.saturating_sub(2) as usize;
     let start = selected.saturating_sub(capacity.saturating_sub(1));
-    let mut lines = vec![Line::styled(
-        "命令 · ↑↓ 选择 · Tab 补全 · Enter 执行",
-        theme::muted(),
-    )];
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(theme::border())
+        .title(Span::styled(" 命令 · ↑↓ 选择 · Tab 补全 · Enter 执行 ", theme::subtle()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let mut lines = Vec::new();
     for (row, index) in matches.iter().enumerate().skip(start).take(capacity) {
         let (name, description) = input::COMMANDS[*index];
-        lines.push(Line::styled(
-            format!(
-                "{} /{name}  {description}",
-                if row == selected { "❯" } else { " " }
+        let focused = row == selected;
+        lines.push(Line::from(vec![
+            Span::styled(
+                if focused { "❯ " } else { "  " },
+                if focused {
+                    theme::suggestion()
+                } else {
+                    theme::subtle()
+                },
             ),
-            if row == selected {
-                theme::heading()
-            } else {
-                theme::muted()
-            },
-        ));
+            Span::styled(
+                format!("/{name}"),
+                if focused {
+                    theme::suggestion()
+                } else {
+                    theme::text()
+                },
+            ),
+            Span::styled(format!("  {description}"), theme::subtle()),
+        ]));
     }
-    f.render_widget(Paragraph::new(Text::from(lines)), area);
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 pub(super) fn todos(app: &App) -> &[crate::agent::event::TodoView] {
@@ -219,7 +292,7 @@ pub(super) fn draw_todos(f: &mut Frame, app: &App, area: Rect) {
                 "展开"
             }
         ),
-        theme::muted(),
+        theme::subtle(),
     )];
     if app.todos_expanded {
         let mut ordered: Vec<_> = items.iter().collect();

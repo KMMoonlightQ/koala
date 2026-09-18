@@ -21,7 +21,7 @@ pub(crate) fn ensure_layout(workspace: &std::path::Path) -> Result<(), MemoryErr
         "digest/wiki",
         "metadata",
     ] {
-        let path = workspace.join(dir);
+        let path = store::checked_path(workspace, dir)?;
         std::fs::create_dir_all(&path).map_err(|source| MemoryError::Io {
             path: path.display().to_string(),
             source,

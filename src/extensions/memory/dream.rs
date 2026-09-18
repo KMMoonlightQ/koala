@@ -3,6 +3,7 @@ use crate::extensions::memory::{BUCKET_NAMES, Catalog, FileStore, MemoryError, t
 use crate::llm::{LlmClient, LlmError, Message};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::fs;
 use std::path::Path;
 use thiserror::Error;
@@ -232,36 +233,22 @@ fn list_daily(workspace: &Path) -> Result<Vec<(String, i64)>, DreamError> {
 }
 
 fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, i64)>) -> Result<(), DreamError> {
-    if !dir.is_dir() {
-        return Ok(());
-    }
-    let entries = fs::read_dir(dir).map_err(|source| MemoryError::Io {
-        path: dir.display().to_string(),
-        source,
-    })?;
-    for entry in entries {
-        let path = entry
-            .map_err(|source| MemoryError::Io {
-                path: dir.display().to_string(),
-                source,
-            })?
-            .path();
-        if path.is_dir() {
-            walk(root, &path, out)?;
-        } else if path.extension().is_some_and(|ext| ext == "md") {
-            let rel = path
-                .strip_prefix(root)
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .map_err(|_| MemoryError::InvalidPath(path.display().to_string()))?;
-            let mtime = path
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            out.push((rel, mtime));
-        }
+    let mut paths = Vec::new();
+    super::store::collect_markdown(dir, &mut paths)?;
+    for path in paths {
+        let rel = path
+            .strip_prefix(root)
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .map_err(|_| MemoryError::InvalidPath(path.display().to_string()))?;
+        let path = super::store::checked_path(root, &rel)?;
+        let mtime = path
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        out.push((rel, mtime));
     }
     Ok(())
 }

@@ -60,31 +60,8 @@ pub async fn distill_session(
 }
 
 fn read_transcript(session_path: &Path) -> Result<String, DistillError> {
-    let raw = std::fs::read_to_string(session_path)
+    let out = crate::agent::transcripts::distillation_text(session_path, MAX_TRANSCRIPT_CHARS)
         .map_err(|_| DistillError::EmptySession(session_path.display().to_string()))?;
-    let mut out = String::new();
-    for line in raw.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let role = value.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        let content = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        if content.is_empty() {
-            continue;
-        }
-        out.push_str(role);
-        out.push_str(": ");
-        out.push_str(content);
-        out.push_str("\n\n");
-        if out.len() > MAX_TRANSCRIPT_CHARS {
-            let mut end = MAX_TRANSCRIPT_CHARS;
-            while !out.is_char_boundary(end) {
-                end -= 1;
-            }
-            out.truncate(end);
-            break;
-        }
-    }
     if out.trim().is_empty() {
         return Err(DistillError::EmptySession(
             session_path.display().to_string(),

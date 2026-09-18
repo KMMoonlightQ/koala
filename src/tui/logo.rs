@@ -36,7 +36,9 @@ pub(super) fn lines() -> Vec<Line<'static>> {
 
 fn render_pixels(pixels: &[&str]) -> Vec<Line<'static>> {
     pixels
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|rows| {
             Line::from(
                 rows[0]

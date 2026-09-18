@@ -101,7 +101,7 @@ impl FileStore {
     pub fn rebuild(&mut self) -> Result<(), MemoryError> {
         let mut files = BTreeMap::new();
         for sub in ["daily", "digest"] {
-            let dir = self.workspace.join(sub);
+            let dir = checked_path(&self.workspace, sub)?;
             let mut paths = Vec::new();
             collect_markdown(&dir, &mut paths)?;
             paths.sort();
@@ -126,8 +126,7 @@ impl FileStore {
 
     /// Write a file and immediately refresh its index entries.
     pub fn write_file(&mut self, rel: &str, content: &str) -> Result<(), MemoryError> {
-        validate_rel_path(rel)?;
-        let abs = self.workspace.join(rel);
+        let abs = checked_path(&self.workspace, rel)?;
         if let Some(parent) = abs.parent() {
             fs::create_dir_all(parent).map_err(io_err(parent))?;
         }
@@ -188,8 +187,7 @@ impl FileStore {
 
     /// 1-based inclusive line range, clamped to the file.
     pub fn read_lines(&self, rel: &str, start: usize, end: usize) -> Result<String, MemoryError> {
-        validate_rel_path(rel)?;
-        let abs = self.workspace.join(rel);
+        let abs = checked_path(&self.workspace, rel)?;
         let text = fs::read_to_string(&abs).map_err(io_err(&abs))?;
         let start = start.max(1);
         Ok(text
@@ -210,7 +208,7 @@ impl FileStore {
     }
 
     fn read_entry(&self, rel: &str) -> Result<FileEntry, MemoryError> {
-        let abs = self.workspace.join(rel);
+        let abs = checked_path(&self.workspace, rel)?;
         let text = fs::read_to_string(&abs).map_err(io_err(&abs))?;
         let parsed =
             markdown::parse(&text).unwrap_or_else(|_| markdown::ParsedMarkdown::plain(&text));
@@ -270,15 +268,41 @@ fn validate_rel_path(rel: &str) -> Result<(), MemoryError> {
     Ok(())
 }
 
-fn collect_markdown(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), MemoryError> {
-    if !dir.is_dir() {
+/// Resolve a workspace-relative path without following links inside the workspace.
+/// Missing suffixes are allowed so callers can create new files and directories.
+pub(super) fn checked_path(workspace: &Path, rel: &str) -> Result<PathBuf, MemoryError> {
+    validate_rel_path(rel)?;
+    let mut path = workspace.to_path_buf();
+    for component in Path::new(rel).components() {
+        path.push(component);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(MemoryError::InvalidPath(rel.into()));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_err(&path)(error)),
+        }
+    }
+    Ok(path)
+}
+
+pub(super) fn collect_markdown(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), MemoryError> {
+    let metadata = match fs::symlink_metadata(dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_err(dir)(error)),
+    };
+    if !metadata.is_dir() {
         return Ok(());
     }
     for entry in fs::read_dir(dir).map_err(io_err(dir))? {
-        let path = entry.map_err(io_err(dir))?.path();
-        if path.is_dir() {
+        let entry = entry.map_err(io_err(dir))?;
+        let path = entry.path();
+        let kind = entry.file_type().map_err(io_err(&path))?;
+        if kind.is_dir() {
             collect_markdown(&path, out)?;
-        } else if path.extension().is_some_and(|ext| ext == "md") {
+        } else if kind.is_file() && path.extension().is_some_and(|ext| ext == "md") {
             out.push(path);
         }
     }
@@ -298,7 +322,7 @@ impl Catalog {
     }
 
     pub fn load(workspace: &Path) -> Result<Self, MemoryError> {
-        let path = Self::path(workspace);
+        let path = checked_path(workspace, "metadata/catalog.json")?;
         match fs::read_to_string(&path) {
             Ok(text) => serde_json::from_str(&text).map_err(|e| MemoryError::Json {
                 path: path.display().to_string(),
@@ -310,7 +334,7 @@ impl Catalog {
     }
 
     pub fn save(&self, workspace: &Path) -> Result<(), MemoryError> {
-        let path = Self::path(workspace);
+        let path = checked_path(workspace, "metadata/catalog.json")?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(io_err(parent))?;
         }
@@ -352,6 +376,65 @@ mod tests {
         fs::write(ws.0.join("digest/wiki/borrow.md"), BORROW_CARD).unwrap();
         let store = FileStore::open(&ws.0).unwrap();
         (ws, store)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_cannot_escape_reads_writes_or_indexing() {
+        use std::os::unix::fs::symlink;
+        let (ws, mut store) = open_seeded();
+        let outside = TempWorkspace::new();
+        fs::create_dir_all(&outside.0).unwrap();
+        let target = outside.0.join("secret.md");
+        fs::write(&target, "outsideonlymarker").unwrap();
+        symlink(&outside.0, ws.0.join("digest/link")).unwrap();
+        symlink(&target, ws.0.join("daily/linked.md")).unwrap();
+        symlink(outside.0.join("missing.md"), ws.0.join("daily/dangling.md")).unwrap();
+        symlink(ws.0.join("daily"), ws.0.join("daily/cycle")).unwrap();
+        for path in [
+            "digest/link/secret.md",
+            "daily/linked.md",
+            "daily/dangling.md",
+        ] {
+            assert!(store.read_lines(path, 1, 10).is_err(), "{path}");
+            assert!(store.write_file(path, "overwrite").is_err(), "{path}");
+            assert!(store.upsert_file(path).is_err(), "{path}");
+        }
+        assert!(store.write_file("digest/link/new/note.md", "new").is_err());
+        assert!(!outside.0.join("new").exists());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "outsideonlymarker");
+        store.rebuild().unwrap();
+        assert!(store.search("outsideonlymarker", 5).is_empty());
+        assert!(
+            FileStore::open(&ws.0)
+                .unwrap()
+                .search("outsideonlymarker", 5)
+                .is_empty()
+        );
+        let mut paths = Vec::new();
+        collect_markdown(&ws.0.join("daily"), &mut paths).unwrap();
+        assert_eq!(paths.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn layout_and_checkpoint_reject_linked_directories_and_files() {
+        use std::os::unix::fs::symlink;
+        let ws = TempWorkspace::new();
+        let outside = TempWorkspace::new();
+        fs::create_dir_all(&ws.0).unwrap();
+        fs::create_dir_all(&outside.0).unwrap();
+        symlink(&outside.0, ws.0.join("digest")).unwrap();
+        assert!(FileStore::open(&ws.0).is_err());
+        assert!(!outside.0.join("wiki").exists());
+        fs::remove_file(ws.0.join("digest")).unwrap();
+        FileStore::open(&ws.0).unwrap();
+        let target = outside.0.join("checkpoint.json");
+        fs::write(&target, "{}").unwrap();
+        symlink(&target, Catalog::path(&ws.0)).unwrap();
+        assert!(Catalog::load(&ws.0).is_err());
+        assert!(Catalog::default().save(&ws.0).is_err());
+        assert_eq!(fs::read_to_string(target).unwrap(), "{}");
     }
 
     #[test]

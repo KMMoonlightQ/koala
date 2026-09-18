@@ -278,8 +278,10 @@ Enter 发送，Shift+Enter、Ctrl+J 或 `\` 后接 Enter 换行。启用终端�
 
 | 组件 | 实现 |
 |---|---|
+| 显示转录 | `src/tui/transcript.rs`：集中处理转录事件、工具状态、待办、滚动、详情模式与渲染缓存；界面通过操作与可见行访问它 |
+| 持久化转录 | `src/agent/transcripts.rs`：管理当前转录标识、整轮追加、严格恢复与容错蒸馏；保存失败保留内存回答，避免再次记为中断 |
 | ReAct 循环 | `src/agent/react.rs`：流式思考 → 工具调用 → 观察回填，直到模型不再调工具；可配置工具轮数上限，默认不限 |
-| Tools | `src/agent/tools/`：trait + 注册表。内置 remember / todo_write / skill / task / bash |
+| 工具目录 | `src/agent/tools/catalog.rs`：统一内置与扩展工具的定义、能力和执行归属；自动许可与 plan mode 可用性分别判断。内置 remember / todo_write / skill / task / bash |
 | Extensions | `src/extensions/`：可安装的进程扩展 + 原生 trait；上下文注入、工具注册、参数/结果处理；知识库实现位于 `src/extensions/memory/` |
 | Hooks | `src/agent/hooks.rs`：PreToolUse（exit 2 阻断）/ PostToolUse / TurnStart / TurnEnd，stdin 收 JSON |
 | 权限控制 | `src/agent/permissions.rs`：三级可切换审批策略；审批区显示操作与参数 |

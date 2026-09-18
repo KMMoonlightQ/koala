@@ -60,9 +60,8 @@ impl Extensions {
         if self.entries.iter().any(|e| e.name() == extension.name()) {
             return Err(format!("duplicate extension: {}", extension.name()));
         }
-        let mut names: HashSet<String> = ["bash", "remember", "todo_write", "task", "skill"]
-            .into_iter()
-            .map(String::from)
+        let mut names: HashSet<String> = crate::agent::tools::catalog::builtin_names()
+            .map(str::to_owned)
             .chain(self.tools().into_iter().map(|t| t.function.name))
             .collect();
         for tool in extension.tools() {
@@ -73,19 +72,20 @@ impl Extensions {
         self.entries.push(extension);
         Ok(())
     }
-    pub fn tools(&self) -> Vec<Tool> {
-        self.entries.iter().flat_map(|e| e.tools()).collect()
-    }
-    fn owner(&self, tool: &str) -> Option<&Arc<dyn Extension>> {
+    pub(crate) fn tool_entries(&self) -> Vec<(Tool, Arc<dyn Extension>)> {
         self.entries
             .iter()
-            .find(|e| e.tools().iter().any(|t| t.function.name == tool))
+            .flat_map(|extension| {
+                extension
+                    .tools()
+                    .into_iter()
+                    .map(|tool| (tool, Arc::clone(extension)))
+            })
+            .collect()
     }
-    pub fn read_only(&self, tool: &str) -> bool {
-        self.owner(tool).is_some_and(|e| e.read_only(tool))
-    }
-    pub async fn execute(&self, tool: &str, args: &Value) -> Option<Result<Response, String>> {
-        Some(self.owner(tool)?.execute(tool, args).await)
+
+    pub fn tools(&self) -> Vec<Tool> {
+        self.entries.iter().flat_map(|e| e.tools()).collect()
     }
     /// Ordered middleware: later extensions see the current arguments/result.
     pub async fn hook(&self, stage: Stage, mut payload: Value) -> Result<Response, String> {
@@ -320,43 +320,6 @@ mod tests {
         let path = std::env::temp_dir().join(format!("kb-extension-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&path).unwrap();
         path
-    }
-    #[tokio::test]
-    async fn memory_can_be_removed_and_retrieves_fresh_data() {
-        let dir = temporary();
-        let mut cfg = Config::default();
-        cfg.memory.workspace = dir.join("memory");
-        cfg.extensions.memory = false;
-        let disabled = load(&cfg).unwrap();
-        assert!(disabled.tools().is_empty());
-        disabled
-            .hook(Stage::TurnStart, json!({"input": "ownership"}))
-            .await
-            .unwrap();
-        assert!(!cfg.memory.workspace.exists());
-        cfg.extensions.memory = true;
-        let enabled = load(&cfg).unwrap();
-        let written = enabled.execute("memory_write", &json!({"path": "digest/wiki/rust", "name": "rust", "content": "ownership and borrowing", "description": "Rust"})).await.unwrap().unwrap();
-        assert!(!written.is_error);
-        let retrieved = enabled
-            .hook(Stage::TurnStart, json!({"input": "ownership"}))
-            .await
-            .unwrap();
-        assert!(
-            retrieved
-                .context
-                .unwrap()
-                .contains("ownership and borrowing")
-        );
-        assert!(enabled.read_only("memory_read"));
-        assert!(!enabled.read_only("memory_write"));
-        let failure = enabled
-            .execute("memory_read", &json!({"path": "../secret"}))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(failure.is_error);
-        std::fs::remove_dir_all(dir).unwrap();
     }
     #[tokio::test]
     async fn process_protocol_and_ordered_argument_rewrite() {

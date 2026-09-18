@@ -66,6 +66,7 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                         break;
                     };
                     match cmd {
+                        SessionCommand::SetLang(value) => shared.lang.set(value),
                         SessionCommand::Cancel => {
                             if stop(&mut active, &agent, &mut work_rx, &ev_tx, &mut progress, shared.lang.get()).await {
                                 let _ = ev_tx.send(UiEvent::Cancelled);
@@ -184,7 +185,6 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                                 ],
                             )));
                         }
-                        SessionCommand::SetLang(value) => shared.lang.set(value),
                         SessionCommand::TogglePlanMode => {
                             let on = agent.lock().await.toggle_plan_mode();
                             let _ = ev_tx.send(UiEvent::PlanMode(on));
@@ -295,6 +295,45 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn language_switch_during_active_turn_updates_backend_without_interrupting() {
+        let root = std::env::temp_dir().join(format!("kb-live-lang-{}", uuid::Uuid::new_v4()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.llm.base_url = format!("http://{}", listener.local_addr().unwrap());
+        cfg.extensions.memory = false;
+        cfg.lang = Lang::En;
+        cfg.agent.session_dir = root.join("sessions");
+        cfg.agent.memory_file = root.join("memory.md");
+        let agent = Agent::new(&cfg).unwrap();
+        let shared = agent.shared.clone();
+        let (handle, mut events) = spawn(agent);
+        handle.send(SessionCommand::Submit("first prompt".into()));
+        let (mut socket, _) = timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        request(&mut socket).await;
+        handle.send(SessionCommand::SetLang(Lang::Zh));
+        // FIFO task query is a barrier: SetLang must have been handled first.
+        handle.send(SessionCommand::ShowTasks);
+        receive_until(&mut events, |event| matches!(event, UiEvent::Tasks(_))).await;
+        assert_eq!(shared.lang.get(), Lang::Zh);
+        let response =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"finished\"}}]}\n\ndata: [DONE]\n\n";
+        socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes()).await.unwrap();
+        receive_until(
+            &mut events,
+            |event| matches!(event, UiEvent::Text(text) if text == "finished"),
+        )
+        .await;
+        receive_until(&mut events, |event| matches!(event, UiEvent::Done)).await;
+        handle.send(SessionCommand::Shutdown);
+        while events.recv().await.is_some() {}
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn restored_session_reaches_model_and_appends_to_original_transcript() {

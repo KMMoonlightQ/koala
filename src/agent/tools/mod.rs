@@ -1,4 +1,5 @@
 pub mod bash;
+pub mod catalog;
 pub mod remember;
 pub mod skill;
 pub mod task;
@@ -130,44 +131,7 @@ pub trait Tool: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = ToolResult> + Send + 'a>>;
 }
 
-pub struct ToolRegistry {
-    tools: Vec<Box<dyn Tool>>,
-}
-
-impl ToolRegistry {
-    /// `task` is only available at depth 0 so sub-agents cannot recurse.
-    pub fn build(depth: usize) -> Self {
-        let mut tools: Vec<Box<dyn Tool>> = vec![
-            Box::new(remember::Remember),
-            Box::new(todo::TodoWrite),
-            Box::new(skill::SkillTool),
-            Box::new(bash::Bash),
-        ];
-        if depth == 0 {
-            tools.push(Box::new(task::TaskTool));
-        }
-        Self { tools }
-    }
-
-    pub fn definitions(&self) -> Vec<crate::llm::Tool> {
-        self.tools
-            .iter()
-            .map(|t| crate::llm::Tool::function(t.name(), t.description(), t.schema()))
-            .collect()
-    }
-
-    pub async fn execute(
-        &self,
-        ctx: &mut ToolContext<'_>,
-        name: &str,
-        args: serde_json::Value,
-    ) -> ToolResult {
-        match self.tools.iter().find(|t| t.name() == name) {
-            Some(tool) => tool.execute(ctx, args).await,
-            None => ToolResult::err(format!("unknown tool: {name}")),
-        }
-    }
-}
+pub use catalog::ToolCatalog;
 
 /// One-line argument digest for the UI: `bash(ls -la)`, `skill(review)`...
 pub fn summarize_args(name: &str, arguments: &str) -> String {
@@ -303,7 +267,7 @@ mod tests {
             depth: 0,
             plan_mode: false,
         };
-        let registry = ToolRegistry::build(0);
+        let registry = ToolCatalog::build(0, &shared.extensions);
         let valid =
             serde_json::json!({"todos": [{"content": "keep this", "status": "in_progress"}]});
         assert!(

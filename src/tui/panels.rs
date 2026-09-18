@@ -396,7 +396,11 @@ fn render_scrolled(f: &mut Frame, lines: Vec<Line<'static>>, scroll: &mut usize,
 }
 
 pub(super) fn menu_matches(app: &App) -> Vec<usize> {
-    if app.menu_dismissed || app.panel.is_some() || app.detailed || app.permission.is_some() {
+    if app.menu_dismissed
+        || app.panel.is_some()
+        || app.transcript.detailed()
+        || app.permission.is_some()
+    {
         Vec::new()
     } else {
         input::matches(&app.input)
@@ -454,13 +458,7 @@ pub(super) fn draw_menu(f: &mut Frame, app: &App, area: Rect) {
 }
 
 pub(super) fn todos(app: &App) -> &[crate::agent::event::TodoView] {
-    app.last_todos
-        .and_then(|i| app.entries.get(i))
-        .and_then(|entry| match entry {
-            transcript::EntryKind::Todos(items) => Some(items.as_slice()),
-            _ => None,
-        })
-        .unwrap_or_default()
+    app.transcript.todos()
 }
 
 pub(super) fn draw_todos(f: &mut Frame, app: &App, area: Rect) {

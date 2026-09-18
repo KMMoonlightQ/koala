@@ -13,6 +13,14 @@ pub enum HookOutcome {
 }
 
 pub async fn run_hook(command: &str, payload: &serde_json::Value) -> HookOutcome {
+    run_hook_with_timeout(command, payload, HOOK_TIMEOUT).await
+}
+
+async fn run_hook_with_timeout(
+    command: &str,
+    payload: &serde_json::Value,
+    timeout: Duration,
+) -> HookOutcome {
     let child = super::process::spawn(
         tokio::process::Command::new("bash")
             .arg("-c")
@@ -25,12 +33,20 @@ pub async fn run_hook(command: &str, payload: &serde_json::Value) -> HookOutcome
         Ok(c) => c,
         Err(e) => return HookOutcome::Failed(format!("spawn failed: {e}")),
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        let data = payload.to_string().into_bytes();
-        let _ = stdin.write_all(&data).await;
-        let _ = stdin.shutdown().await;
-    }
-    match tokio::time::timeout(HOOK_TIMEOUT, child.wait_with_output()).await {
+    let stdin = child.stdin.take();
+    let data = payload.to_string().into_bytes();
+    let exchange = async move {
+        let writer = async move {
+            if let Some(mut stdin) = stdin {
+                // Hooks may deliberately exit without consuming their payload.
+                let _ = stdin.write_all(&data).await;
+                let _ = stdin.shutdown().await;
+            }
+        };
+        let (_, output) = tokio::join!(writer, child.wait_with_output());
+        output
+    };
+    match tokio::time::timeout(timeout, exchange).await {
         Ok(Ok(output)) => {
             let code = output.status.code().unwrap_or(-1);
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -58,6 +74,30 @@ pub async fn run_all(commands: &[String], payload: &serde_json::Value) -> HookOu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn timeout_covers_a_hook_that_never_reads_large_input() {
+        let payload = serde_json::json!({"input": "x".repeat(2_000_000)});
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(3),
+            run_hook_with_timeout("sleep 30", &payload, Duration::from_millis(100)),
+        )
+        .await
+        .expect("stdin write escaped hook timeout");
+        assert_eq!(outcome, HookOutcome::Failed("hook timed out".into()));
+    }
+
+    #[tokio::test]
+    async fn drains_stderr_while_writing_large_input() {
+        let payload = serde_json::json!({"input": "x".repeat(2_000_000)});
+        let outcome = run_hook_with_timeout(
+            "head -c 200000 /dev/zero >&2; cat >/dev/null",
+            &payload,
+            Duration::from_secs(3),
+        )
+        .await;
+        assert_eq!(outcome, HookOutcome::Ok);
+    }
 
     #[tokio::test]
     async fn exit_zero_is_ok() {

@@ -36,7 +36,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     if app.panel.is_some() {
         return panel_key(app, key);
     }
-    if app.detailed {
+    if app.transcript.detailed() {
         return false;
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);

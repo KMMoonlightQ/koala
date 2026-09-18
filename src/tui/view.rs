@@ -1,4 +1,4 @@
-use super::{App, logo, panels, text, theme, transcript};
+use super::{App, logo, panels, text, theme};
 use crate::i18n::{self, Key};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
@@ -12,7 +12,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
     });
     let input_height = (app.input.lines().len().clamp(1, 5) + 2) as u16;
     let todos = panels::todos(app);
-    let todo_height = if todos.is_empty() || app.detailed {
+    let todo_height = if todos.is_empty() || app.transcript.detailed() {
         0
     } else {
         (todos.len() + 1)
@@ -21,16 +21,20 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
     };
     let menu_height = panels::menu_height(app);
     let rows = Layout::vertical([
-        Constraint::Length(u16::from(app.detailed)),
+        Constraint::Length(u16::from(app.transcript.detailed())),
         Constraint::Min(1),
         Constraint::Length(todo_height),
         Constraint::Length(menu_height),
         Constraint::Length(1),
-        Constraint::Length(if app.detailed { 0 } else { input_height }),
+        Constraint::Length(if app.transcript.detailed() {
+            0
+        } else {
+            input_height
+        }),
         Constraint::Length(1),
     ])
     .split(area);
-    if app.detailed {
+    if app.transcript.detailed() {
         f.render_widget(
             Paragraph::new(i18n::text(app.lang, Key::DetailedLog)).style(theme::heading()),
             rows[0],
@@ -40,7 +44,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
     panels::draw_todos(f, app, rows[2]);
     panels::draw_menu(f, app, rows[3]);
     draw_status(f, app, rows[4]);
-    if !app.detailed {
+    if !app.transcript.detailed() {
         draw_input(f, app, rows[5]);
     }
     draw_statusbar(f, app, rows[6]);
@@ -92,64 +96,10 @@ fn centered(area: Rect, max_w: u16, max_h: u16) -> Rect {
 }
 
 fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
-    if app.rendered.as_ref().is_none_or(|cache| {
-        cache.width != area.width || cache.detailed != app.detailed || cache.lang != app.lang
-    }) {
-        let mut lines = Vec::new();
-        if !app.detailed {
-            if area.width >= 24 {
-                lines.extend(logo::lines());
-                lines.push(Line::default());
-            }
-            lines.push(Line::from(vec![
-                Span::styled("koala", theme::heading()),
-                Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), theme::muted()),
-            ]));
-            lines.extend(text::wrap(
-                Line::styled(text::clean(&app.directory), theme::muted()),
-                area.width as usize,
-            ));
-            lines.push(Line::default());
-        }
-        for entry in &app.entries {
-            if !app.detailed && matches!(entry, transcript::EntryKind::Todos(_)) {
-                continue;
-            }
-            lines.extend(transcript::render_entry(
-                entry,
-                area.width as usize,
-                app.detailed,
-                app.lang,
-            ));
-            lines.push(Line::default());
-        }
-        app.rendered = Some(transcript::Rendered {
-            width: area.width,
-            detailed: app.detailed,
-            lang: app.lang,
-            lines,
-        });
-    }
-    let lines = &app.rendered.as_ref().unwrap().lines;
-    // Markdown and tool output are already wrapped with their continuation
-    // prefixes. Paragraph only provides scrolling and terminal clipping.
-    app.bottom = lines.len().saturating_sub(area.height as usize);
-    app.scroll = if app.follow {
-        app.bottom
-    } else {
-        app.scroll.min(app.bottom)
-    };
-    f.render_widget(
-        Paragraph::new(Text::from(
-            lines
-                .iter()
-                .skip(app.scroll)
-                .take(area.height as usize)
-                .cloned()
-                .collect::<Vec<_>>(),
-        )),
-        area,
-    );
+    let lines = app
+        .transcript
+        .visible_lines(area.width, area.height, app.lang, &app.directory);
+    f.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
@@ -157,7 +107,7 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         let elapsed = app.started.map(|t| t.elapsed()).unwrap_or_default();
         let action = if app.permission.is_some() {
             i18n::text(app.lang, Key::ActionDenyOrInterrupt)
-        } else if app.detailed || app.panel.is_some() {
+        } else if app.transcript.detailed() || app.panel.is_some() {
             i18n::text(app.lang, Key::ActionClosePanelToInterrupt)
         } else {
             i18n::text(app.lang, Key::ActionInterrupt)
@@ -235,13 +185,13 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(left), area);
     let hint = if app.permission.is_some() || app.panel.is_some() {
         ""
-    } else if app.detailed {
+    } else if app.transcript.detailed() {
         i18n::text(app.lang, Key::StatusBarHintBack)
     } else if let Some(hint) = &app.hint {
         hint.as_str()
-    } else if app.unread {
+    } else if app.transcript.unread() {
         i18n::text(app.lang, Key::StatusBarHintNewContent)
-    } else if !app.follow {
+    } else if !app.transcript.following() {
         i18n::text(app.lang, Key::StatusBarHintBottom)
     } else {
         i18n::text(app.lang, Key::StatusBarHintHelp)
@@ -253,7 +203,7 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
         let hint_area = Rect::new(area.right() - hint_width, area.y, hint_width, area.height);
         f.render_widget(
             Paragraph::new(hint)
-                .style(if app.hint.is_some() || app.unread {
+                .style(if app.hint.is_some() || app.transcript.unread() {
                     theme::text()
                 } else {
                     theme::key_hint()

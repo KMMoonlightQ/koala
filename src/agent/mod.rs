@@ -23,10 +23,7 @@ use background::BackgroundManager;
 use event::{EventSender, UiEvent};
 use permissions::Permissions;
 use plan::TodoList;
-use serde::Serialize;
 use skills::Skills;
-use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
@@ -76,18 +73,10 @@ pub struct Agent {
     agent_memory: AgentMemory,
     skills: Arc<Skills>,
     background: BackgroundManager,
-    session_id: String,
-    session_dir: PathBuf,
+    transcript: transcripts::TranscriptStore,
     history: Vec<Message>,
     plan_mode: bool,
     pending_input: Option<String>,
-}
-
-#[derive(Serialize)]
-struct SessionRecord<'a> {
-    ts: String,
-    role: &'a str,
-    content: &'a str,
 }
 
 impl Agent {
@@ -133,8 +122,7 @@ impl Agent {
             skills: Arc::new(Skills::load()),
             todos: TodoList::default(),
             background: BackgroundManager::default(),
-            session_id: new_session_id(),
-            session_dir: cfg.agent.session_dir.clone(),
+            transcript: transcripts::TranscriptStore::new(cfg.agent.session_dir.clone()),
             history: Vec::new(),
             plan_mode: false,
             pending_input: None,
@@ -195,7 +183,7 @@ impl Agent {
     }
 
     pub fn session_id(&self) -> &str {
-        &self.session_id
+        self.transcript.id()
     }
 
     /// Interface language used for messages and the system prompt.
@@ -208,12 +196,12 @@ impl Agent {
     }
 
     pub fn list_sessions(&self) -> Result<Vec<transcripts::SessionView>, String> {
-        transcripts::list(&self.session_dir, &self.session_id, self.lang())
+        self.transcript.list(self.lang())
     }
 
     pub fn restore_session(&mut self, id: &str) -> Result<Vec<transcripts::Record>, String> {
         // Validate the entire file before changing any live session state.
-        let records = transcripts::read(&self.session_dir, id, self.lang())?;
+        let records = self.transcript.restore(id, self.lang())?;
         self.history = records
             .iter()
             .map(|r| {
@@ -224,7 +212,6 @@ impl Agent {
                 }
             })
             .collect();
-        self.session_id = id.to_owned();
         self.background = self.background.new_scope();
         self.todos = TodoList::default();
         self.pending_input = None;
@@ -236,7 +223,7 @@ impl Agent {
     }
 
     pub fn new_session(&mut self) {
-        self.session_id = new_session_id();
+        self.transcript.reset();
         self.background = self.background.new_scope();
         self.history.clear();
         self.todos = TodoList::default();
@@ -258,14 +245,15 @@ impl Agent {
 
     /// Manual /compact. Returns true when history was compacted.
     pub async fn compact_now(&mut self) -> Result<bool, AgentError> {
-        let payload = serde_json::json!({"session": self.session_id, "messages": self.history});
+        let payload =
+            serde_json::json!({"session": self.transcript.id(), "messages": self.history});
         self.shared
             .extensions
             .hook(crate::extensions::Stage::BeforeCompact, payload)
             .await
             .map_err(AgentError::Extension)?;
         let changed = compact::compact(&self.shared.llm, &mut self.history).await?;
-        self.shared.extensions.hook(crate::extensions::Stage::AfterCompact, serde_json::json!({"session": self.session_id, "messages": self.history, "changed": changed})).await.map_err(AgentError::Extension)?;
+        self.shared.extensions.hook(crate::extensions::Stage::AfterCompact, serde_json::json!({"session": self.transcript.id(), "messages": self.history, "changed": changed})).await.map_err(AgentError::Extension)?;
         Ok(changed)
     }
 
@@ -277,7 +265,7 @@ impl Agent {
         self.pending_input = Some(input.to_owned());
         if let hooks::HookOutcome::Failed(reason) = hooks::run_all(
             &self.shared.hooks.turn_start,
-            &serde_json::json!({"hook": "turn_start", "session": self.session_id}),
+            &serde_json::json!({"hook": "turn_start", "session": self.transcript.id()}),
         )
         .await
         {
@@ -285,7 +273,7 @@ impl Agent {
         }
 
         let extension = self.shared.extensions.hook(crate::extensions::Stage::TurnStart,
-            serde_json::json!({"session": self.session_id, "input": input, "plan_mode": self.plan_mode, "depth": 0})).await.map_err(AgentError::Extension)?;
+            serde_json::json!({"session": self.transcript.id(), "input": input, "plan_mode": self.plan_mode, "depth": 0})).await.map_err(AgentError::Extension)?;
         let mut system = prompt::build_system(
             &self
                 .agent_memory
@@ -323,7 +311,7 @@ impl Agent {
                 Ok(reply) => reply,
                 Err(error) => {
                     if let Err(reason) = self.shared.extensions.hook(crate::extensions::Stage::TurnEnd,
-                        serde_json::json!({"session": self.session_id, "input": input, "error": error.to_string(), "depth": 0, "plan_mode": self.plan_mode})).await {
+                        serde_json::json!({"session": self.transcript.id(), "input": input, "error": error.to_string(), "depth": 0, "plan_mode": self.plan_mode})).await {
                         let _ = events.send(UiEvent::Note(format!("extension: {reason}")));
                     }
                     return Err(error);
@@ -331,11 +319,7 @@ impl Agent {
             }
         };
 
-        self.history.push(Message::user(input));
-        self.history.push(Message::assistant(&reply));
-        self.pending_input = None;
-        self.append_session("user", input)?;
-        self.append_session("assistant", &reply)?;
+        self.record_turn(input, &reply)?;
 
         if compact::estimate_chars(&self.history) > self.shared.compact_threshold {
             let _ = events.send(UiEvent::Status(
@@ -354,14 +338,14 @@ impl Agent {
 
         if let hooks::HookOutcome::Failed(reason) = hooks::run_all(
             &self.shared.hooks.turn_end,
-            &serde_json::json!({"hook": "turn_end", "session": self.session_id}),
+            &serde_json::json!({"hook": "turn_end", "session": self.transcript.id()}),
         )
         .await
         {
             let _ = events.send(UiEvent::Note(format!("hook: {reason}")));
         }
         if let Err(reason) = self.shared.extensions.hook(crate::extensions::Stage::TurnEnd,
-            serde_json::json!({"session": self.session_id, "input": input, "reply": reply, "session_path": self.session_path(), "plan_mode": self.plan_mode, "depth": 0})).await {
+            serde_json::json!({"session": self.transcript.id(), "input": input, "reply": reply, "session_path": self.transcript.path(), "plan_mode": self.plan_mode, "depth": 0})).await {
             let _ = events.send(UiEvent::Note(format!("extension: {reason}")));
         }
         Ok(reply)
@@ -376,71 +360,19 @@ impl Agent {
                 progress,
                 i18n::text(self.lang(), Key::InterruptNotice)
             );
-            self.history.push(Message::user(&input));
-            self.history.push(Message::assistant(&reply));
-            self.append_session("user", &input)?;
-            self.append_session("assistant", &reply)?;
+            self.record_turn(&input, &reply)?;
         }
         Ok(())
     }
 
-    fn append_session(&self, role: &str, content: &str) -> Result<(), AgentError> {
-        let path = self.session_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|source| AgentError::Io {
-                path: parent.display().to_string(),
-                source,
-            })?;
-        }
-        let record = SessionRecord {
-            ts: chrono::Local::now().to_rfc3339(),
-            role,
-            content,
-        };
-        let mut line =
-            serde_json::to_string(&record).expect("session records contain only strings");
-        line.push('\n');
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)
-            .map_err(|source| AgentError::Io {
-                path: path.display().to_string(),
-                source,
-            })?;
-        // Accept valid JSONL files whose final record has no newline.
-        let separate = (|| -> std::io::Result<()> {
-            if file.metadata()?.len() > 0 {
-                file.seek(SeekFrom::End(-1))?;
-                let mut last = [0];
-                file.read_exact(&mut last)?;
-                if last[0] != b'\n' {
-                    file.write_all(b"\n")?;
-                }
-            }
-            Ok(())
-        })();
-        separate.map_err(|source| AgentError::Io {
-            path: path.display().to_string(),
-            source,
-        })?;
-        file.write_all(line.as_bytes())
-            .map_err(|source| AgentError::Io {
-                path: path.display().to_string(),
-                source,
-            })
+    fn record_turn(&mut self, input: &str, reply: &str) -> Result<(), AgentError> {
+        // A completed reply stays in memory even if persistence fails. Clear
+        // pending first so session completion cannot save it again as interrupted.
+        self.history.push(Message::user(input));
+        self.history.push(Message::assistant(reply));
+        self.pending_input = None;
+        self.transcript.append_turn(input, reply)
     }
-
-    fn session_path(&self) -> PathBuf {
-        self.session_dir.join(format!("{}.jsonl", self.session_id))
-    }
-}
-
-fn new_session_id() -> String {
-    let date = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    let short = &uuid::Uuid::new_v4().simple().to_string()[..6];
-    format!("{date}-{short}")
 }
 
 #[cfg(test)]
@@ -599,8 +531,38 @@ mod tests {
     }
 
     #[test]
+    fn completed_and_interrupted_turns_are_not_replayed_after_write_failure() {
+        let root = std::env::temp_dir().join(format!("kb-failed-save-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let blocked = root.join("not-a-directory");
+        std::fs::write(&blocked, "keep").unwrap();
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.extensions.memory = false;
+        cfg.agent.memory_file = root.join("memory.md");
+        cfg.agent.session_dir = blocked;
+        let mut agent = Agent::new(&cfg).unwrap();
+        agent.pending_input = Some("question".into());
+        assert!(agent.record_turn("question", "completed answer").is_err());
+        agent.record_interruption("completed answer").unwrap();
+        assert_eq!(agent.history.len(), 2);
+        assert_eq!(
+            agent.history[1].content.as_deref(),
+            Some("completed answer")
+        );
+        assert!(agent.pending_input.is_none());
+        agent.pending_input = Some("next question".into());
+        assert!(agent.record_interruption("partial answer").is_err());
+        agent.record_interruption("partial answer").unwrap();
+        assert_eq!(agent.history.len(), 4);
+        assert!(agent.pending_input.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn session_id_is_filesystem_safe() {
-        let id = new_session_id();
+        let store = transcripts::TranscriptStore::new(PathBuf::new());
+        let id = store.id();
         assert!(id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
         assert_eq!(id.len(), 15 + 1 + 6);
     }

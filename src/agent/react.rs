@@ -1,9 +1,9 @@
 use super::AgentError;
 use super::event::UiEvent;
 use super::hooks::{self, HookOutcome};
-use super::permissions::{self, Policy};
+use super::permissions::Policy;
 use super::retry;
-use super::tools::{self, ToolContext, ToolRegistry};
+use super::tools::{self, ToolCatalog, ToolContext};
 use crate::extensions::Stage;
 use crate::llm::{DeltaAggregator, Message, ToolCall};
 use futures_util::StreamExt;
@@ -16,9 +16,8 @@ pub async fn run(
     messages: &mut Vec<Message>,
     max_rounds: Option<usize>,
 ) -> Result<String, AgentError> {
-    let registry = ToolRegistry::build(ctx.depth);
-    let mut tool_defs = registry.definitions();
-    tool_defs.extend(ctx.shared.extensions.tools());
+    let registry = ToolCatalog::build(ctx.depth, &ctx.shared.extensions);
+    let tool_defs = registry.definitions();
 
     // Allow one final model response after the last permitted tool round,
     // but never execute tools beyond the configured budget.
@@ -107,7 +106,7 @@ async fn connect_with_retry(
 
 async fn execute_one(
     ctx: &mut ToolContext<'_>,
-    registry: &ToolRegistry,
+    registry: &ToolCatalog,
     call: &ToolCall,
 ) -> tools::ToolResult {
     // Use a UI-local invocation id: providers may reuse call ids across rounds.
@@ -144,7 +143,7 @@ async fn execute_one(
 
 async fn execute_checked(
     ctx: &mut ToolContext<'_>,
-    registry: &ToolRegistry,
+    registry: &ToolCatalog,
     call: &ToolCall,
 ) -> tools::ToolResult {
     let name = call.function.name.as_str();
@@ -183,19 +182,12 @@ async fn execute_checked(
     {
         return tools::ToolResult::err(format!("blocked by hook: {reason}"));
     }
-    if ctx.plan_mode
-        && !permissions::is_plan_mode_tool(name)
-        && !ctx.shared.extensions.read_only(name)
-    {
+    if ctx.plan_mode && !registry.plan_allowed(name) {
         return tools::ToolResult::err(format!(
             "plan mode: {name} is read-only-restricted; finish planning first"
         ));
     }
-    match ctx
-        .shared
-        .permissions
-        .check(name, &args, ctx.shared.extensions.read_only(name))
-    {
+    match registry.policy(&ctx.shared.permissions, name, &args) {
         Policy::Deny => return tools::ToolResult::err(format!("permission denied: {name}")),
         Policy::Ask => {
             let summary = tools::summarize_args(name, &arguments);
@@ -212,18 +204,7 @@ async fn execute_checked(
         Policy::Allow => {}
     }
 
-    let result = match ctx.shared.extensions.execute(name, &args).await {
-        Some(Ok(response)) => match response.content {
-            Some(content) => tools::ToolResult {
-                content,
-                is_error: response.is_error,
-                display_content: None,
-            },
-            None => tools::ToolResult::err("extension tool returned no content"),
-        },
-        Some(Err(reason)) => tools::ToolResult::err(reason),
-        None => registry.execute(ctx, name, args).await,
-    };
+    let result = registry.execute(ctx, name, args).await;
 
     let payload = serde_json::json!({
         "hook": "post_tool_use",
@@ -287,7 +268,8 @@ mod tests {
                 arguments: serde_json::json!({"command": command}).to_string(),
             },
         };
-        let result = execute_one(&mut ctx, &ToolRegistry::build(0), &call).await;
+        let registry = ToolCatalog::build(0, &ctx.shared.extensions);
+        let result = execute_one(&mut ctx, &registry, &call).await;
         let mut captured = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             captured.push(ev);
@@ -315,7 +297,7 @@ mod tests {
             depth: 0,
             plan_mode: false,
         };
-        let registry = ToolRegistry::build(0);
+        let registry = ToolCatalog::build(0, &ctx.shared.extensions);
         let call = ToolCall {
             id: "approval".into(),
             kind: "function".into(),
@@ -422,7 +404,7 @@ mod tests {
             depth: 0,
             plan_mode: true,
         };
-        let registry = ToolRegistry::build(0);
+        let registry = ToolCatalog::build(0, &ctx.shared.extensions);
         let mut call = ToolCall {
             id: "extension-call".into(),
             kind: "function".into(),

@@ -1,12 +1,12 @@
-//! On-disk chat transcripts used by the session picker and restoration.
-//! Every error string here is shown verbatim by the session picker, so `lang`
-//! is threaded in and callers pass the frontend's language.
+//! Persistent conversation records, strict restoration and tolerant distillation.
+//! Picker/restore errors use the frontend language; write errors retain I/O context.
 use crate::i18n::{self, Key, Lang};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Record {
     pub ts: String,
     pub role: String,
@@ -19,6 +19,145 @@ pub struct SessionView {
     pub title: String,
     pub updated: String,
     pub current: bool,
+}
+
+/// Owns the active transcript identity and its on-disk record format.
+/// Restoration validates every record before changing the write target.
+pub struct TranscriptStore {
+    directory: PathBuf,
+    id: String,
+}
+
+impl TranscriptStore {
+    pub fn new(directory: PathBuf) -> Self {
+        Self {
+            directory,
+            id: new_id(),
+        }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.directory.join(format!("{}.jsonl", self.id))
+    }
+
+    pub fn reset(&mut self) {
+        self.id = new_id();
+    }
+
+    pub fn list(&self, lang: Lang) -> Result<Vec<SessionView>, String> {
+        list(&self.directory, &self.id, lang)
+    }
+
+    pub fn restore(&mut self, id: &str, lang: Lang) -> Result<Vec<Record>, String> {
+        let records = read(&self.directory, id, lang)?;
+        self.id = id.to_owned();
+        Ok(records)
+    }
+
+    /// Encode the whole turn before touching disk. A normal write failure rolls
+    /// back to the original length; this is not a crash-durability guarantee.
+    pub fn append_turn(&self, input: &str, reply: &str) -> Result<(), super::AgentError> {
+        self.append_turn_with(input, reply, |file, bytes| file.write_all(bytes))
+    }
+
+    // Internal I/O seam for exercising partial-write failures against real files.
+    fn append_turn_with(
+        &self,
+        input: &str,
+        reply: &str,
+        write: impl FnOnce(&mut fs::File, &[u8]) -> std::io::Result<()>,
+    ) -> Result<(), super::AgentError> {
+        let path = self.path();
+        let append = || -> std::io::Result<()> {
+            fs::create_dir_all(&self.directory)?;
+            let mut bytes = Vec::new();
+            let ts = chrono::Local::now().to_rfc3339();
+            for (role, content) in [("user", input), ("assistant", reply)] {
+                serde_json::to_writer(
+                    &mut bytes,
+                    &Record {
+                        ts: ts.clone(),
+                        role: role.into(),
+                        content: content.into(),
+                    },
+                )?;
+                bytes.push(b'\n');
+            }
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .append(true)
+                .open(&path)?;
+            // Serialize appends so rollback cannot truncate a concurrent turn.
+            file.lock()?;
+            let original_len = file.metadata()?.len();
+            if original_len > 0 {
+                file.seek(SeekFrom::End(-1))?;
+                let mut last = [0];
+                file.read_exact(&mut last)?;
+                if last[0] != b'\n' {
+                    bytes.insert(0, b'\n');
+                }
+            }
+            if let Err(error) = write(&mut file, &bytes) {
+                if let Err(rollback) = file.set_len(original_len) {
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!("{error}; transcript rollback failed: {rollback}"),
+                    ));
+                }
+                return Err(error);
+            }
+            Ok(())
+        };
+        append().map_err(|source| super::AgentError::Io {
+            path: path.display().to_string(),
+            source,
+        })
+    }
+}
+
+fn new_id() -> String {
+    format!(
+        "{}-{}",
+        chrono::Local::now().format("%Y%m%d-%H%M%S"),
+        &uuid::Uuid::new_v4().simple().to_string()[..6]
+    )
+}
+
+/// A best-effort text projection for distillation. Unlike restoration, this
+/// accepts incomplete records and skips malformed lines. The limit is bytes,
+/// rounded down to a UTF-8 boundary, matching the model-input budget.
+pub fn distillation_text(path: &Path, max_bytes: usize) -> std::io::Result<String> {
+    let raw = fs::read_to_string(path)?;
+    let mut out = String::new();
+    for line in raw.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let role = value.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let content = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if content.is_empty() {
+            continue;
+        }
+        out.push_str(role);
+        out.push_str(": ");
+        out.push_str(content);
+        out.push_str("\n\n");
+        if out.len() > max_bytes {
+            let mut end = max_bytes;
+            while !out.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.truncate(end);
+            break;
+        }
+    }
+    Ok(out)
 }
 
 pub fn read(directory: &Path, id: &str, lang: Lang) -> Result<Vec<Record>, String> {
@@ -134,6 +273,79 @@ pub fn list(directory: &Path, current: &str, lang: Lang) -> Result<Vec<SessionVi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_turn_appends_without_losing_prefix_and_failed_restore_keeps_target() {
+        let root = std::env::temp_dir().join(format!("kb-turn-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let prefix = r#"{"ts":"then","role":"user","content":"old"}"#;
+        fs::write(root.join("saved.jsonl"), prefix).unwrap();
+        let mut store = TranscriptStore::new(root.clone());
+        store.restore("saved", Lang::En).unwrap();
+        fs::write(root.join("broken.jsonl"), "{").unwrap();
+        assert!(store.restore("broken", Lang::En).is_err());
+        assert_eq!(store.id(), "saved");
+        store.append_turn("你好", "回答").unwrap();
+        assert!(
+            fs::read_to_string(store.path())
+                .unwrap()
+                .starts_with(prefix)
+        );
+        let records = read(&root, "saved", Lang::En).unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[1].content, "你好");
+        assert_eq!(records[2].role, "assistant");
+        assert_eq!(
+            distillation_text(&store.path(), 12000).unwrap(),
+            "user: old\n\nuser: 你好\n\nassistant: 回答\n\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_write_rolls_back_exact_bytes_then_a_retry_writes_once() {
+        let root = std::env::temp_dir().join(format!("kb-write-failure-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let prefix = r#"{"ts":"then","role":"user","content":"original"}"#;
+        fs::write(root.join("saved.jsonl"), prefix).unwrap();
+        let mut store = TranscriptStore::new(root.clone());
+        store.restore("saved", Lang::En).unwrap();
+        let error = store
+            .append_turn_with("new", "answer", |file, bytes| {
+                file.write_all(&bytes[..bytes.len() / 2])?;
+                Err(std::io::Error::other("injected write failure"))
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("injected write failure"));
+        assert_eq!(fs::read_to_string(store.path()).unwrap(), prefix);
+        store.append_turn("new", "answer").unwrap();
+        assert_eq!(read(&root, "saved", Lang::En).unwrap().len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn strict_restore_and_tolerant_distillation_keep_different_contracts() {
+        let root = std::env::temp_dir().join(format!("kb-read-modes-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("mixed.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                "bad json\n",
+                "{\"role\":\"user\",\"content\":\"你好世界\"}\n",
+                "{\"role\":\"assistant\",\"content\":\"\"}\n",
+                "{\"role\":\"custom\",\"content\":\"kept\"}\n"
+            ),
+        )
+        .unwrap();
+        assert!(read(&root, "mixed", Lang::En).is_err());
+        assert_eq!(
+            distillation_text(&path, 12000).unwrap(),
+            "user: 你好世界\n\ncustom: kept\n\n"
+        );
+        assert_eq!(distillation_text(&path, 10).unwrap(), "user: 你");
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn lists_newest_first_and_reports_invalid_files_without_losing_valid_sessions() {

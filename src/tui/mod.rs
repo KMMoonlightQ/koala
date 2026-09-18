@@ -21,7 +21,9 @@ use ratatui::style::Style;
 use ratatui::text::Line;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
-use transcript::{EntryKind, Rendered, ToolEntry, ToolState};
+#[cfg(test)]
+use transcript::ToolEntry;
+use transcript::{EntryKind, Scroll, ToolState, Transcript};
 use tui_textarea::TextArea;
 use view::draw;
 
@@ -85,23 +87,14 @@ struct App {
     /// Interface language; drives every label and the system prompt.
     lang: Lang,
     background_count: usize,
-    detailed: bool,
-    compact_viewport: Option<(usize, bool)>,
-    rendered: Option<Rendered>,
+    transcript: Transcript,
     input: TextArea<'static>,
-    entries: Vec<EntryKind>,
-    assistant_open: bool,
-    last_todos: Option<usize>,
     permission: Option<PermissionPrompt>,
     busy: bool,
     restarting: bool,
     status: String,
     started: Option<Instant>,
     hint: Option<String>,
-    follow: bool,
-    unread: bool,
-    scroll: usize,
-    bottom: usize,
     quit: bool,
 }
 
@@ -135,49 +128,24 @@ impl App {
             permission_mode: PermissionMode::Normal,
             lang: Lang::default(),
             background_count: 0,
-            detailed: false,
-            compact_viewport: None,
-            rendered: None,
+            transcript: Transcript::default(),
             input: new_input(Lang::default()),
-            entries: Vec::new(),
-            assistant_open: false,
-            last_todos: None,
             permission: None,
             busy: false,
             restarting: false,
             status: String::new(),
             started: None,
             hint: None,
-            follow: true,
-            unread: false,
-            scroll: 0,
-            bottom: 0,
             quit: false,
         }
     }
 
     fn push(&mut self, entry: EntryKind) {
-        self.rendered = None;
-        self.entries.push(entry);
-        self.assistant_open = false;
-        self.unread |= !self.follow;
+        self.transcript.push(entry);
     }
 
     fn toggle_details(&mut self) {
-        if self.detailed {
-            if let Some((scroll, follow)) = self.compact_viewport.take() {
-                self.scroll = scroll;
-                self.follow = follow;
-                if follow {
-                    self.unread = false;
-                }
-            }
-        } else {
-            self.compact_viewport = Some((self.scroll, self.follow));
-            self.follow = true;
-        }
-        self.detailed = !self.detailed;
-        self.rendered = None;
+        self.transcript.toggle_details();
         self.hint = None;
     }
 
@@ -190,7 +158,7 @@ impl App {
 
     fn finish(&mut self) {
         self.permission = None;
-        self.assistant_open = false;
+        self.transcript.finish();
         if !self.restarting {
             self.busy = false;
             self.started = None;
@@ -198,8 +166,8 @@ impl App {
         }
     }
 
-    /// Switch the interface language. Labels are baked into rendered lines, so
-    /// the render cache is dropped; draft, cursor and scroll stay untouched.
+    /// Switch the interface language. The transcript cache keys on language;
+    /// draft, cursor and scroll stay untouched.
     fn set_lang(&mut self, lang: Lang) {
         if self.lang == lang {
             return;
@@ -207,7 +175,6 @@ impl App {
         self.lang = lang;
         self.input
             .set_placeholder_text(i18n::text(lang, Key::InputPlaceholder));
-        self.rendered = None;
         self.hint = None;
     }
 
@@ -283,12 +250,6 @@ async fn event_loop(
 }
 
 fn handle_ui_event(app: &mut App, ev: UiEvent) {
-    if !matches!(
-        &ev,
-        UiEvent::Status(_) | UiEvent::BackgroundCount(_) | UiEvent::PlanMode(_) | UiEvent::Tasks(_)
-    ) {
-        app.rendered = None;
-    }
     match ev {
         UiEvent::ContextUsage(tokens) => app.context_used = tokens,
         UiEvent::Tasks(tasks) => {
@@ -320,16 +281,8 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
         }
         UiEvent::BackgroundCount(n) => app.background_count = n,
         UiEvent::Status(status) => app.status = status,
-        UiEvent::Text(delta) => {
-            match app.entries.last_mut() {
-                Some(EntryKind::Assistant(text)) if app.assistant_open => text.push_str(&delta),
-                _ => {
-                    app.entries.push(EntryKind::Assistant(delta));
-                    app.assistant_open = true;
-                }
-            }
-            app.unread |= !app.follow;
-        }
+        UiEvent::Text(delta) => app.transcript.append_text(delta),
+        UiEvent::Todos(items) => app.transcript.set_todos(items),
         UiEvent::ToolStart {
             id,
             name,
@@ -337,15 +290,7 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
             arguments,
         } => {
             app.status = i18n::fill(app.lang, Key::StatusRunningTool, &[("name", &name)]);
-            app.push(EntryKind::Tool(ToolEntry {
-                id,
-                name,
-                summary,
-                arguments,
-                output: None,
-                state: ToolState::Running,
-                duration_ms: None,
-            }));
+            app.transcript.start_tool(id, name, summary, arguments);
         }
         UiEvent::ToolEnd {
             id,
@@ -353,32 +298,9 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
             is_error,
             duration_ms,
         } => {
-            if let Some(EntryKind::Tool(tool)) = app
-                .entries
-                .iter_mut()
-                .rev()
-                .find(|e| matches!(e, EntryKind::Tool(tool) if tool.id == id))
-            {
-                tool.output = Some(output);
-                tool.state = if is_error {
-                    ToolState::Failed
-                } else {
-                    ToolState::Succeeded
-                };
-                tool.duration_ms = Some(duration_ms);
-            }
+            app.transcript
+                .finish_tool(&id, output, is_error, duration_ms);
             app.status = i18n::text(app.lang, Key::StatusProcessing).into();
-            app.unread |= !app.follow;
-        }
-        UiEvent::Todos(items) => {
-            match app.last_todos {
-                Some(idx) => app.entries[idx] = EntryKind::Todos(items),
-                None => {
-                    app.last_todos = Some(app.entries.len());
-                    app.push(EntryKind::Todos(items));
-                }
-            }
-            app.unread |= !app.follow;
         }
         UiEvent::Note(text) => app.push(EntryKind::Note(text)),
         UiEvent::Info(text) => app.push(EntryKind::Info(text)),
@@ -393,14 +315,10 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
         }
         UiEvent::Done => app.finish(),
         UiEvent::Cancelled => {
-            for entry in &mut app.entries {
-                if let EntryKind::Tool(tool) = entry
-                    && tool.state == ToolState::Running
-                {
-                    tool.state = ToolState::Cancelled;
-                    tool.output = Some(i18n::text(app.lang, Key::NoteToolInterrupted).into());
-                }
-            }
+            app.transcript.stop_tools(
+                ToolState::Cancelled,
+                i18n::text(app.lang, Key::NoteToolInterrupted),
+            );
             app.finish();
             app.push(EntryKind::Note(
                 i18n::text(app.lang, Key::InfoCancelled).into(),
@@ -414,26 +332,12 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
             }
         }
         UiEvent::SessionRestored { id, records } => {
+            app.transcript.restore(records);
             app.context_used = None;
             controls::close_panel(app);
-            app.entries.clear();
-            app.detailed = false;
-            app.compact_viewport = None;
-            app.last_todos = None;
             app.restarting = false;
             app.finish();
-            app.follow = true;
-            app.unread = false;
-            app.scroll = 0;
-            app.bottom = 0;
             app.hint = None;
-            for record in records {
-                app.push(if record.role == "user" {
-                    EntryKind::User(record.content)
-                } else {
-                    EntryKind::Assistant(record.content)
-                });
-            }
             app.push(EntryKind::Info(i18n::fill(
                 app.lang,
                 Key::InfoSessionRestored,
@@ -447,40 +351,26 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
             app.push(EntryKind::Error(error));
         }
         UiEvent::SessionReset => {
+            app.transcript.reset();
             app.context_used = None;
             controls::close_panel(app);
-            app.entries.clear();
-            app.detailed = false;
-            app.compact_viewport = None;
-            app.last_todos = None;
             app.restarting = false;
             app.finish();
-            app.follow = true;
-            app.unread = false;
-            app.scroll = 0;
-            app.bottom = 0;
             app.hint = None;
             app.push(EntryKind::Info(
                 i18n::text(app.lang, Key::InfoNewSession).into(),
             ));
         }
         UiEvent::Error(err) => {
+            app.transcript.stop_tools(ToolState::Failed, &err);
             app.permission = None;
-            for entry in &mut app.entries {
-                if let EntryKind::Tool(tool) = entry
-                    && tool.state == ToolState::Running
-                {
-                    tool.state = ToolState::Failed;
-                    tool.output = Some(err.clone());
-                }
-            }
             app.push(EntryKind::Error(err));
         }
     }
 }
 
 fn handle_paste(app: &mut App, pasted: &str) {
-    if app.permission.is_some() || app.detailed {
+    if app.permission.is_some() || app.transcript.detailed() {
         return;
     }
     let pasted = text::clean(&pasted.replace("\r\n", "\n").replace('\r', "\n"));
@@ -562,33 +452,17 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         }
         return;
     }
-    if app.detailed {
+    if app.transcript.detailed() {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => app.toggle_details(),
-            KeyCode::PageUp | KeyCode::Up => {
-                app.follow = false;
-                app.scroll =
-                    app.scroll
-                        .saturating_sub(if key.code == KeyCode::Up { 1 } else { 10 });
-            }
-            KeyCode::PageDown | KeyCode::Down => {
-                app.scroll = app
-                    .scroll
-                    .saturating_add(if key.code == KeyCode::Down { 1 } else { 10 })
-                    .min(app.bottom);
-                if app.scroll == app.bottom {
-                    app.follow = true;
-                    app.unread = false;
-                }
-            }
-            KeyCode::Home => {
-                app.follow = false;
-                app.scroll = 0;
-            }
-            KeyCode::End => {
-                app.follow = true;
-                app.unread = false;
-            }
+            KeyCode::PageUp | KeyCode::Up => app
+                .transcript
+                .scroll(Scroll::Up(if key.code == KeyCode::Up { 1 } else { 10 })),
+            KeyCode::PageDown | KeyCode::Down => app
+                .transcript
+                .scroll(Scroll::Down(if key.code == KeyCode::Down { 1 } else { 10 })),
+            KeyCode::Home => app.transcript.scroll(Scroll::Start),
+            KeyCode::End => app.transcript.scroll(Scroll::End),
             _ => {}
         }
         return;
@@ -607,20 +481,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.input.insert_newline();
         }
         KeyCode::Enter => submit(app),
-        KeyCode::PageUp => {
-            app.follow = false;
-            app.scroll = app.scroll.saturating_sub(10);
-        }
-        KeyCode::PageDown => {
-            app.scroll = app.scroll.saturating_add(10).min(app.bottom);
-            if app.scroll == app.bottom {
-                app.follow = true;
-                app.unread = false;
-            }
-        }
+        KeyCode::PageUp => app.transcript.scroll(Scroll::Up(10)),
+        KeyCode::PageDown => app.transcript.scroll(Scroll::Down(10)),
         KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.follow = true;
-            app.unread = false;
+            app.transcript.scroll(Scroll::End)
         }
         _ => {
             app.hint = None;
@@ -688,8 +552,7 @@ fn submit(app: &mut App) {
         return;
     }
     consume_input(app, &text);
-    app.follow = true;
-    app.unread = false;
+    app.transcript.scroll(Scroll::End);
     app.push(EntryKind::User(text.clone()));
     app.start(i18n::text(app.lang, Key::StatusGenerating));
     app.session.send(SessionCommand::Submit(text));
@@ -847,7 +710,8 @@ mod tests {
         handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(commands.try_recv().is_err());
         assert!(
-            app.entries
+            app.transcript
+                .entries()
                 .iter()
                 .any(|e| matches!(e, EntryKind::User(s) if s == "current conversation"))
         );
@@ -866,7 +730,8 @@ mod tests {
         );
         assert!(!app.busy);
         assert!(
-            app.entries
+            app.transcript
+                .entries()
                 .iter()
                 .any(|e| matches!(e, EntryKind::User(s) if s == "current conversation"))
         );
@@ -883,12 +748,14 @@ mod tests {
         );
         assert!(!app.busy);
         assert!(
-            app.entries
+            app.transcript
+                .entries()
                 .iter()
                 .any(|e| matches!(e, EntryKind::User(s) if s == "restored conversation"))
         );
         assert!(
-            !app.entries
+            !app.transcript
+                .entries()
                 .iter()
                 .any(|e| matches!(e, EntryKind::User(s) if s == "current conversation"))
         );
@@ -1189,11 +1056,13 @@ mod tests {
     #[test]
     fn streaming_does_not_interrupt_reading_history() {
         let mut app = app();
-        app.follow = false;
-        app.scroll = 7;
+        app.push(EntryKind::Assistant("history\n\n".repeat(40)));
+        render(&mut app, 80, 15);
+        app.transcript.scroll(Scroll::Start);
+        app.transcript.scroll(Scroll::Down(7));
         handle_ui_event(&mut app, UiEvent::Text("new content".into()));
-        assert!(!app.follow);
-        assert_eq!(app.scroll, 7);
+        assert!(!app.transcript.following());
+        assert_eq!(app.transcript.scroll_offset(), 7);
     }
 
     #[test]
@@ -1209,7 +1078,8 @@ mod tests {
             SessionCommand::SetLang(Lang::Zh)
         ));
         assert!(
-            app.entries
+            app.transcript
+                .entries()
                 .iter()
                 .any(|e| matches!(e, EntryKind::Info(s) if s == "语言：中文"))
         );
@@ -1304,13 +1174,13 @@ mod tests {
             (0..100).map(|i| format!("line {i}\n\n")).collect(),
         ));
         render(&mut app, 80, 24);
-        let bottom = app.scroll;
+        let bottom = app.transcript.scroll_offset();
         assert!(bottom > 10);
         handle_key(&mut app, KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
-        assert_eq!(app.scroll, bottom - 10);
+        assert_eq!(app.transcript.scroll_offset(), bottom - 10);
         handle_ui_event(&mut app, UiEvent::Note("background finished".into()));
         let screen = render(&mut app, 80, 24);
-        assert_eq!(app.scroll, bottom - 10);
+        assert_eq!(app.transcript.scroll_offset(), bottom - 10);
         assert!(screen.contains("新内容"));
         for _ in 0..20 {
             handle_key(
@@ -1318,8 +1188,8 @@ mod tests {
                 KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
             );
         }
-        assert!(app.follow);
-        assert!(!app.unread);
+        assert!(app.transcript.following());
+        assert!(!app.transcript.unread());
     }
 
     #[test]
@@ -1368,7 +1238,7 @@ mod tests {
         assert!(!screen.contains("old session"));
         assert!(screen.contains("新会话已开始"));
         assert!(!app.busy);
-        assert!(app.follow);
+        assert!(app.transcript.following());
     }
 
     #[test]
@@ -1489,11 +1359,11 @@ mod tests {
                 duration_ms: 1200,
             },
         );
-        let EntryKind::Tool(first) = &app.entries[0] else {
+        let EntryKind::Tool(first) = &app.transcript.entries()[0] else {
             panic!("missing first tool")
         };
         assert!(first.state == ToolState::Failed);
-        let EntryKind::Tool(second) = &app.entries[1] else {
+        let EntryKind::Tool(second) = &app.transcript.entries()[1] else {
             panic!("missing second tool")
         };
         assert!(second.state == ToolState::Running);
@@ -1501,8 +1371,9 @@ mod tests {
         assert!(compact.contains("失败 · 1.2s"));
         assert!(compact.contains("Ctrl+O 展开"));
         assert!(!compact.contains("result line 8"));
-        app.follow = false;
-        app.scroll = 2;
+        render(&mut app, 100, 10);
+        app.transcript.scroll(Scroll::Start);
+        app.transcript.scroll(Scroll::Down(2));
         app.input.insert_str("keep this draft");
         handle_key(
             &mut app,
@@ -1514,9 +1385,9 @@ mod tests {
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.input.lines().join("\n"), "keep this draft");
         handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(!app.detailed);
-        assert!(!app.follow);
-        assert_eq!(app.scroll, 2);
+        assert!(!app.transcript.detailed());
+        assert!(!app.transcript.following());
+        assert_eq!(app.transcript.scroll_offset(), 2);
         assert!(!app.quit);
     }
 
@@ -1708,7 +1579,7 @@ mod tests {
             &mut app,
             KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
         );
-        assert!(!app.detailed);
+        assert!(!app.transcript.detailed());
         for (width, height) in [(40, 12), (20, 8), (1, 1)] {
             render(&mut app, width, height);
         }
@@ -1733,7 +1604,7 @@ mod tests {
             &mut app,
             KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
         );
-        assert!(app.detailed);
+        assert!(app.transcript.detailed());
     }
 
     #[test]

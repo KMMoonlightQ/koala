@@ -71,6 +71,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
         panels::draw(f, app, content);
     }
     draw_permission(f, app, rows[1]);
+    theme::apply(f.buffer_mut(), app.theme);
 }
 
 /// Clear complete transcript rows so fragments beside a modal cannot read as
@@ -116,7 +117,11 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         line.spans.extend([
             Span::styled(
                 text::clean(&format!("{} · {}s", app.status, elapsed.as_secs())),
-                theme::text(),
+                if app.permission.is_some() {
+                    theme::warning()
+                } else {
+                    theme::accent()
+                },
             ),
             Span::styled(format!(" · {action}"), theme::key_hint()),
         ]);
@@ -125,7 +130,11 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_input(f: &mut Frame, app: &App, area: Rect) {
-    let border_style = if app.busy {
+    let border_style = if app.permission.is_some() {
+        theme::warning()
+    } else if app.plan_mode {
+        theme::plan()
+    } else if app.busy {
         theme::accent()
     } else {
         theme::border()
@@ -163,7 +172,7 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
                 Key::StatusBarBackground,
                 &[("n", &app.background_count.to_string())],
             ),
-            theme::text(),
+            theme::accent(),
         ));
     }
     spans.push(Span::styled(text::clean(&app.model), theme::text()));
@@ -178,7 +187,13 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
             Some(tokens) => format!("{:.0}%", tokens as f64 / capacity as f64 * 100.0),
             None => "--%".into(),
         };
-        spans.push(Span::styled(format!(" · CTX [{usage}]"), theme::text()));
+        let style = match app.context_used.filter(|_| capacity > 0) {
+            Some(tokens) if tokens as f64 / capacity as f64 >= 0.9 => theme::error(),
+            Some(tokens) if tokens as f64 / capacity as f64 >= 0.75 => theme::warning(),
+            _ => theme::muted(),
+        };
+        spans.push(Span::styled(" · ", theme::muted()));
+        spans.push(Span::styled(format!("CTX [{usage}]"), style));
     }
     let left = Line::from(spans);
     let left_width = left.width() as u16;
@@ -204,7 +219,7 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
         f.render_widget(
             Paragraph::new(hint)
                 .style(if app.hint.is_some() || app.transcript.unread() {
-                    theme::text()
+                    theme::accent().add_modifier(ratatui::style::Modifier::BOLD)
                 } else {
                     theme::key_hint()
                 })

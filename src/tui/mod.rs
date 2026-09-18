@@ -1,4 +1,4 @@
-use crate::config::PermissionMode;
+use crate::config::{PermissionMode, Theme};
 mod controls;
 mod input;
 mod logo;
@@ -28,6 +28,9 @@ use tui_textarea::TextArea;
 use view::draw;
 
 enum Panel {
+    Theme {
+        selected: usize,
+    },
     Sessions {
         selected: usize,
         loading: bool,
@@ -86,6 +89,9 @@ struct App {
     permission_mode: PermissionMode,
     /// Interface language; drives every label and the system prompt.
     lang: Lang,
+    language_path: Option<std::path::PathBuf>,
+    theme: Theme,
+    theme_path: Option<std::path::PathBuf>,
     background_count: usize,
     transcript: Transcript,
     input: TextArea<'static>,
@@ -127,6 +133,9 @@ impl App {
             plan_mode: false,
             permission_mode: PermissionMode::Normal,
             lang: Lang::default(),
+            language_path: None,
+            theme: Theme::default(),
+            theme_path: None,
             background_count: 0,
             transcript: Transcript::default(),
             input: new_input(Lang::default()),
@@ -138,6 +147,13 @@ impl App {
             hint: None,
             quit: false,
         }
+    }
+
+    fn configure_appearance(&mut self, cfg: &Config) {
+        self.theme = cfg.theme;
+        self.theme_path = cfg.theme_path.clone();
+        self.set_lang(cfg.lang);
+        self.language_path = cfg.language_path.clone();
     }
 
     fn push(&mut self, entry: EntryKind) {
@@ -188,9 +204,9 @@ impl App {
 }
 
 pub async fn run(cfg: &Config) -> anyhow::Result<()> {
-    let (handle, events) = session::spawn(Agent::new(cfg)?);
+    let (handle, events) = session::spawn(Agent::new(cfg).await?);
     let mut app = App::new(handle);
-    app.set_lang(cfg.lang);
+    app.configure_appearance(cfg);
     app.model = cfg.llm.model.clone();
     app.directory = std::env::current_dir()?.display().to_string();
     match input::History::load(
@@ -529,11 +545,12 @@ fn submit(app: &mut App) {
         app.session.send(SessionCommand::NewSession);
         return;
     }
-    // Language is a pure frontend setting, so /lang works mid-turn like the
-    // panels handled here.
+    // Frontend settings and panels also work during an active turn.
     if matches!(text.as_str(), "/help" | "/tasks" | "/todos")
         || text == "/lang"
         || text.starts_with("/lang ")
+        || text == "/theme"
+        || text.starts_with("/theme ")
     {
         // A rejected command (bad /lang argument) keeps the draft for editing.
         if handle_command(app, text.trim_start_matches('/')) {
@@ -561,6 +578,41 @@ fn submit(app: &mut App) {
 fn handle_command(app: &mut App, cmd: &str) -> bool {
     let mut words = cmd.split_whitespace();
     let command = words.next();
+    if command == Some("theme") {
+        let value = words.next();
+        if words.next().is_some() || value.is_some_and(|v| Theme::parse(v).is_none()) {
+            app.hint = Some(i18n::text(app.lang, Key::UsageTheme).into());
+            return false;
+        }
+        if value.is_none() {
+            controls::close_panel(app);
+            app.panel = Some(Panel::Theme {
+                selected: Theme::ALL
+                    .iter()
+                    .position(|theme| *theme == app.theme)
+                    .unwrap_or(0),
+            });
+            return true;
+        }
+        if let Some(value) = value.and_then(Theme::parse) {
+            app.theme = value;
+            if let Some(path) = &app.theme_path
+                && let Err(e) = crate::config::save_theme(path, value)
+            {
+                app.push(EntryKind::Note(i18n::fill(
+                    app.lang,
+                    Key::NoteThemeSaveFailed,
+                    &[("e", &e.to_string())],
+                )));
+            }
+        }
+        app.push(EntryKind::Info(i18n::fill(
+            app.lang,
+            Key::InfoThemeSet,
+            &[("theme", app.theme.code())],
+        )));
+        return true;
+    }
     if command == Some("permissions") {
         let value = words.next();
         if words.next().is_some() || value.is_some_and(|v| PermissionMode::parse(v).is_none()) {
@@ -637,6 +689,15 @@ fn handle_command(app: &mut App, cmd: &str) -> bool {
         app.set_lang(lang);
         // The agent renders its system prompt in the same language.
         app.session.send(SessionCommand::SetLang(lang));
+        if let Some(path) = &app.language_path
+            && let Err(e) = crate::config::save_language(path, lang)
+        {
+            app.push(EntryKind::Note(i18n::fill(
+                lang,
+                Key::NoteLanguageSaveFailed,
+                &[("e", &e.to_string())],
+            )));
+        }
         app.push(EntryKind::Info(i18n::fill(
             lang,
             Key::InfoLanguageSet,
@@ -916,13 +977,16 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
             terminal.draw(|f| draw(f, &mut app)).unwrap();
             let buffer = terminal.backend().buffer();
-            assert_eq!(buffer[(1, 23)].fg, color);
+            assert_eq!(buffer[(1, 23)].fg, theme::foreground(app.theme, color));
             let status = format!("{} · test-model · medium · CTX [1%]", mode.label());
             for x in 1..=Line::from(status).width() as u16 {
                 assert!(!buffer[(x, 23)].modifier.contains(Modifier::DIM));
             }
             let model_x = 1 + Line::from(format!("{} · ", mode.label())).width() as u16;
-            assert_eq!(buffer[(model_x, 23)].fg, theme::TEXT);
+            assert_eq!(
+                buffer[(model_x, 23)].fg,
+                theme::foreground(app.theme, theme::TEXT)
+            );
             assert!(buffer[(113, 23)].modifier.contains(Modifier::DIM));
         }
     }
@@ -1063,6 +1127,204 @@ mod tests {
         handle_ui_event(&mut app, UiEvent::Text("new content".into()));
         assert!(!app.transcript.following());
         assert_eq!(app.transcript.scroll_offset(), 7);
+    }
+
+    #[test]
+    fn theme_selection_survives_restart_and_preserves_language() {
+        let root = std::env::temp_dir().join(format!("koala-theme-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = root.join("config.toml");
+        std::fs::write(&config, "theme = \"dark\"\nlang = \"zh\"\n").unwrap();
+        let load = || {
+            Config::load_files(
+                std::slice::from_ref(&config),
+                root.join(".koala/language.toml"),
+            )
+            .unwrap()
+        };
+        let (session, mut commands) = SessionHandle::test_channel();
+        let mut app = App::new(session);
+        app.configure_appearance(&load());
+        assert_eq!(app.theme, Theme::Dark);
+        app.busy = true;
+        for theme in [Theme::Light, Theme::Dark, Theme::Auto] {
+            app.input = input::editor(&format!("/theme {}", theme.code()), app.lang);
+            submit(&mut app);
+            assert_eq!(app.theme, theme);
+            assert_eq!(load().theme, theme);
+            assert_eq!(load().lang, Lang::Zh);
+            assert!(app.busy);
+            assert!(commands.try_recv().is_err());
+        }
+        app.input = input::editor("/theme invalid", app.lang);
+        submit(&mut app);
+        assert_eq!(app.theme, Theme::Auto);
+        assert_eq!(app.input.lines(), ["/theme invalid"]);
+        assert_eq!(load().theme, Theme::Auto);
+        assert!(!handle_command(&mut app, "theme dark extra"));
+        app.input = input::editor("/theme", app.lang);
+        submit(&mut app);
+        assert!(matches!(app.panel, Some(Panel::Theme { selected: 0 })));
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("选择主题"));
+        assert!(screen.contains("auto（当前）"));
+        assert!(screen.contains("跟随终端"));
+        app.input.insert_str("未发送草稿");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.theme, Theme::Auto);
+        assert_eq!(load().theme, Theme::Auto);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.panel.is_none());
+        assert_eq!(load().theme, Theme::Auto);
+        assert_eq!(app.input.lines(), ["未发送草稿"]);
+        handle_command(&mut app, "theme");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(app.panel, Some(Panel::Theme { selected: 2 })));
+        render(&mut app, 20, 8);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.panel.is_none());
+        assert_eq!(app.theme, Theme::Dark);
+        assert_eq!(load().theme, Theme::Dark);
+        assert_eq!(app.input.lines(), ["未发送草稿"]);
+        assert!(app.busy);
+        assert!(commands.try_recv().is_err());
+        handle_command(&mut app, "theme");
+        assert!(matches!(app.panel, Some(Panel::Theme { selected: 2 })));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(matches!(app.panel, Some(Panel::Theme { selected: 0 })));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(load().theme, Theme::Auto);
+        let mut cfg = load();
+        cfg.apply_env_with(|key| (key == "KOALA_THEME").then(|| "light".into()));
+        assert_eq!(cfg.theme, Theme::Light);
+        cfg.apply_env_with(|key| (key == "KOALA_THEME").then(|| "invalid".into()));
+        assert_eq!(cfg.theme, Theme::Light);
+        drop(app);
+        let (session, _) = SessionHandle::test_channel();
+        let mut app = App::new(session);
+        app.configure_appearance(&load());
+        assert_eq!(app.theme, Theme::Auto);
+        app.input = input::editor("/lang en", app.lang);
+        submit(&mut app);
+        assert_eq!(load().theme, Theme::Auto);
+        assert_eq!(load().lang, Lang::En);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn themes_recolor_cached_content_editor_and_modal_without_losing_draft() {
+        use ratatui::{Terminal, backend::TestBackend, style::Color};
+        let mut app = app();
+        app.push(EntryKind::Assistant("Cached answer".into()));
+        app.input.insert_str("unsent draft");
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        for theme in [Theme::Dark, Theme::Light, Theme::Auto, Theme::Dark] {
+            app.theme = theme;
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(0, 0)].bg, theme::background(theme));
+            for needle in ["Cached answer", "unsent draft"] {
+                let cell = buffer
+                    .content
+                    .iter()
+                    .find(|cell| cell.symbol() == &needle[..1])
+                    .unwrap();
+                assert_eq!(cell.fg, theme::foreground(theme, theme::TEXT));
+            }
+            assert_eq!(app.input.lines(), ["unsent draft"]);
+            app.panel = Some(Panel::Help { scroll: 0 });
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            // Cleared modal regions must inherit the selected background too.
+            assert_eq!(
+                terminal.backend().buffer()[(50, 5)].bg,
+                theme::background(theme)
+            );
+            app.panel = None;
+        }
+        app.theme = Theme::Auto;
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(terminal.backend().buffer()[(0, 0)].bg, Color::Reset);
+        assert!(
+            input::commands(Lang::En)
+                .iter()
+                .any(|(name, _)| *name == "theme")
+        );
+    }
+
+    #[test]
+    fn theme_save_failure_is_reported() {
+        let root = std::env::temp_dir().join(format!("koala-theme-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&root, "not a directory").unwrap();
+        let mut app = app();
+        app.theme_path = Some(root.join("theme.toml"));
+        assert!(handle_command(&mut app, "theme light"));
+        assert_eq!(app.theme, Theme::Light);
+        assert!(
+            app.transcript
+                .entries()
+                .iter()
+                .any(|e| matches!(e, EntryKind::Note(s) if s.contains("无法保存主题偏好")))
+        );
+        std::fs::remove_file(root).unwrap();
+    }
+
+    #[test]
+    fn lang_command_survives_restart() {
+        let root = std::env::temp_dir().join(format!("koala-language-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = root.join("config.toml");
+        let source = "# Keep this comment and setting\nlang = \"en\"\n[llm]\nmodel = \"test\"\n";
+        std::fs::write(&config, source).unwrap();
+        let preference = root.join(".koala/language.toml");
+        let load =
+            || Config::load_files(std::slice::from_ref(&config), preference.clone()).unwrap();
+        let cfg = load();
+        assert_eq!(cfg.lang, Lang::En);
+        let (session, _) = SessionHandle::test_channel();
+        let mut app = App::new(session);
+        app.configure_appearance(&cfg);
+        app.input = input::editor("/lang", cfg.lang);
+        submit(&mut app);
+        assert_eq!(app.lang, Lang::Zh);
+        drop(app);
+        let cfg = load();
+        let (session, _) = SessionHandle::test_channel();
+        let mut app = App::new(session);
+        app.configure_appearance(&cfg);
+        assert_eq!(app.lang, Lang::Zh);
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), source);
+        app.input = input::editor("/lang en", app.lang);
+        submit(&mut app);
+        assert_eq!(load().lang, Lang::En);
+        app.input = input::editor("/lang invalid", app.lang);
+        submit(&mut app);
+        assert_eq!(load().lang, Lang::En);
+        let mut cfg = load();
+        cfg.apply_env_with(|key| (key == "KOALA_LANG").then(|| "zh".into()));
+        assert_eq!(cfg.lang, Lang::Zh);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn language_save_failure_is_visible_and_does_not_block_switching() {
+        let root = std::env::temp_dir().join(format!("koala-language-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&root, "not a directory").unwrap();
+        let mut app = app();
+        app.language_path = Some(root.join("language.toml"));
+        app.input = input::editor("/lang zh", Lang::En);
+        submit(&mut app);
+        assert_eq!(app.lang, Lang::Zh);
+        assert!(
+            app.transcript
+                .entries()
+                .iter()
+                .any(|e| matches!(e, EntryKind::Note(s) if s.contains("无法保存语言偏好")))
+        );
+        std::fs::remove_file(root).unwrap();
     }
 
     #[test]
@@ -1395,13 +1657,13 @@ mod tests {
     fn startup_metadata_and_resizing_show_real_state() {
         let mut app = app();
         app.model = "local-model".into();
-        app.directory = "/workspace/kb-agent".into();
+        app.directory = "/workspace/koala".into();
         handle_ui_event(&mut app, UiEvent::PlanMode(true));
         handle_ui_event(&mut app, UiEvent::BackgroundCount(2));
         let screen = render(&mut app, 100, 28);
         assert!(screen.contains("koala"));
         assert!(screen.contains("local-model"));
-        assert!(screen.contains("/workspace/kb-agent"));
+        assert!(screen.contains("/workspace/koala"));
         assert!(screen.contains("Plan · 后台 2"));
         assert!(screen.contains("输入消息"));
         assert!(screen.contains("╭"));
@@ -1421,7 +1683,7 @@ mod tests {
     fn layout_fixture() {
         let mut app = app();
         app.model = "local-model".into();
-        app.directory = "/workspace/kb-agent".into();
+        app.directory = "/workspace/koala".into();
         app.push(EntryKind::User("检查任务执行情况，并列出下一步。".into()));
         app.push(EntryKind::Assistant("## 检查结果\n\n已确认 **核心交互** 正常，接下来检查：\n\n- 工具输出与错误状态\n- 中文换行和窄窗口显示\n\n```rust\nlet ready = true;\n```".into()));
         handle_ui_event(

@@ -4,9 +4,10 @@
 三级工具权限和中英文界面。通过 ReAct 循环调用工具，提供 Plan 模式、Todo、skills、
 上下文压缩、子 Agent 和后台任务。
 
-**知识库以 extension 接入**：Agent 核心只依赖通用扩展协议。默认启用的 memory extension
+**知识库以 extension 接入**：Agent 核心只依赖通用扩展协议。独立安装的 memory extension
 在每轮开始时检索相关知识，并提供 memory_search / memory_read / memory_write 工具。
-关闭扩展后不注入知识库上下文、不注册知识库工具。蒸馏和整合保留 CLI 入口。
+移除 manifest 配置即关闭集成，不注册知识库工具。知识库由独立的 `koala-memory` 程序提供；
+Agent 的依赖图不包含 memory 包，删除 `extensions/memory/` 也能构建 Agent。
 
 ## 目录
 
@@ -17,6 +18,7 @@
 - [会话恢复](#会话恢复)、[工具权限](#工具权限)与[模型和思考档位](#模型和思考档位)
 - [快捷键与输入](#快捷键与输入)、[后台任务](#后台任务)与[对话界面](#对话界面)
 - [Agent 架构](#agent-架构)
+- [MCP 服务器](#mcp-服务器)
 - [Extension 开发与安装](#extension-开发与安装)
 - [开发](#开发)
 
@@ -50,13 +52,14 @@ koala --help
 配置按以下顺序读取，找到第一个文件后停止，不合并多个文件：
 
 1. 当前工作目录的 `config.toml`。
-2. 系统配置目录下的 `kb-agent/config.toml`。
+2. 系统配置目录下的 `koala/config.toml`。
 3. 如果都不存在，使用内置默认值。
 
 系统配置目录通过 `dirs::config_dir()` 获取：Linux 通常为 `~/.config`（可由
 `XDG_CONFIG_HOME` 覆盖），macOS 为 `~/Library/Application Support`，Windows 为
 Roaming AppData 目录。全局配置、Agent 私有记忆和全局 skills 均使用此目录。
-改名后保留 `kb-agent` 配置子目录、`KBA_*` 环境变量及 `.kb` 数据目录，兼容已有配置和记忆。
+统一使用 `koala` 配置子目录、`KOALA_*` 环境变量和 `.koala` 数据目录。
+从旧版本升级时，请迁移数据和全局配置目录，并同步更新自定义路径及环境变量名称。
 
 最小配置示例：
 
@@ -67,22 +70,22 @@ api_key = "your-api-key"
 model = "your-model-name"
 ```
 
-`base_url` 填 API 基础路径，客户端会追加 `/chat/completions`。对话、`distill` 和
-`dream` 共用 `[llm]` 配置；`search` 和 `read` 在本地运行，不需要调用模型。
+`base_url` 填 API 基础路径，客户端会追加 `/chat/completions`。对话使用 Agent 的 `[llm]` 配置。独立 memory 的 `distill` / `dream` 使用其显式指定的配置；
+`search` 和 `read` 在本地运行，不需要调用模型。
 端点要求额外请求头时，可在 `[llm.headers]` 中声明。
 
 以下环境变量覆盖文件配置：
 
 | 环境变量 | 对应配置 | 默认值 |
 |---|---|---|
-| `KBA_BASE_URL` | `llm.base_url` | `https://api.openai.com/v1` |
-| `KBA_API_KEY` | `llm.api_key` | 空 |
-| `KBA_MODEL` | `llm.model` | 空，调用模型前需配置 |
-| `KBA_WORKSPACE` | `memory.workspace` | `.kb` |
-| `KBA_LANG` | 顶层 `lang`（`en` / `zh`） | `en` |
+| `KOALA_BASE_URL` | `llm.base_url` | `https://api.openai.com/v1` |
+| `KOALA_API_KEY` | `llm.api_key` | 空 |
+| `KOALA_MODEL` | `llm.model` | 空，调用模型前需配置 |
+| `KOALA_LANG` | 顶层 `lang`（`en` / `zh`） | `en` |
+| `KOALA_THEME` | 顶层 `theme`（`auto` / `light` / `dark`） | `auto` |
 
-`KBA_WORKSPACE` 只改变知识库目录。会话转录目录由 `agent.session_dir` 单独控制，
-默认仍为 `.kb/session`；相对路径均相对于启动时的工作目录。
+`KOALA_WORKSPACE` 仅由独立的 memory 扩展读取，Agent 不读取该变量。会话转录目录由 `agent.session_dir` 单独控制，
+默认仍为 `.koala/session`；相对路径均相对于启动时的工作目录。
 
 工具权限默认使用 **Normal**，每次工具调用均需确认；可通过 `/permissions` 切换。
 `deny` 在 Normal / Ask When Need 下优先，`allow` 仅在 Ask When Need 下生效；
@@ -91,15 +94,15 @@ Never Ask 自动放行全部工具。具体行为见[工具权限](#工具权限
 
 ## 记忆
 
-- **知识库 extension**（共享、可人工编辑）：`.kb/{daily,digest}`。每轮自动检索最多 5 条相关片段，注入上下文最多 8,000 字符；Agent 可通过扩展工具检索、阅读和保存知识。Agent 仍把原始转录写进 `agent.session_dir`（默认 `.kb/session`）；`koala distill` 把会话蒸馏成 daily 卡片，`koala dream` 把变化的 daily 卡片整合成 digest 长期记忆（CREATE / CORROBORATE / REFINE / CORRECT），`koala search` / `koala read` 供人检索阅读。
-- **Agent 私有记忆**：`agent.memory_file`（默认 `<config dir>/kb-agent/memory.md`），Agent 自用的便签，每轮注入 prompt，与知识库互不引用。
+- **知识库 extension**（共享、可人工编辑）：`.koala/{daily,digest}`。每轮自动检索最多 5 条相关片段，注入上下文最多 8,000 字符；Agent 可通过扩展工具检索、阅读和保存知识。Agent 仍把原始转录写进 `agent.session_dir`（默认 `.koala/session`）；`koala-memory distill` 把会话蒸馏成 daily 卡片，`koala-memory dream` 把变化的 daily 卡片整合成 digest 长期记忆（CREATE / CORROBORATE / REFINE / CORRECT），`koala-memory search` / `koala-memory read` 供人检索阅读。
+- **Agent 私有记忆**：`agent.memory_file`（默认 `<config dir>/koala/memory.md`），Agent 自用的便签，每轮注入 prompt，与知识库互不引用。
 
 所有知识库记忆都是普通 Markdown：frontmatter 存 `name`/`description`，正文用 `[[路径]]` wikilink 互联。文件是唯一事实源，索引每次启动全量重建。
 
 默认知识库目录结构：
 
 ```text
-.kb/
+.koala/
 ├── session/            # 会话转录（默认 agent.session_dir）
 ├── daily/              # 蒸馏后的日常记忆卡片
 ├── digest/
@@ -115,14 +118,13 @@ Never Ask 自动放行全部工具。具体行为见[工具权限](#工具权限
 `distill` 生成 daily 卡片 → `dream` 整合 digest → `search` / `read` 检索阅读。
 
 ```bash
-koala distill                          # 蒸馏 session_dir 中修改时间最新的一个 .jsonl 文件
-koala distill path/to/session.jsonl    # 蒸馏指定会话
-koala dream                            # 将发生变化的 daily 卡片整合为长期记忆
-koala search "所有权" -k 5             # BM25 检索，默认返回最多 5 条
-koala read digest/wiki/ownership.md --start 1 --end 20
+koala-memory distill path/to/session.jsonl    # 蒸馏指定会话
+koala-memory dream                            # 将发生变化的 daily 卡片整合为长期记忆
+koala-memory search "所有权" -k 5             # BM25 检索，默认返回最多 5 条
+koala-memory read digest/wiki/ownership.md --start 1 --end 20
 ```
 
-`read` 的路径相对于 `memory.workspace`，需替换为实际存在的文件路径；行号从 1 开始，
+`read` 的路径相对于扩展配置的 `memory.workspace`，需替换为实际存在的文件路径；行号从 1 开始，
 包含起止行。不传 `--start` / `--end` 时读取全文。`search` 输出文件路径、行号范围、
 相关度分数和匹配内容。
 
@@ -131,7 +133,21 @@ koala read digest/wiki/ownership.md --start 1 --end 20
 界面文案、系统提示词和 Agent 侧提示都走同一张映射表（`src/i18n.rs`），
 默认英文。三种切换方式：`/lang` 在对话中切换（`/lang en` / `/lang zh` 显式指定），
 `config.toml` 顶层（放在 `[llm]` 等表声明之前）写 `lang = "zh"` 设置启动语言，
-或用环境变量 `KBA_LANG` 覆盖。
+或用环境变量 `KOALA_LANG` 覆盖。
+
+`/lang` 会立即将选择保存到当前工作目录的 `.koala/language.toml`，在同一目录
+退出重开后仍生效。启动语言优先级：`KOALA_LANG` > 已保存的语言 > `config.toml`
+> 默认英文。删除 `.koala/language.toml` 可恢复使用配置文件的语言；保存失败会在界面提示。
+
+## 界面主题
+
+默认 `auto`：使用终端自身的默认前景色、背景色和 ANSI 调色板，终端切换配色时自动跟随，
+无需重启。`light` 使用固定浅色配色，`dark` 使用固定深色配色。
+
+输入 `/theme auto`、`/theme light` 或 `/theme dark` 立即切换，执行任务期间也可使用。
+单独输入 `/theme` 弹出主题选择窗，默认选中当前主题；方向键选择、Enter 确认并保存、Esc 取消。选择保存到当前目录的 `.koala/theme.toml`，重启后保留。
+也可在 `config.toml` 顶层设置 `theme = "auto"`，或使用环境变量 `KOALA_THEME`。
+优先级：`KOALA_THEME` > 已保存的主题 > `config.toml` > `auto`。
 
 ## 对话内命令
 
@@ -148,13 +164,14 @@ koala read digest/wiki/ownership.md --start 1 --end 20
 | `/todos` | 打开完整 Todo 列表 |
 | `/help` | 打开快捷键与命令帮助 |
 | `/skills` | 列出已加载 skills |
+| `/theme` | 弹窗选择主题；`/theme auto`、`/theme light`、`/theme dark` 切换并保存主题 |
 | `/lang` | 切换界面语言（中文 / English），也支持 `/lang en`、`/lang zh`；可在执行中使用 |
 | `/quit` 或 `/q` | 退出（可在执行中使用） |
 
 ## 会话恢复
 
 退出后再次启动，输入 `/sessions` 即可查找并恢复历史会话。列表读取当前配置的
-`agent.session_dir`（默认 `.kb/session`，相对于启动工作目录），按最近更新时间排序，
+`agent.session_dir`（默认 `.koala/session`，相对于启动工作目录），按最近更新时间排序，
 显示首条用户消息、更新时间、会话 ID，并标记当前会话。Enter 恢复历史对话到界面和模型上下文，
 后续消息继续追加到原文件。前台执行期间需先中断，再切换会话。
 
@@ -282,15 +299,15 @@ Enter 发送，Shift+Enter、Ctrl+J 或 `\` 后接 Enter 换行。启用终端�
 | 持久化转录 | `src/agent/transcripts.rs`：管理当前转录标识、整轮追加、严格恢复与容错蒸馏；保存失败保留内存回答，避免再次记为中断 |
 | ReAct 循环 | `src/agent/react.rs`：流式思考 → 工具调用 → 观察回填，直到模型不再调工具；可配置工具轮数上限，默认不限 |
 | 工具目录 | `src/agent/tools/catalog.rs`：统一内置与扩展工具的定义、能力和执行归属；自动许可与 plan mode 可用性分别判断。内置 remember / todo_write / skill / task / bash |
-| Extensions | `src/extensions/`：可安装的进程扩展 + 原生 trait；上下文注入、工具注册、参数/结果处理；知识库实现位于 `src/extensions/memory/` |
+| Extensions | `crates/extension-api/` 与 `crates/extensions/`：协议及通用运行时；知识库为独立项目 `extensions/memory/` |
 | Hooks | `src/agent/hooks.rs`：PreToolUse（exit 2 阻断）/ PostToolUse / TurnStart / TurnEnd，stdin 收 JSON |
 | 权限控制 | `src/agent/permissions.rs`：三级可切换审批策略；审批区显示操作与参数 |
 | System prompt | `src/agent/prompt.rs`：每次调用前按节组装（基础准则 + agent 私有记忆 + skills 清单 + todos + plan mode） |
 | Plan mode | `/plan` 切换；允许 todo_write / skill / task 及扩展声明的只读工具；写工具被拒绝，子 Agent 继承此限制 |
-| Skills | `./skills/*/SKILL.md` 或 `<config dir>/kb-agent/skills/*/SKILL.md`，清单进 prompt，`skill` 工具按需加载全文 |
+| Skills | `./skills/*/SKILL.md` 或 `<config dir>/koala/skills/*/SKILL.md`，清单进 prompt，`skill` 工具按需加载全文 |
 | Context compact | history 超阈值自动压缩（保留最近 4 条，其余 LLM 摘要），也可 `/compact` 手动 |
 | Sub agents | `task` 工具派生子 Agent（独立上下文，不能再派孙 Agent），支持后台运行 |
-| Agent 私有记忆 | `agent.memory_file`（默认 `<config dir>/kb-agent/memory.md`），只给 Agent 用，每轮注入 prompt，`remember` 工具追加 |
+| Agent 私有记忆 | `agent.memory_file`（默认 `<config dir>/koala/memory.md`），只给 Agent 用，每轮注入 prompt，`remember` 工具追加 |
 | 异常与重试 | LLM 建连失败（429/5xx/网络）指数退避重试 5 次；工具错误作为结果回喂不中断循环 |
 | 后台任务 | `bash` / `task` 加 `background=true`，`/tasks` 查看状态，完成自动通知 |
 
@@ -298,6 +315,58 @@ Enter 发送，Shift+Enter、Ctrl+J 或 `\` 后接 Enter 换行。启用终端�
 默认均为 `"unlimited"`（不限制轮数），也可设置为非负整数，例如 `50`；`0` 表示禁止执行工具。
 一轮可包含多个工具调用。达到数字上限后仍允许模型生成最终文本；
 若模型继续请求工具，则报告达到上限，不执行额外工具，已完成的操作保留。
+
+## MCP 服务器
+
+koala 可作为 MCP 客户端，连接本地 **stdio** 和远程 **Streamable HTTP** 服务器，
+发现并调用服务器提供的工具。使用官方 [Rust SDK](https://github.com/modelcontextprotocol/rust-sdk)。
+在 `config.toml` 中添加服务器，重启后生效：
+
+```toml
+[mcp.servers.files]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/absolute/path/to/files"]
+startup_timeout_secs = 60
+timeout_secs = 60
+# 可选：工作目录及传给子进程的环境变量（继承其余环境变量）
+# cwd = "/absolute/path/to/workspace"
+# env = { MY_API_KEY = "your-key" }
+# 仅对自己确认只读的工具显式授权，填服务器原始工具名：
+# read_only_tools = ["read_file", "list_directory"]
+
+[mcp.servers.remote]
+url = "https://example.com/mcp" # 替换为实际服务地址
+bearer_token_env = "MY_MCP_TOKEN"
+# headers = { X-Project = "my-project" }
+# enabled = false
+```
+
+每个服务器必须且只能配置 `command` 或 `url`。`command` 和 `args` 按 argv 执行，
+不经过 shell；相对路径基于启动 koala 的工作目录（设置 `cwd` 后，子进程参数中的相对路径基于该目录）。
+HTTP token 从指定环境变量读取；不支持自动 OAuth 登录或旧版独立 SSE 端点。
+不要把示例远程地址直接作为实际配置。stdio 服务器 stderr 被丢弃，以免破坏终端界面；
+需要排查服务器日志时可让服务器写入自己的日志文件。
+
+工具名为 `mcp__服务器名__原始工具名`，例如 `mcp__files__read_file`。
+服务器名和工具名需由 ASCII 字母、数字、下划线或连字符组成，完整工具名不超过 64 字节；
+不兼容或重复的名字会在启动时报告。工具描述、输入 schema、结构化结果、内容块和 `isError`
+均保留；当前模型工具结果通道为文本，图片等内容块保留为 JSON，不直接显示为图片。
+
+MCP 工具沿用现有 hooks、三级权限和 Plan 模式。默认视作非只读工具，
+服务器的 `readOnlyHint` 不会自动授予权限。只有 `read_only_tools` 中明确列出的工具
+允许在 Plan 模式使用，并可在 Ask When Need 中自动执行；Normal 仍逐次审批。
+`permissions.allow` / `deny` 使用带 `mcp__` 前缀的完整工具名。
+错误拼写的 `read_only_tools` 会导致启动失败，避免静默改变权限。
+
+启动时完成握手和分页工具发现，连接在主 Agent、子 Agent 和新会话之间复用。
+默认启动超时为 30 秒，每次工具调用超时为 60 秒，均须为正整数。
+已启用服务器连接失败时启动报错；临时停用可设置 `enabled = false`。
+中断或超时会发送 MCP 取消通知，不自动重试工具调用；已在服务器完成的操作不会撤销，
+服务器是否停止执行取决于其取消实现。断开连接后需重启 koala，工具列表变化也需重启加载。
+当前集成范围为 MCP tools，不包含 resources、prompts、sampling 或 elicitation 的交互入口。
+
+本地 MCP 服务器与 koala 拥有相同系统权限，配置服务器即允许启动该程序；
+工具审批不限制服务器自身的启动行为。
 
 ## Extension 开发与安装
 
@@ -310,18 +379,17 @@ Enter 发送，Shift+Enter、Ctrl+J 或 `\` 后接 Enter 换行。启用终端�
 koala extension-install examples/extensions/context
 ```
 
-命令复制目录至 `.kb/extensions/<name>`，拒绝覆盖已有安装、符号链接和特殊文件。
-可用 `--directory path/to/extensions` 指定安装目录；默认安装位置固定为 `.kb/extensions`，
-不随 `KBA_WORKSPACE` 改变。随后把命令输出的 manifest 路径加入配置（重启生效）：
+命令复制目录至 `.koala/extensions/<name>`，拒绝覆盖已有安装、符号链接和特殊文件。
+可用 `--directory path/to/extensions` 指定安装目录；默认安装位置固定为 `.koala/extensions`，
+不随 `KOALA_WORKSPACE` 改变。随后把命令输出的 manifest 路径加入配置（重启生效）：
 
 ```toml
 [extensions]
-memory = true
-manifests = [".kb/extensions/context-example/extension.toml"]
+manifests = [".koala/extensions/context-example/extension.toml"]
 timeout_secs = 30
 ```
 
-从 `manifests` 删除路径即停用外部扩展；`memory = false` 完全关闭知识库的 Agent 集成，
+所有扩展（包括 memory）统一按 `manifests` 加载；删除对应路径即停用，
 不会影响已有文件及独立 CLI 命令。Agent 私有 `remember` 便签仍独立存在。
 
 扩展目录必须包含 `extension.toml`，也可不复制目录而直接配置 manifest 路径：
@@ -341,7 +409,7 @@ parameters = { type = "object", properties = { query = { type = "string" } }, re
 ```
 
 每次调用启动独立进程，工作目录为 manifest 所在目录；跨调用状态须自行持久化。
-`command` 为 argv，不经过 shell 展开。stdin 接收一个 JSON 对象，stdout 必须返回一个
+`command` 为 argv，不经过 shell 展开。通用环境变量 `KOALA_EXTENSION_CWD` 提供 Agent 启动目录。stdin 接收一个 JSON 对象，stdout 必须返回一个
 JSON 对象（无修改时 `{}`）；日志写 stderr。协议版本当前为 1。
 
 - Hook 请求：`{"api_version":1,"kind":"hook","stage":"pre_tool_use","payload":{"tool":"bash","arguments":{"command":"pwd"},"depth":0,"plan_mode":false}}`。
@@ -359,7 +427,7 @@ JSON 对象（无修改时 `{}`）；日志写 stderr。协议版本当前为 1�
 | after_compact | session、messages、changed | 观察 |
 | turn_end | input、reply 或 error、depth、plan_mode；主 Agent 成功时另有 session、session_path | 观察 |
 
-memory 最先执行，外部扩展按配置顺序执行，后续扩展可看到前序改写的参数和结果。
+所有扩展按配置顺序执行，后续扩展可看到前序改写的参数和结果。
 `before_model` 的上下文只作用于当前请求，不累积到历史。`pre_tool_use` 改写后再运行
 原 shell pre hook、plan mode 校验和权限确认，扩展不能通过改参数跳过审批。
 扩展工具不可覆盖内置工具，也不可与其他扩展重名。只有明确声明 `read_only = true`
@@ -373,7 +441,7 @@ post_tool_use / turn_end 失败只显示诊断，不抹掉已完成的结果。�
 知识库扩展通过 turn_start 自动检索，通过工具实时打开文件库，因此可看到外部文件修改。
 `memory_write` 遵守权限确认与 plan mode；`distill` / `dream` 仍显式运行，不会在每轮
 结束时隐式调用模型或整合文件。Rust 扩展也可实现 `extensions::Extension` 并通过
-`Extensions::register` 接入同一协议。库内通过 `pub use extensions::memory` 保留顶层 `memory` 导出，可使用 `koala::memory`。
+`Extensions::register` 接入同一协议。Agent 不再导出 `koala::memory`；知识库库 API 属于独立的 `koala_memory` 包。
 
 ## 开发
 
@@ -381,4 +449,55 @@ post_tool_use / turn_end 失败只显示诊断，不抹掉已完成的结果。�
 cargo fmt --check                   # 格式检查
 cargo test                          # 测试
 cargo clippy --all-targets -- -D warnings
+```
+
+
+### 独立 memory 扩展的构建与迁移
+
+依赖方向：Agent → 通用扩展运行时 → 版本化协议；memory → 版本化协议。
+通用 LLM、Markdown 和进程模块位于独立基础包，均不依赖 Agent。
+memory 不属于 Agent 的 Cargo workspace，不参与 Agent 的默认构建或测试。
+私有 `remember` 便签仍属于 Agent 本身，与共享知识库扩展无关。
+
+```bash
+# 构建并安装独立命令（不编译 Agent/TUI/MCP）
+cargo install --path extensions/memory
+# 生成带可执行文件的自包含安装包；目录必须不存在
+koala-memory package /tmp/koala-memory-package --memory-workspace "$PWD/.koala"
+# 通用安装命令；无需 Agent 中有任何 memory 注册代码
+koala extension-install /tmp/koala-memory-package
+```
+
+然后在 Agent 的 `[extensions]` 中设置：
+
+```toml
+[extensions]
+manifests = [".koala/extensions/memory/extension.toml"]
+timeout_secs = 30
+```
+
+重启后生效。安装包携带当前平台可执行文件，运行无需 Rust 工具链或源码。
+修改知识库目录时，编辑 manifest 的 `--workspace` 参数即可；打包时相对目录会转为绝对目录，
+因此复制安装包不会意外更换知识库。CLI 的 `--workspace` 优先于 `KOALA_WORKSPACE`。
+
+原 `[memory]` 与 `extensions.memory` 不再是 Agent 配置项。已有知识库文件无需迁移；
+安装时指定原 workspace。原 `koala search/read/distill/dream` 改为独立命令：
+
+```bash
+koala-memory --workspace .koala search "所有权"
+koala-memory --workspace .koala read digest/wiki/ownership.md
+koala-memory --config memory.toml distill .koala/session/SESSION.jsonl
+koala-memory --config memory.toml dream
+```
+
+`distill` 必须显式传入转录文件路径，扩展不读取 Agent 内部会话配置。
+`memory.toml` 由扩展独立读取，可包含 `[memory] workspace` 及 `[llm] base_url/api_key/model/headers`；
+也可用 `--config config.toml` 显式读取旧配置完成迁移。扩展不会从 Agent 隐式接收 API key，
+LLM 配置只在蒸馏/整合时需要。详见 [memory 扩展文档](extensions/memory/README.md)。
+
+```bash
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --manifest-path extensions/memory/Cargo.toml
+cargo clippy --manifest-path extensions/memory/Cargo.toml --all-targets -- -D warnings
 ```

@@ -19,6 +19,7 @@ pub(super) const COMMANDS: &[(&str, Key)] = &[
     ("skills", Key::CmdSkills),
     ("compact", Key::CmdCompact),
     ("lang", Key::CmdLang),
+    ("theme", Key::CmdTheme),
     ("quit", Key::CmdQuit),
 ];
 
@@ -183,7 +184,7 @@ mod tests {
     use super::*;
     #[test]
     fn history_roundtrip_is_project_scoped_and_preserves_multiline() {
-        let root = std::env::temp_dir().join(format!("kb-history-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("koala-history-{}", uuid::Uuid::new_v4()));
         let path = root.join("history");
         let mut first = History::load(path.clone(), "project-a".into()).unwrap();
         first.record("第一行\n第二行").unwrap();

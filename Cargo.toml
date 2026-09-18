@@ -3,7 +3,16 @@ name = "koala"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = ["crates/*"]
+exclude = ["extensions/memory"]
+resolver = "3"
+
 [dependencies]
+koala-extensions = { path = "crates/extensions" }
+koala-llm = { path = "crates/llm" }
+koala-markdown = { path = "crates/markdown" }
+koala-process = { path = "crates/process" }
 anyhow = "1.0.104"
 chrono = "0.4.45"
 clap = { version = "4.6.7", features = ["derive"] }
@@ -13,15 +22,12 @@ futures-util = "0.3.34"
 pulldown-cmark = "0.13.4"
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "stream"] }
+rmcp = { version = "3.4.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-serde_yml = "0.0.13"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["full"] }
 toml = "1.1.6"
 tui-textarea = "0.7.0"
 unicode-segmentation = "1.13.3"
 uuid = { version = "1.26.1", features = ["v4"] }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"

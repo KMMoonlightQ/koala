@@ -80,7 +80,7 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(cfg: &Config) -> Result<Self, AgentError> {
+    pub async fn new(cfg: &Config) -> Result<Self, AgentError> {
         if cfg.llm.model.is_empty() {
             return Err(AgentError::MissingModel);
         }
@@ -102,6 +102,14 @@ impl Agent {
                 .clone()
                 .or_else(|| efforts.first().cloned()),
         );
+        let mut extensions = crate::extensions::load(
+            &cfg.extensions,
+            tools::catalog::builtin_names().map(str::to_owned),
+        )
+        .map_err(AgentError::Extension)?;
+        crate::mcp::load(&cfg.mcp, &mut extensions)
+            .await
+            .map_err(AgentError::Extension)?;
         Ok(Self {
             reasoning_efforts: efforts.clone(),
             context_window: selected.context_window.map(|v| v.get()),
@@ -110,7 +118,7 @@ impl Agent {
                 llm,
                 permissions: Permissions::new(&cfg.permissions),
                 hooks: cfg.hooks.clone(),
-                extensions: crate::extensions::load(cfg).map_err(AgentError::Extension)?,
+                extensions,
                 max_tool_rounds: cfg.agent.max_tool_rounds,
                 max_retries: cfg.agent.max_retries,
                 compact_threshold: cfg.agent.compact_threshold,
@@ -379,24 +387,24 @@ impl Agent {
 mod tests {
     use super::*;
 
-    fn mock_agent(url: &str) -> (Agent, PathBuf) {
-        let root = std::env::temp_dir().join(format!("kb-agent-review-{}", uuid::Uuid::new_v4()));
+    async fn mock_agent(url: &str) -> (Agent, PathBuf) {
+        let root = std::env::temp_dir().join(format!("koala-review-{}", uuid::Uuid::new_v4()));
         let mut cfg = Config::default();
         cfg.permissions.mode = crate::config::PermissionMode::AskWhenNeed;
         cfg.llm.model = "test".into();
         cfg.llm.base_url = url.into();
-        cfg.extensions.memory = false;
+
         cfg.agent.memory_file = root.join("memory.md");
         cfg.agent.session_dir = root.join("sessions");
         cfg.agent.max_tool_rounds = Some(1);
-        (Agent::new(&cfg).unwrap(), root)
+        (Agent::new(&cfg).await.unwrap(), root)
     }
 
     #[tokio::test]
     async fn background_results_reach_model_and_stay_in_their_session() {
         use crate::test_support::{MockLlm, stream};
         let mut mock = MockLlm::start(vec![stream(serde_json::json!({"content": "ok"})); 3]).await;
-        let (mut agent, root) = mock_agent(&mock.url);
+        let (mut agent, root) = mock_agent(&mock.url).await;
         let id = agent.background.register("task", "research");
         agent
             .background
@@ -443,7 +451,7 @@ mod tests {
             stream(call("EXTRA_WRITE")),
         ])
         .await;
-        let (mut agent, root) = mock_agent(&mock.url);
+        let (mut agent, root) = mock_agent(&mock.url).await;
         let outcome = agent.run_turn("work", event::null_events()).await;
         assert!(outcome.is_err(), "round exhaustion must not be successful");
         let memory = agent.agent_memory.content().unwrap();
@@ -459,7 +467,7 @@ mod tests {
             stream(serde_json::json!({"tool_calls": [{"index": 0, "id": "c", "function": {"name": "remember", "arguments": "{\"text\":\"fact\"}"}}]})),
             stream(serde_json::json!({"content": "finished"})),
         ]).await;
-        let (mut agent, root) = mock_agent(&mock.url);
+        let (mut agent, root) = mock_agent(&mock.url).await;
         assert_eq!(
             agent.run_turn("work", event::null_events()).await.unwrap(),
             "finished"
@@ -479,7 +487,7 @@ mod tests {
         }
         replies.push(stream(serde_json::json!({"content": "finished"})));
         let mock = MockLlm::start(replies).await;
-        let (mut agent, root) = mock_agent(&mock.url);
+        let (mut agent, root) = mock_agent(&mock.url).await;
         Arc::get_mut(&mut agent.shared).unwrap().max_tool_rounds =
             Config::default().agent.max_tool_rounds;
         assert_eq!(
@@ -500,7 +508,7 @@ mod tests {
             stream(serde_json::json!({"content": "hello"})),
             stream(serde_json::json!({"tool_calls": [{"index": 0, "id": "c", "function": {"name": "remember", "arguments": "{\"text\":\"must not write\"}"}}]})),
         ]).await;
-        let (mut agent, root) = mock_agent(&mock.url);
+        let (mut agent, root) = mock_agent(&mock.url).await;
         Arc::get_mut(&mut agent.shared).unwrap().max_tool_rounds = Some(0);
         assert_eq!(
             agent.run_turn("hello", event::null_events()).await.unwrap(),
@@ -523,25 +531,25 @@ mod tests {
             "data: {\"error\":{\"message\":\"failed\"}}\n\ndata: [DONE]\n\n",
         ] {
             let mock = MockLlm::start(vec![(200, format!("data: {delta}\n\n{tail}"))]).await;
-            let (mut agent, root) = mock_agent(&mock.url);
+            let (mut agent, root) = mock_agent(&mock.url).await;
             assert!(agent.run_turn("work", event::null_events()).await.is_err());
             assert!(!root.join("memory.md").exists());
             assert!(agent.history.is_empty());
         }
     }
 
-    #[test]
-    fn completed_and_interrupted_turns_are_not_replayed_after_write_failure() {
-        let root = std::env::temp_dir().join(format!("kb-failed-save-{}", uuid::Uuid::new_v4()));
+    #[tokio::test]
+    async fn completed_and_interrupted_turns_are_not_replayed_after_write_failure() {
+        let root = std::env::temp_dir().join(format!("koala-failed-save-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let blocked = root.join("not-a-directory");
         std::fs::write(&blocked, "keep").unwrap();
         let mut cfg = Config::default();
         cfg.llm.model = "test".into();
-        cfg.extensions.memory = false;
+
         cfg.agent.memory_file = root.join("memory.md");
         cfg.agent.session_dir = blocked;
-        let mut agent = Agent::new(&cfg).unwrap();
+        let mut agent = Agent::new(&cfg).await.unwrap();
         agent.pending_input = Some("question".into());
         assert!(agent.record_turn("question", "completed answer").is_err());
         agent.record_interruption("completed answer").unwrap();

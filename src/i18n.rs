@@ -5,8 +5,8 @@
 //! deterministic and two frontends could use different languages.
 use serde::Deserialize;
 
-/// Interface language. English is the default; `/lang` toggles at runtime and
-/// `lang = "zh"` in config.toml sets the startup value.
+/// Interface language. `/lang` saves a workspace preference; config.toml
+/// supplies the initial default and KOALA_LANG overrides the startup value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Lang {
@@ -18,7 +18,7 @@ pub enum Lang {
 impl Lang {
     pub const ALL: [Self; 2] = [Self::En, Self::Zh];
 
-    /// Config file / `KBA_LANG` spelling.
+    /// Config file / `KOALA_LANG` spelling.
     pub fn code(self) -> &'static str {
         match self {
             Self::En => "en",
@@ -125,6 +125,10 @@ keys!(
     CmdSkills,
     CmdCompact,
     CmdLang,
+    CmdTheme,
+    UsageTheme,
+    InfoThemeSet,
+    NoteThemeSaveFailed,
     CmdQuit,
     ProgressToolCall,
     ProgressToolResult,
@@ -157,6 +161,7 @@ keys!(
     InfoContextCompacted,
     InfoNothingToCompact,
     InfoLanguageSet,
+    NoteLanguageSaveFailed,
     UsagePermissions,
     UsageModel,
     UsageEffort,
@@ -177,6 +182,10 @@ keys!(
     PanelPermissions,
     PanelModel,
     PanelEffort,
+    PanelTheme,
+    ThemeAuto,
+    ThemeLight,
+    ThemeDark,
     PanelTodos,
     PanelHelp,
     PanelHistory,
@@ -281,6 +290,22 @@ pub fn text(lang: Lang, key: Key) -> &'static str {
         CmdTodos => ("Open the full todo list", "打开完整 Todo 列表"),
         CmdSkills => ("List loaded skills", "列出已加载 skills"),
         CmdCompact => ("Compact the conversation context", "压缩对话上下文"),
+        CmdTheme => (
+            "Set the theme (auto / light / dark)",
+            "设置主题（auto / light / dark）",
+        ),
+        UsageTheme => (
+            "Usage: /theme [auto|light|dark]",
+            "用法：/theme [auto|light|dark]",
+        ),
+        InfoThemeSet => (
+            "Theme: {theme} (auto / light / dark)",
+            "主题：{theme}（auto / light / dark）",
+        ),
+        NoteThemeSaveFailed => (
+            "Theme changed for this session, but could not save the preference: {e}",
+            "本次会话的主题已切换，但无法保存主题偏好：{e}",
+        ),
         CmdLang => ("Switch the interface language", "切换界面语言"),
         CmdQuit => ("Quit", "退出"),
 
@@ -344,6 +369,10 @@ pub fn text(lang: Lang, key: Key) -> &'static str {
         ),
         InfoContextCompacted => ("Context compacted", "上下文已压缩"),
         InfoNothingToCompact => ("Nothing to compact yet", "暂无需要压缩的内容"),
+        NoteLanguageSaveFailed => (
+            "Language changed for this session, but could not save the preference: {e}",
+            "本次会话的语言已切换，但无法保存语言偏好：{e}",
+        ),
         InfoLanguageSet => ("Language: {label}", "语言：{label}"),
         UsagePermissions => (
             "Usage: /permissions [normal|ask_when_need|never_ask]",
@@ -374,6 +403,10 @@ pub fn text(lang: Lang, key: Key) -> &'static str {
         PanelSessions => ("Sessions", "历史会话"),
         PanelPermissions => ("Permission Level", "权限等级"),
         PanelModel => ("Select Model", "选择模型"),
+        PanelTheme => ("Select Theme", "选择主题"),
+        ThemeAuto => ("Follow terminal", "跟随终端"),
+        ThemeLight => ("Light appearance", "浅色主题"),
+        ThemeDark => ("Dark appearance", "深色主题"),
         PanelEffort => ("Reasoning Effort", "思考档位"),
         PanelTodos => ("Todos", "Todo 列表"),
         PanelHelp => ("Help", "帮助"),

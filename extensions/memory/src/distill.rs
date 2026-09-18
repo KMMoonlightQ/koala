@@ -1,6 +1,6 @@
-use crate::extensions::memory::{FileStore, MemoryError};
 use crate::llm::{LlmClient, LlmError, Message};
 use crate::markdown;
+use crate::{FileStore, MemoryError};
 use std::path::Path;
 use thiserror::Error;
 
@@ -60,7 +60,7 @@ pub async fn distill_session(
 }
 
 fn read_transcript(session_path: &Path) -> Result<String, DistillError> {
-    let out = crate::agent::transcripts::distillation_text(session_path, MAX_TRANSCRIPT_CHARS)
+    let out = distillation_text(session_path, MAX_TRANSCRIPT_CHARS)
         .map_err(|_| DistillError::EmptySession(session_path.display().to_string()))?;
     if out.trim().is_empty() {
         return Err(DistillError::EmptySession(
@@ -96,13 +96,65 @@ pub fn slugify(name: &str) -> String {
     slug.trim_end_matches('-').to_string()
 }
 
+/// A best-effort text projection for distillation. Unlike restoration, this
+/// accepts incomplete records and skips malformed lines. The limit is bytes,
+/// rounded down to a UTF-8 boundary, matching the model-input budget.
+pub fn distillation_text(path: &Path, max_bytes: usize) -> std::io::Result<String> {
+    let raw = std::fs::read_to_string(path)?;
+    let mut out = String::new();
+    for line in raw.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let role = value.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let content = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if content.is_empty() {
+            continue;
+        }
+        out.push_str(role);
+        out.push_str(": ");
+        out.push_str(content);
+        out.push_str("\n\n");
+        if out.len() > max_bytes {
+            let mut end = max_bytes;
+            while !out.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.truncate(end);
+            break;
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn transcript_projection_tolerates_bad_lines_and_truncates_utf8() {
+        let path = std::env::temp_dir().join(format!("koala-projection-{}", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &path,
+            concat!(
+                "bad json\n",
+                "{\"role\":\"user\",\"content\":\"你好世界\"}\n",
+                "{\"role\":\"assistant\",\"content\":\"\"}\n",
+                "{\"role\":\"custom\",\"content\":\"kept\"}\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            distillation_text(&path, 12000).unwrap(),
+            "user: 你好世界\n\ncustom: kept\n\n"
+        );
+        assert_eq!(distillation_text(&path, 10).unwrap(), "user: 你");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn long_unicode_transcript_preserves_valid_text() {
-        let path = std::env::temp_dir().join(format!("kb-distill-{}", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("koala-distill-{}", uuid::Uuid::new_v4()));
         std::fs::write(
             &path,
             serde_json::json!({"role": "user", "content": "a中".repeat(5000)}).to_string(),

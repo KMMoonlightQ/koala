@@ -337,7 +337,7 @@ pub(super) fn render_entry(
             .iter()
             .flat_map(|item| {
                 let (mark, style) = match item.status {
-                    TodoState::Done => ("☒", theme::muted()),
+                    TodoState::Done => ("✓", theme::success()),
                     TodoState::InProgress => ("◐", theme::accent()),
                     TodoState::Pending => ("☐", theme::text()),
                 };
@@ -348,7 +348,12 @@ pub(super) fn render_entry(
                 )
             })
             .collect(),
-        EntryKind::Note(s) | EntryKind::Info(s) => text::prefixed_styled(
+        EntryKind::Info(s) => text::prefixed_styled(
+            literal(s, body_width, theme::suggestion()),
+            Span::styled("ℹ ", theme::accent()),
+            Span::raw("  "),
+        ),
+        EntryKind::Note(s) => text::prefixed_styled(
             literal(s, body_width, theme::muted()),
             Span::styled("· ", theme::subtle()),
             Span::raw("  "),

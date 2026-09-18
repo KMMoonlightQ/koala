@@ -1,9 +1,12 @@
-# 界面语言：en（默认）或 zh。也可用 /lang 在对话中切换，或用 KBA_LANG 覆盖。
+# 界面语言：en（默认）或 zh。也可用 /lang 在对话中切换，或用 KOALA_LANG 覆盖。
 # lang = "zh"
+
+# 主题：auto（默认，跟随终端配色）、light 或 dark。支持 /theme 和 KOALA_THEME。
+# theme = "auto"
 
 [llm]
 base_url = "https://api.openai.com/v1"     # 任意 OpenAI 兼容端点，如 https://dashscope.aliyuncs.com/compatible-mode/v1
-api_key = "sk-xxx"                          # provider 的 key，或用环境变量 KBA_API_KEY 覆盖
+api_key = "sk-xxx"                          # provider 的 key，或用环境变量 KOALA_API_KEY 覆盖
 model = "gpt-4o-mini"                       # 模型名
 
 # 以下按模型/服务商实际能力填写；不配置则不展示对应信息。
@@ -13,7 +16,7 @@ model = "gpt-4o-mini"                       # 模型名
 
 # 额外的请求头：某些"OpenAI 兼容"端点要求额外的路由头时填这里，每个请求都会携带
 # [llm.headers]
-# x-opencode-session = "kb-agent"
+# x-opencode-session = "koala"
 
 # /model 中的额外模型，共用上面的 base_url、api_key 和 headers。
 # 若列表包含 llm.model 的同名项，以该项的能力配置为准。
@@ -23,16 +26,14 @@ model = "gpt-4o-mini"                       # 模型名
 # reasoning_effort = "medium"
 # context_window = 128000
 
-[memory]
-workspace = ".kb"
 
 [agent]
 max_tool_rounds = "unlimited"           # 不限制轮数；非负整数设置上限，0 禁止工具调用
 max_retries = 5
 compact_threshold = 40000                # history 字符数超过即自动压缩
 subagent_max_rounds = "unlimited"
-session_dir = ".kb/session"              # 会话转录目录：Agent 与知识库之间唯一的接口
-# memory_file = "..."                    # Agent 私有记忆，默认 <config dir>/kb-agent/memory.md
+session_dir = ".koala/session"              # 会话转录目录：通用 JSONL 会话转录
+# memory_file = "..."                    # Agent 私有记忆，默认 <config dir>/koala/memory.md
 
 # 权限等级：normal / ask_when_need / never_ask
 # 对话内 /permissions 切换；方向键选择，Enter 确认，Esc 取消
@@ -51,8 +52,26 @@ post_tool_use = []
 turn_start = []
 turn_end = []
 
-# Extensions are trusted local programs. Loaded in the listed order after memory.
+# Extensions are trusted local programs. All extensions (including memory) load in the listed order.
 [extensions]
-memory = true
-manifests = [] # e.g. [".kb/extensions/context-example/extension.toml"]
+manifests = [] # e.g. [".koala/extensions/context-example/extension.toml"]
 timeout_secs = 30
+
+# MCP 客户端（可配置多个服务器；修改后重启）
+# 本地 stdio：command 是可执行程序，args 不经过 shell 展开。
+# [mcp.servers.local]
+# command = "python3"
+# args = ["/absolute/path/to/server.py"]
+# cwd = "/absolute/path/to/workspace"
+# env = { API_KEY = "your-key" }
+# startup_timeout_secs = 30
+# timeout_secs = 60
+# enabled = true
+# read_only_tools = ["search"] # 原始工具名；显式信任其只读性
+
+# 远程 Streamable HTTP：url 与 command 二选一。
+# [mcp.servers.remote]
+# url = "https://example.com/mcp"
+# headers = { X-Project = "my-project" }
+# bearer_token_env = "MY_MCP_TOKEN" # 从环境变量读取 Bearer token
+# read_only_tools = []

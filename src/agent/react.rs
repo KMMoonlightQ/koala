@@ -242,8 +242,8 @@ mod tests {
             cfg.permissions.deny.push("bash".into());
         }
         cfg.agent.memory_file =
-            std::env::temp_dir().join(format!("kb-unused-{}", uuid::Uuid::new_v4()));
-        let mut agent = Agent::new(&cfg).unwrap();
+            std::env::temp_dir().join(format!("koala-unused-{}", uuid::Uuid::new_v4()));
+        let mut agent = Agent::new(&cfg).await.unwrap();
         let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let events = if silent {
             crate::agent::event::null_events()
@@ -282,9 +282,9 @@ mod tests {
         use crate::config::PermissionMode;
         let mut cfg = Config::default();
         cfg.llm.model = "test".into();
-        cfg.extensions.memory = false;
-        let marker = std::env::temp_dir().join(format!("kb-approval-{}", uuid::Uuid::new_v4()));
-        let mut agent = Agent::new(&cfg).unwrap();
+
+        let marker = std::env::temp_dir().join(format!("koala-approval-{}", uuid::Uuid::new_v4()));
+        let mut agent = Agent::new(&cfg).await.unwrap();
         let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let shared = agent.shared.clone();
         let mut ctx = ToolContext {
@@ -387,12 +387,32 @@ mod tests {
     }
     #[tokio::test]
     async fn extension_tools_obey_plan_mode_and_permissions() {
-        let directory = std::env::temp_dir().join(format!("kb-ext-plan-{}", uuid::Uuid::new_v4()));
+        let directory =
+            std::env::temp_dir().join(format!("koala-ext-plan-{}", uuid::Uuid::new_v4()));
         let mut cfg = Config::default();
         cfg.llm.model = "test".into();
-        cfg.memory.workspace = directory.clone();
+        std::fs::create_dir_all(&directory).unwrap();
+        let manifest = directory.join("extension.toml");
+        std::fs::write(
+            &manifest,
+            r#"api_version = 1
+name = "test-tools"
+command = ["bash", "-c", "cat >/dev/null; printf '%s' '{\"content\":\"unique-memory-test\"}'"]
+[[tools]]
+name = "test_write"
+description = "write"
+parameters = { type = "object" }
+[[tools]]
+name = "test_search"
+description = "search"
+parameters = { type = "object" }
+read_only = true
+"#,
+        )
+        .unwrap();
+        cfg.extensions.manifests = vec![manifest];
         cfg.permissions.mode = crate::config::PermissionMode::NeverAsk;
-        let mut agent = Agent::new(&cfg).unwrap();
+        let mut agent = Agent::new(&cfg).await.unwrap();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut ctx = ToolContext {
             todos: &mut agent.todos,
@@ -409,7 +429,7 @@ mod tests {
             id: "extension-call".into(),
             kind: "function".into(),
             function: FunctionCall {
-                name: "memory_write".into(),
+                name: "test_write".into(),
                 arguments: serde_json::json!({
                     "path": "digest/wiki/test", "name": "test", "content": "unique-memory-test"
                 })
@@ -418,17 +438,17 @@ mod tests {
         };
         let blocked = execute_one(&mut ctx, &registry, &call).await;
         assert!(blocked.is_error && blocked.content.contains("plan mode"));
-        assert!(!directory.exists());
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
         ctx.plan_mode = false;
         assert!(!execute_one(&mut ctx, &registry, &call).await.is_error);
         ctx.plan_mode = true;
-        call.function.name = "memory_search".into();
+        call.function.name = "test_search".into();
         call.function.arguments = serde_json::json!({"query": "unique-memory-test"}).to_string();
         let found = execute_one(&mut ctx, &registry, &call).await;
         assert!(!found.is_error && found.content.contains("unique-memory-test"));
         cfg.permissions.mode = crate::config::PermissionMode::Normal;
-        cfg.permissions.deny.push("memory_search".into());
-        let mut denied_agent = Agent::new(&cfg).unwrap();
+        cfg.permissions.deny.push("test_search".into());
+        let mut denied_agent = Agent::new(&cfg).await.unwrap();
         let mut denied_ctx = ToolContext {
             todos: &mut denied_agent.todos,
             agent_memory: &denied_agent.agent_memory,

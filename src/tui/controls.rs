@@ -141,6 +141,16 @@ fn panel_key(app: &mut App, key: KeyEvent) -> bool {
             }
             _ => {}
         },
+        Panel::Theme { selected } => match key.code {
+            KeyCode::Up => *selected = selected.saturating_sub(1),
+            KeyCode::Down => *selected = (*selected + 1).min(super::Theme::ALL.len() - 1),
+            KeyCode::Enter => {
+                let theme = super::Theme::ALL[*selected];
+                close_panel(app);
+                super::handle_command(app, &format!("theme {}", theme.code()));
+            }
+            _ => {}
+        },
         Panel::Permissions { selected } => match key.code {
             KeyCode::Up => *selected = selected.saturating_sub(1),
             KeyCode::Down => *selected = (*selected + 1).min(2),

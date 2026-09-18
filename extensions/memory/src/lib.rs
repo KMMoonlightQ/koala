@@ -1,8 +1,12 @@
+pub use koala_llm as llm;
+pub use koala_markdown as markdown;
 pub mod bm25;
 pub mod chunk;
 pub mod distill;
 pub mod dream;
 pub mod store;
+#[cfg(test)]
+mod test_support;
 pub mod tools;
 
 pub use distill::{DistillError, distill_session};
@@ -30,7 +34,7 @@ pub(crate) fn ensure_layout(workspace: &std::path::Path) -> Result<(), MemoryErr
     Ok(())
 }
 
-/// The KB participates through the public extension contract only.
+/// The knowledge base participates through the public extension contract only.
 pub struct MemoryExtension {
     workspace: std::path::PathBuf,
 }
@@ -39,7 +43,7 @@ impl MemoryExtension {
         Self { workspace }
     }
 }
-impl super::Extension for MemoryExtension {
+impl koala_extension_api::Extension for MemoryExtension {
     fn name(&self) -> &str {
         "memory"
     }
@@ -51,12 +55,12 @@ impl super::Extension for MemoryExtension {
     }
     fn hook<'a>(
         &'a self,
-        stage: super::Stage,
+        stage: koala_extension_api::Stage,
         payload: &'a serde_json::Value,
-    ) -> super::ExtensionFuture<'a> {
+    ) -> koala_extension_api::ExtensionFuture<'a> {
         Box::pin(async move {
-            if stage != super::Stage::TurnStart {
-                return Ok(super::Response::default());
+            if stage != koala_extension_api::Stage::TurnStart {
+                return Ok(koala_extension_api::Response::default());
             }
             let store = FileStore::open(&self.workspace).map_err(|e| e.to_string())?;
             let query = payload["input"].as_str().unwrap_or("");
@@ -68,7 +72,7 @@ impl super::Extension for MemoryExtension {
                 ));
             }
             context = context.chars().take(8000).collect();
-            Ok(super::Response {
+            Ok(koala_extension_api::Response {
                 context: Some(context),
                 ..Default::default()
             })
@@ -78,13 +82,13 @@ impl super::Extension for MemoryExtension {
         &'a self,
         name: &'a str,
         args: &'a serde_json::Value,
-    ) -> super::ExtensionFuture<'a> {
+    ) -> koala_extension_api::ExtensionFuture<'a> {
         Box::pin(async move {
             let mut store = FileStore::open(&self.workspace).map_err(|e| e.to_string())?;
             let result = tools::execute(&mut store, name, args);
             let is_error = result.is_err();
             let content = result.unwrap_or_else(|error| error);
-            Ok(super::Response {
+            Ok(koala_extension_api::Response {
                 content: Some(content),
                 is_error,
                 ..Default::default()

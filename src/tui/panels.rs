@@ -16,7 +16,12 @@ pub(super) fn dialog_chrome(app: &App) -> Option<(&'static str, &'static str)> {
         Some(Panel::Sessions { .. }) => {
             Some((t(Key::PanelSessions), t(Key::HintSelectResumeCancel)))
         }
-        Some(Panel::Permissions { .. } | Panel::Model { .. } | Panel::Effort { .. }) => Some((
+        Some(
+            Panel::Permissions { .. }
+            | Panel::Model { .. }
+            | Panel::Effort { .. }
+            | Panel::Theme { .. },
+        ) => Some((
             t(dialog_list_title(&app.panel)),
             t(Key::HintSelectConfirmCancel),
         )),
@@ -33,6 +38,7 @@ pub(super) fn dialog_chrome(app: &App) -> Option<(&'static str, &'static str)> {
 
 fn dialog_list_title(panel: &Option<Panel>) -> Key {
     match panel {
+        Some(Panel::Theme { .. }) => Key::PanelTheme,
         Some(Panel::Permissions { .. }) => Key::PanelPermissions,
         Some(Panel::Model { .. }) => Key::PanelModel,
         _ => Key::PanelEffort,
@@ -44,6 +50,7 @@ fn dialog_list_title(panel: &Option<Panel>) -> Key {
 pub(super) fn content_height(app: &App) -> usize {
     match &app.panel {
         Some(Panel::Sessions { .. }) => (app.sessions.len() * 2).clamp(1, 16),
+        Some(Panel::Theme { .. }) => super::Theme::ALL.len(),
         Some(Panel::Permissions { .. }) => 3,
         Some(Panel::Model { .. }) => app.models.len(),
         Some(Panel::Effort { .. }) => app.reasoning_efforts.len(),
@@ -105,7 +112,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                         }
                     ),
                     if index == *selected {
-                        theme::suggestion()
+                        theme::selected()
                     } else {
                         theme::text()
                     },
@@ -115,6 +122,42 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                     theme::muted(),
                 ));
             }
+            f.render_widget(Paragraph::new(Text::from(lines)), area);
+        }
+        Some(Panel::Theme { selected }) => {
+            let capacity = area.height as usize;
+            let start = selected.saturating_sub(capacity.saturating_sub(1));
+            let lines: Vec<_> = super::Theme::ALL
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(capacity)
+                .map(|(index, value)| {
+                    let description = match value {
+                        super::Theme::Auto => Key::ThemeAuto,
+                        super::Theme::Light => Key::ThemeLight,
+                        super::Theme::Dark => Key::ThemeDark,
+                    };
+                    Line::styled(
+                        format!(
+                            "{}{}{} · {}",
+                            if index == *selected { "❯ " } else { "  " },
+                            value.code(),
+                            if *value == app.theme {
+                                i18n::text(app.lang, Key::Current)
+                            } else {
+                                ""
+                            },
+                            i18n::text(app.lang, description),
+                        ),
+                        if index == *selected {
+                            theme::selected()
+                        } else {
+                            theme::muted()
+                        },
+                    )
+                })
+                .collect();
             f.render_widget(Paragraph::new(Text::from(lines)), area);
         }
         Some(Panel::Permissions { selected }) => {
@@ -139,7 +182,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                             mode.description(app.lang)
                         ),
                         if index == *selected {
-                            theme::suggestion()
+                            theme::selected()
                         } else {
                             theme::muted()
                         },
@@ -171,7 +214,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                             }
                         ),
                         if index == *selected {
-                            theme::suggestion()
+                            theme::selected()
                         } else {
                             theme::muted()
                         },
@@ -203,7 +246,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                             }
                         ),
                         if index == *selected {
-                            theme::suggestion()
+                            theme::selected()
                         } else {
                             theme::muted()
                         },
@@ -265,7 +308,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                     Span::styled(
                         if focused { "❯ " } else { "  " },
                         if focused {
-                            theme::suggestion()
+                            theme::selected()
                         } else {
                             theme::subtle()
                         },
@@ -273,7 +316,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                     Span::styled(
                         value,
                         if focused {
-                            theme::suggestion()
+                            theme::selected()
                         } else {
                             theme::muted()
                         },
@@ -305,7 +348,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                             task.description
                         ),
                         area.width as usize,
-                        theme::heading(),
+                        theme::task_status(task.status),
                     ));
                     lines.push(Line::default());
                     let output = if task.output.is_empty() {
@@ -339,7 +382,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                     let style = if task.status == TaskState::Failed {
                         theme::error()
                     } else if i == index {
-                        theme::suggestion()
+                        theme::selected()
                     } else {
                         theme::muted()
                     };
@@ -347,17 +390,16 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                         Span::styled(
                             if i == index { "❯ " } else { "  " },
                             if i == index {
-                                theme::suggestion()
+                                theme::selected()
                             } else {
                                 theme::subtle()
                             },
                         ),
+                        Span::styled(format!("#{} [{}] ", task.id, task.kind), style),
+                        Span::styled(task.status.label(app.lang), theme::task_status(task.status)),
                         Span::styled(
                             format!(
-                                "#{} [{}] {} · {:.1}s  {}",
-                                task.id,
-                                task.kind,
-                                task.status.label(app.lang),
+                                " · {:.1}s  {}",
                                 elapsed(task.elapsed_ms, task.status, app.tasks_received),
                                 text::clean(&task.description).replace('\n', " ")
                             ),
@@ -438,7 +480,7 @@ pub(super) fn draw_menu(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(
                 if focused { "❯ " } else { "  " },
                 if focused {
-                    theme::suggestion()
+                    theme::selected()
                 } else {
                     theme::subtle()
                 },
@@ -446,12 +488,19 @@ pub(super) fn draw_menu(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(
                 format!("/{name}"),
                 if focused {
-                    theme::suggestion()
+                    theme::selected()
                 } else {
                     theme::text()
                 },
             ),
-            Span::styled(format!("  {description}"), theme::subtle()),
+            Span::styled(
+                format!("  {description}"),
+                if focused {
+                    theme::text()
+                } else {
+                    theme::muted()
+                },
+            ),
         ]));
     }
     f.render_widget(Paragraph::new(Text::from(lines)), inner);
@@ -469,7 +518,11 @@ pub(super) fn draw_todos(f: &mut Frame, app: &App, area: Rect) {
     let done = items.iter().filter(|t| t.status == TodoState::Done).count();
     let mut lines = vec![Line::styled(
         format!("▾ {done}/{}", items.len()),
-        theme::subtle(),
+        if done == items.len() {
+            theme::success()
+        } else {
+            theme::accent()
+        },
     )];
     let ordered = ordered_todos(app);
     let capacity = area.height.saturating_sub(1) as usize;
@@ -512,6 +565,6 @@ fn todo_marker(status: TodoState) -> (&'static str, ratatui::style::Style) {
     match status {
         TodoState::InProgress => ("◐", theme::heading()),
         TodoState::Pending => ("☐", theme::muted()),
-        TodoState::Done => ("☒", theme::muted()),
+        TodoState::Done => ("✓", theme::success()),
     }
 }

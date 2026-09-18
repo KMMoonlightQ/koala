@@ -120,7 +120,7 @@ mod tests {
 
     #[tokio::test]
     async fn abort_stops_shell_descendants() {
-        let root = std::env::temp_dir().join(format!("kb-shell-test-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("koala-shell-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let ready = root.join("ready");
         let leaked = root.join("leaked");
@@ -146,7 +146,8 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_stops_shell_descendants() {
-        let path = std::env::temp_dir().join(format!("kb-timeout-test-{}", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("koala-timeout-test-{}", uuid::Uuid::new_v4()));
         let cmd = format!("(sleep 0.4; touch '{}') & wait", path.display());
         let error = run_command(&cmd, Duration::from_millis(100))
             .await

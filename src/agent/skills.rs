@@ -14,11 +14,11 @@ pub struct Skills {
 }
 
 impl Skills {
-    /// Scan `./skills/*/SKILL.md` and `<config dir>/kb-agent/skills/*/SKILL.md`.
+    /// Scan `./skills/*/SKILL.md` and `<config dir>/koala/skills/*/SKILL.md`.
     pub fn load() -> Self {
         let mut roots = vec![PathBuf::from("skills")];
         if let Some(dir) = dirs::config_dir() {
-            roots.push(dir.join("kb-agent").join("skills"));
+            roots.push(dir.join("koala").join("skills"));
         }
         Self::load_from(&roots)
     }
@@ -82,7 +82,7 @@ mod tests {
 
     #[test]
     fn loads_skill_files_with_frontmatter() {
-        let dir = std::env::temp_dir().join(format!("kb-agent-skills-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("koala-skills-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join("skills/review")).unwrap();
         std::fs::write(
             dir.join("skills/review/SKILL.md"),
@@ -102,7 +102,7 @@ mod tests {
 
     #[test]
     fn missing_dirs_are_fine() {
-        let dir = std::env::temp_dir().join(format!("kb-agent-skills-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("koala-skills-{}", uuid::Uuid::new_v4()));
         let skills = Skills::load_from(&[dir.join("skills")]);
         assert!(skills.list.is_empty());
     }

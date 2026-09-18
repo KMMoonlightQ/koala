@@ -1,3 +1,5 @@
 /target
-/.kb
+/.koala
 /config.toml
+
+/extensions/memory/target

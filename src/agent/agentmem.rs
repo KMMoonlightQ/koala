@@ -74,7 +74,7 @@ mod tests {
 
     #[test]
     fn remember_groups_by_day_and_content_caps() {
-        let dir = std::env::temp_dir().join(format!("kb-agent-mem-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("koala-mem-{}", uuid::Uuid::new_v4()));
         let mem = AgentMemory::load(dir.join("memory.md"));
         mem.remember("喜欢简洁回复").unwrap();
         mem.remember("用 Rust").unwrap();
@@ -87,7 +87,7 @@ mod tests {
 
     #[test]
     fn content_truncates_long_memory() {
-        let dir = std::env::temp_dir().join(format!("kb-agent-mem-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("koala-mem-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("memory.md");
         std::fs::write(&file, "x".repeat(5000)).unwrap();
@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn invalid_memory_is_reported_and_never_overwritten() {
-        let dir = std::env::temp_dir().join(format!("kb-agent-mem-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("koala-mem-{}", uuid::Uuid::new_v4()));
         let file = dir.join("memory.md");
         let mem = AgentMemory::load(file.clone());
         assert_eq!(mem.content().unwrap(), "");

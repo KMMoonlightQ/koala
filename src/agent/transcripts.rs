@@ -1,4 +1,4 @@
-//! Persistent conversation records, strict restoration and tolerant distillation.
+//! Persistent conversation records and strict restoration.
 //! Picker/restore errors use the frontend language; write errors retain I/O context.
 use crate::i18n::{self, Key, Lang};
 use serde::{Deserialize, Serialize};
@@ -129,37 +129,6 @@ fn new_id() -> String {
     )
 }
 
-/// A best-effort text projection for distillation. Unlike restoration, this
-/// accepts incomplete records and skips malformed lines. The limit is bytes,
-/// rounded down to a UTF-8 boundary, matching the model-input budget.
-pub fn distillation_text(path: &Path, max_bytes: usize) -> std::io::Result<String> {
-    let raw = fs::read_to_string(path)?;
-    let mut out = String::new();
-    for line in raw.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let role = value.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        let content = value.get("content").and_then(|v| v.as_str()).unwrap_or("");
-        if content.is_empty() {
-            continue;
-        }
-        out.push_str(role);
-        out.push_str(": ");
-        out.push_str(content);
-        out.push_str("\n\n");
-        if out.len() > max_bytes {
-            let mut end = max_bytes;
-            while !out.is_char_boundary(end) {
-                end -= 1;
-            }
-            out.truncate(end);
-            break;
-        }
-    }
-    Ok(out)
-}
-
 pub fn read(directory: &Path, id: &str, lang: Lang) -> Result<Vec<Record>, String> {
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
         return Err(i18n::text(lang, Key::SessionInvalidId).into());
@@ -276,7 +245,7 @@ mod tests {
 
     #[test]
     fn restored_turn_appends_without_losing_prefix_and_failed_restore_keeps_target() {
-        let root = std::env::temp_dir().join(format!("kb-turn-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("koala-turn-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let prefix = r#"{"ts":"then","role":"user","content":"old"}"#;
         fs::write(root.join("saved.jsonl"), prefix).unwrap();
@@ -295,16 +264,13 @@ mod tests {
         assert_eq!(records.len(), 3);
         assert_eq!(records[1].content, "你好");
         assert_eq!(records[2].role, "assistant");
-        assert_eq!(
-            distillation_text(&store.path(), 12000).unwrap(),
-            "user: old\n\nuser: 你好\n\nassistant: 回答\n\n"
-        );
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn partial_write_rolls_back_exact_bytes_then_a_retry_writes_once() {
-        let root = std::env::temp_dir().join(format!("kb-write-failure-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("koala-write-failure-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let prefix = r#"{"ts":"then","role":"user","content":"original"}"#;
         fs::write(root.join("saved.jsonl"), prefix).unwrap();
@@ -324,8 +290,8 @@ mod tests {
     }
 
     #[test]
-    fn strict_restore_and_tolerant_distillation_keep_different_contracts() {
-        let root = std::env::temp_dir().join(format!("kb-read-modes-{}", uuid::Uuid::new_v4()));
+    fn strict_restore_rejects_malformed_records() {
+        let root = std::env::temp_dir().join(format!("koala-read-modes-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&root).unwrap();
         let path = root.join("mixed.jsonl");
         fs::write(
@@ -339,17 +305,12 @@ mod tests {
         )
         .unwrap();
         assert!(read(&root, "mixed", Lang::En).is_err());
-        assert_eq!(
-            distillation_text(&path, 12000).unwrap(),
-            "user: 你好世界\n\ncustom: kept\n\n"
-        );
-        assert_eq!(distillation_text(&path, 10).unwrap(), "user: 你");
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn lists_newest_first_and_reports_invalid_files_without_losing_valid_sessions() {
-        let root = std::env::temp_dir().join(format!("kb-sessions-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("koala-sessions-{}", uuid::Uuid::new_v4()));
         assert!(list(&root, "", Lang::En).unwrap().is_empty());
         fs::create_dir_all(&root).unwrap();
         let record = r#"{"ts":"2026-09-18T10:00:00+08:00","role":"user","content":"查找\n旧会话"}"#;

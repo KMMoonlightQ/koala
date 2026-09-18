@@ -2,7 +2,7 @@ use super::{Tool, ToolContext, ToolResult};
 use std::future::Future;
 use std::pin::Pin;
 
-/// Agent-private scratch memory (.kb/agent/memory.md), injected into every
+/// Agent-private scratch memory (<config dir>/koala/memory.md), injected into every
 /// system prompt. Distinct from the curated knowledge base.
 pub struct Remember;
 

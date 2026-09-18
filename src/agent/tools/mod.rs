@@ -206,7 +206,7 @@ mod tests {
             max_retries: 0,
             compact_threshold: 1000,
             subagent_max_rounds: Some(2),
-            memory_file: std::path::PathBuf::from("/tmp/kb-agent-ctx-test.md"),
+            memory_file: std::path::PathBuf::from("/tmp/koala-ctx-test.md"),
             lang: crate::i18n::LangCell::new(crate::i18n::Lang::En),
         })
     }
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn subagent_ctx_inherits_plan_mode_and_increments_depth() {
         let mut todos = TodoList::default();
-        let mem = AgentMemory::load(std::env::temp_dir().join("kb-agent-ctx-test.md"));
+        let mem = AgentMemory::load(std::env::temp_dir().join("koala-ctx-test.md"));
         let background = BackgroundManager::default();
         let skills = Arc::new(Skills::default());
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
@@ -252,7 +252,7 @@ mod tests {
     async fn invalid_tool_arguments_leave_state_unchanged() {
         let mut todos = TodoList::default();
         let mem = AgentMemory::load(
-            std::env::temp_dir().join(format!("kb-args-{}", uuid::Uuid::new_v4())),
+            std::env::temp_dir().join(format!("koala-args-{}", uuid::Uuid::new_v4())),
         );
         let skills = Arc::new(Skills::default());
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();

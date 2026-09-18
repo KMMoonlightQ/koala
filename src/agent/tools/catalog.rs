@@ -183,78 +183,19 @@ mod tests {
     use crate::config::{PermissionMode, PermissionsConfig};
     use serde_json::json;
 
-    #[tokio::test]
-    async fn memory_can_be_removed_and_retrieves_fresh_data() {
-        let dir = std::env::temp_dir().join(format!("kb-catalog-memory-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut cfg = crate::config::Config::default();
-        cfg.memory.workspace = dir.join("memory");
-        cfg.extensions.memory = false;
-        let disabled = crate::extensions::load(&cfg).unwrap();
-        assert!(disabled.tools().is_empty());
-        disabled
-            .hook(
-                crate::extensions::Stage::TurnStart,
-                json!({"input": "ownership"}),
-            )
-            .await
-            .unwrap();
-        assert!(!cfg.memory.workspace.exists());
-        cfg.extensions.memory = true;
-        cfg.llm.model = "test".into();
-        cfg.agent.memory_file = dir.join("private-memory.md");
-        let mut agent = crate::agent::Agent::new(&cfg).unwrap();
-        let enabled = &agent.shared.extensions;
-        let catalog = ToolCatalog::build(0, enabled);
-        let events = crate::agent::event::null_events();
-        let mut ctx = ToolContext {
-            todos: &mut agent.todos,
-            agent_memory: &agent.agent_memory,
-            background: agent.background.clone(),
-            skills: &agent.skills,
-            events: &events,
-            shared: &agent.shared,
-            depth: 0,
-            plan_mode: false,
-        };
-        let written = catalog.execute(&mut ctx, "memory_write", json!({"path": "digest/wiki/rust", "name": "rust", "content": "ownership and borrowing", "description": "Rust"})).await;
-        assert!(!written.is_error);
-        let retrieved = enabled
-            .hook(
-                crate::extensions::Stage::TurnStart,
-                json!({"input": "ownership"}),
-            )
-            .await
-            .unwrap();
-        assert!(
-            retrieved
-                .context
-                .unwrap()
-                .contains("ownership and borrowing")
-        );
-        assert!(catalog.plan_allowed("memory_read"));
-        assert!(!catalog.plan_allowed("memory_write"));
-        let failure = catalog
-            .execute(&mut ctx, "memory_read", json!({"path": "../secret"}))
-            .await;
-        assert!(failure.is_error);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
     struct Echo;
     impl Extension for Echo {
         fn name(&self) -> &str {
             "catalog-test"
         }
         fn tools(&self) -> Vec<crate::llm::Tool> {
-            vec![crate::llm::Tool::function(
-                "echo",
-                "echo input",
-                json!({"type":"object"}),
-            )]
+            ["echo", "save"]
+                .into_iter()
+                .map(|name| crate::llm::Tool::function(name, "test tool", json!({"type":"object"})))
+                .collect()
         }
-        fn read_only(&self, _: &str) -> bool {
-            true
+        fn read_only(&self, name: &str) -> bool {
+            name == "echo"
         }
         fn hook<'a>(
             &'a self,
@@ -281,8 +222,8 @@ mod tests {
     async fn one_catalog_routes_both_tool_sources_and_hidden_tools_cannot_execute() {
         let mut cfg = crate::config::Config::default();
         cfg.llm.model = "test".into();
-        cfg.extensions.memory = false;
-        let mut agent = crate::agent::Agent::new(&cfg).unwrap();
+
+        let mut agent = crate::agent::Agent::new(&cfg).await.unwrap();
         Arc::get_mut(&mut agent.shared)
             .unwrap()
             .extensions
@@ -336,11 +277,7 @@ mod tests {
     #[test]
     fn capabilities_keep_approval_distinct_from_plan_mode() {
         let mut extensions = Extensions::default();
-        extensions
-            .register(Arc::new(crate::extensions::memory::MemoryExtension::new(
-                "unused".into(),
-            )))
-            .unwrap();
+        extensions.register(Arc::new(Echo)).unwrap();
         let catalog = ToolCatalog::build(0, &extensions);
         let permissions = Permissions::new(&PermissionsConfig {
             mode: PermissionMode::AskWhenNeed,
@@ -358,8 +295,8 @@ mod tests {
                 Policy::Ask,
                 false,
             ),
-            ("memory_search", json!({}), Policy::Allow, true),
-            ("memory_write", json!({}), Policy::Ask, false),
+            ("echo", json!({}), Policy::Allow, true),
+            ("save", json!({}), Policy::Ask, false),
             ("unknown", json!({}), Policy::Ask, false),
         ] {
             assert_eq!(catalog.policy(&permissions, name, &args), policy, "{name}");

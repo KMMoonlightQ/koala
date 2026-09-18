@@ -1,6 +1,6 @@
-//! Shared tool definitions for the memory extension and KB consolidation.
+//! Shared tool definitions for the memory extension and knowledge base consolidation.
 
-use crate::extensions::memory::FileStore;
+use crate::FileStore;
 use crate::llm::ToolCall;
 use crate::markdown::{self, FrontMatter};
 
@@ -56,26 +56,30 @@ pub fn definitions() -> Vec<crate::llm::Tool> {
 }
 
 /// Execute a memory tool call directly against the store.
-pub fn dispatch(kb: &mut FileStore, call: &ToolCall) -> String {
-    dispatch_result(kb, call).unwrap_or_else(|error| error)
+pub fn dispatch(store: &mut FileStore, call: &ToolCall) -> String {
+    dispatch_result(store, call).unwrap_or_else(|error| error)
 }
 
-pub fn dispatch_result(kb: &mut FileStore, call: &ToolCall) -> Result<String, String> {
+pub fn dispatch_result(store: &mut FileStore, call: &ToolCall) -> Result<String, String> {
     let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
         .map_err(|e| format!("invalid arguments: {e}"))?;
-    execute(kb, &call.function.name, &args)
+    execute(store, &call.function.name, &args)
 }
 
-pub fn execute(kb: &mut FileStore, name: &str, args: &serde_json::Value) -> Result<String, String> {
+pub fn execute(
+    store: &mut FileStore,
+    name: &str,
+    args: &serde_json::Value,
+) -> Result<String, String> {
     match name {
-        "memory_search" => exec_search(kb, args),
-        "memory_read" => exec_read(kb, args),
-        "memory_write" => exec_write(kb, args),
+        "memory_search" => exec_search(store, args),
+        "memory_read" => exec_read(store, args),
+        "memory_write" => exec_write(store, args),
         other => Err(format!("unknown tool: {other}")),
     }
 }
 
-fn exec_search(kb: &FileStore, args: &serde_json::Value) -> Result<String, String> {
+fn exec_search(store: &FileStore, args: &serde_json::Value) -> Result<String, String> {
     #[derive(serde::Deserialize)]
     struct Args<'a> {
         query: &'a str,
@@ -83,7 +87,7 @@ fn exec_search(kb: &FileStore, args: &serde_json::Value) -> Result<String, Strin
     }
     let args: Args =
         serde::Deserialize::deserialize(args).map_err(|e| format!("invalid arguments: {e}"))?;
-    let hits = kb.search(args.query, args.limit.unwrap_or(5));
+    let hits = store.search(args.query, args.limit.unwrap_or(5));
     if hits.is_empty() {
         return Ok("no matches".to_string());
     }
@@ -94,7 +98,7 @@ fn exec_search(kb: &FileStore, args: &serde_json::Value) -> Result<String, Strin
         .join("\n\n"))
 }
 
-fn exec_read(kb: &FileStore, args: &serde_json::Value) -> Result<String, String> {
+fn exec_read(store: &FileStore, args: &serde_json::Value) -> Result<String, String> {
     #[derive(serde::Deserialize)]
     struct Args<'a> {
         path: &'a str,
@@ -103,7 +107,7 @@ fn exec_read(kb: &FileStore, args: &serde_json::Value) -> Result<String, String>
     }
     let args: Args =
         serde::Deserialize::deserialize(args).map_err(|e| format!("invalid arguments: {e}"))?;
-    match kb.read_lines(
+    match store.read_lines(
         args.path,
         args.start_line.unwrap_or(1),
         args.end_line.unwrap_or(usize::MAX),
@@ -114,7 +118,7 @@ fn exec_read(kb: &FileStore, args: &serde_json::Value) -> Result<String, String>
     }
 }
 
-fn exec_write(kb: &mut FileStore, args: &serde_json::Value) -> Result<String, String> {
+fn exec_write(store: &mut FileStore, args: &serde_json::Value) -> Result<String, String> {
     #[derive(serde::Deserialize)]
     struct Args<'a> {
         path: &'a str,
@@ -149,7 +153,8 @@ fn exec_write(kb: &mut FileStore, args: &serde_json::Value) -> Result<String, St
         extra: serde_yml::Mapping::default(),
     };
     let rendered = markdown::render(&fm, content).map_err(|e| format!("render failed: {e}"))?;
-    kb.write_file(&path, &rendered)
+    store
+        .write_file(&path, &rendered)
         .map_err(|e| format!("write failed: {e}"))?;
     Ok(format!("written: {path}"))
 }
@@ -171,7 +176,7 @@ mod tests {
     }
 
     fn temp_store() -> (std::path::PathBuf, FileStore) {
-        let dir = std::env::temp_dir().join(format!("kb-agent-tools-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("koala-tools-{}", uuid::Uuid::new_v4()));
         let store = FileStore::open(&dir).unwrap();
         (dir, store)
     }

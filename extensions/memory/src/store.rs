@@ -354,7 +354,7 @@ mod tests {
 
     impl TempWorkspace {
         fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!("kb-agent-test-{}", uuid::Uuid::new_v4()));
+            let dir = std::env::temp_dir().join(format!("koala-test-{}", uuid::Uuid::new_v4()));
             Self(dir)
         }
     }

@@ -1,7 +1,8 @@
 use crate::i18n::{self, Key, Lang};
+pub use koala_extensions::ExtensionsConfig;
 use serde::Deserialize;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -17,12 +18,50 @@ pub enum ConfigError {
 pub struct Config {
     /// Interface language for the TUI and system prompts; `/lang` toggles it.
     pub lang: Lang,
+    /// Interface palette; auto uses the terminal's own colors.
+    pub theme: Theme,
+    #[serde(skip)]
+    pub(crate) theme_path: Option<PathBuf>,
+    /// Runtime preference location, never supplied by config.toml.
+    #[serde(skip)]
+    pub(crate) language_path: Option<PathBuf>,
     pub llm: LlmConfig,
-    pub memory: MemoryConfig,
     pub agent: AgentConfig,
     pub permissions: PermissionsConfig,
     pub hooks: HooksConfig,
     pub extensions: ExtensionsConfig,
+    pub mcp: crate::mcp::McpConfig,
+}
+
+/// Auto uses terminal-owned colors, which follow terminal theme changes live.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Theme {
+    #[default]
+    Auto,
+    Light,
+    Dark,
+}
+
+impl Theme {
+    pub const ALL: [Self; 3] = [Self::Auto, Self::Light, Self::Dark];
+
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "light" => Some(Self::Light),
+            "dark" => Some(Self::Dark),
+            _ => None,
+        }
+    }
 }
 
 /// Approval level, independent of the agent's Normal / Plan execution mode.
@@ -189,20 +228,6 @@ impl LlmConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct MemoryConfig {
-    pub workspace: PathBuf,
-}
-
-impl Default for MemoryConfig {
-    fn default() -> Self {
-        Self {
-            workspace: PathBuf::from(".kb"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
 pub struct AgentConfig {
     /// None means unlimited; zero disables tool execution.
     #[serde(deserialize_with = "deserialize_round_limit")]
@@ -226,7 +251,7 @@ impl Default for AgentConfig {
             max_retries: 5,
             compact_threshold: 40_000,
             subagent_max_rounds: None,
-            session_dir: PathBuf::from(".kb/session"),
+            session_dir: PathBuf::from(".koala/session"),
             memory_file: default_memory_file(),
         }
     }
@@ -254,29 +279,66 @@ where
 
 fn default_memory_file() -> PathBuf {
     dirs::config_dir()
-        .map(|d| d.join("kb-agent").join("memory.md"))
+        .map(|d| d.join("koala").join("memory.md"))
         .unwrap_or_else(|| PathBuf::from("memory.md"))
 }
 
 impl Config {
-    /// First existing file wins: ./config.toml, then ~/.config/kb-agent/config.toml.
-    /// Missing files fall back to defaults; KBA_* env vars override everything.
+    /// First existing file wins: ./config.toml, then ~/.config/koala/config.toml.
+    /// Saved workspace appearance overrides the file; KOALA_* env vars win last.
     pub fn load() -> Result<Self, ConfigError> {
         let mut candidates = vec![PathBuf::from("config.toml")];
         if let Some(dir) = dirs::config_dir() {
-            candidates.push(dir.join("kb-agent").join("config.toml"));
+            candidates.push(dir.join("koala").join("config.toml"));
         }
+        let mut cfg = Self::load_files(&candidates, PathBuf::from(".koala/language.toml"))?;
+        cfg.apply_env();
+        Ok(cfg)
+    }
+
+    pub(crate) fn load_files(
+        candidates: &[PathBuf],
+        language_path: PathBuf,
+    ) -> Result<Self, ConfigError> {
         let mut cfg = Config::default();
         for path in candidates {
             if path.is_file() {
-                let text = fs::read_to_string(&path)
+                let text = fs::read_to_string(path)
                     .map_err(|e| ConfigError::Read(path.display().to_string(), e))?;
                 cfg = toml::from_str(&text)
                     .map_err(|e| ConfigError::Parse(path.display().to_string(), e))?;
                 break;
             }
         }
-        cfg.apply_env();
+        match fs::read_to_string(&language_path) {
+            Ok(text) => {
+                #[derive(Deserialize)]
+                struct LanguagePreference {
+                    lang: Lang,
+                }
+                let preference: LanguagePreference = toml::from_str(&text)
+                    .map_err(|e| ConfigError::Parse(language_path.display().to_string(), e))?;
+                cfg.lang = preference.lang;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(ConfigError::Read(language_path.display().to_string(), e)),
+        }
+        let theme_path = language_path.with_file_name("theme.toml");
+        match fs::read_to_string(&theme_path) {
+            Ok(text) => {
+                #[derive(Deserialize)]
+                struct ThemePreference {
+                    theme: Theme,
+                }
+                let preference: ThemePreference = toml::from_str(&text)
+                    .map_err(|e| ConfigError::Parse(theme_path.display().to_string(), e))?;
+                cfg.theme = preference.theme;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(ConfigError::Read(theme_path.display().to_string(), e)),
+        }
+        cfg.theme_path = Some(theme_path);
+        cfg.language_path = Some(language_path);
         Ok(cfg)
     }
 
@@ -285,27 +347,62 @@ impl Config {
     }
 
     pub fn apply_env_with(&mut self, get: impl Fn(&str) -> Option<String>) {
-        if let Some(v) = get("KBA_BASE_URL") {
+        if let Some(v) = get("KOALA_BASE_URL") {
             self.llm.base_url = v;
         }
-        if let Some(v) = get("KBA_API_KEY") {
+        if let Some(v) = get("KOALA_API_KEY") {
             self.llm.api_key = v;
         }
-        if let Some(v) = get("KBA_MODEL") {
+        if let Some(v) = get("KOALA_MODEL") {
             self.llm.model = v;
         }
-        if let Some(v) = get("KBA_WORKSPACE") {
-            self.memory.workspace = PathBuf::from(v);
+        if let Some(v) = get("KOALA_THEME").and_then(|v| Theme::parse(&v)) {
+            self.theme = v;
         }
-        if let Some(v) = get("KBA_LANG").and_then(|v| Lang::parse(&v)) {
+        if let Some(v) = get("KOALA_LANG").and_then(|v| Lang::parse(&v)) {
             self.lang = v;
         }
     }
 }
 
+/// Replace only the language preference, leaving the user's config untouched.
+/// Rename a complete temporary file so an interrupted write cannot truncate it.
+pub(crate) fn save_language(path: &Path, lang: Lang) -> std::io::Result<()> {
+    save_preference(path, "lang", lang.code())
+}
+
+pub(crate) fn save_theme(path: &Path, theme: Theme) -> std::io::Result<()> {
+    save_preference(path, "theme", theme.code())
+}
+
+fn save_preference(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        fs::write(&temporary, format!("{key} = \"{value}\"\n"))?;
+        fs::rename(&temporary, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_defaults_to_auto_and_validates_config() {
+        assert_eq!(toml::from_str::<Config>("").unwrap().theme, Theme::Auto);
+        for theme in [Theme::Auto, Theme::Light, Theme::Dark] {
+            let cfg: Config = toml::from_str(&format!("theme = \"{}\"", theme.code())).unwrap();
+            assert_eq!(cfg.theme, theme);
+        }
+        assert!(toml::from_str::<Config>("theme = \"invalid\"").is_err());
+    }
 
     #[test]
     fn model_profiles_override_legacy_metadata_without_leaking_to_other_models() {
@@ -357,10 +454,7 @@ api_key = "sk-xxx"
 model = "gpt-4o-mini"
 
 [llm.headers]
-x-opencode-session = "kb-agent"
-
-[memory]
-workspace = ".kb"
+x-opencode-session = "koala"
 
 [agent]
 max_tool_rounds = 2
@@ -374,11 +468,10 @@ max_tool_rounds = 2
                 .headers
                 .get("x-opencode-session")
                 .map(String::as_str),
-            Some("kb-agent")
+            Some("koala")
         );
-        assert_eq!(cfg.memory.workspace, PathBuf::from(".kb"));
         assert_eq!(cfg.agent.max_tool_rounds, Some(2));
-        assert_eq!(cfg.agent.session_dir, PathBuf::from(".kb/session"));
+        assert_eq!(cfg.agent.session_dir, PathBuf::from(".koala/session"));
     }
 
     #[test]
@@ -407,7 +500,6 @@ max_tool_rounds = 2
     fn empty_config_uses_defaults() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.llm.base_url, "https://api.openai.com/v1");
-        assert_eq!(cfg.memory.workspace, PathBuf::from(".kb"));
         assert_eq!(cfg.agent.max_tool_rounds, None);
         assert_eq!(cfg.agent.subagent_max_rounds, None);
         assert_eq!(cfg.agent.max_retries, 5);
@@ -431,10 +523,10 @@ max_tool_rounds = 2
         );
         assert!(toml::from_str::<Config>("lang = \"fr\"").is_err());
         let mut cfg: Config = toml::from_str("lang = \"en\"").unwrap();
-        cfg.apply_env_with(|key| (key == "KBA_LANG").then(|| "zh".to_string()));
+        cfg.apply_env_with(|key| (key == "KOALA_LANG").then(|| "zh".to_string()));
         assert_eq!(cfg.lang, Lang::Zh);
         // An unparsable value is ignored rather than silently switching language.
-        cfg.apply_env_with(|key| (key == "KBA_LANG").then(|| "klingon".to_string()));
+        cfg.apply_env_with(|key| (key == "KOALA_LANG").then(|| "klingon".to_string()));
         assert_eq!(cfg.lang, Lang::Zh);
     }
 
@@ -463,7 +555,6 @@ max_tool_rounds = 2
         let cfg: Config = toml::from_str("[llm]\nmodel = \"qwen3\"\n").unwrap();
         assert_eq!(cfg.llm.model, "qwen3");
         assert_eq!(cfg.llm.base_url, "https://api.openai.com/v1");
-        assert_eq!(cfg.memory.workspace, PathBuf::from(".kb"));
     }
 
     #[test]
@@ -473,16 +564,14 @@ max_tool_rounds = 2
         )
         .unwrap();
         cfg.apply_env_with(|key| match key {
-            "KBA_BASE_URL" => Some("http://b:2/v2".to_string()),
-            "KBA_API_KEY" => Some("k2".to_string()),
-            "KBA_MODEL" => Some("m2".to_string()),
-            "KBA_WORKSPACE" => Some("/tmp/ws".to_string()),
+            "KOALA_BASE_URL" => Some("http://b:2/v2".to_string()),
+            "KOALA_API_KEY" => Some("k2".to_string()),
+            "KOALA_MODEL" => Some("m2".to_string()),
             _ => None,
         });
         assert_eq!(cfg.llm.base_url, "http://b:2/v2");
         assert_eq!(cfg.llm.api_key, "k2");
         assert_eq!(cfg.llm.model, "m2");
-        assert_eq!(cfg.memory.workspace, PathBuf::from("/tmp/ws"));
     }
 
     #[test]
@@ -490,23 +579,5 @@ max_tool_rounds = 2
         let mut cfg: Config = toml::from_str("[llm]\napi_key = \"from-file\"\n").unwrap();
         cfg.apply_env_with(|_| None);
         assert_eq!(cfg.llm.api_key, "from-file");
-    }
-}
-
-/// Extensions are trusted local code. Explicit manifest paths determine order.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct ExtensionsConfig {
-    pub memory: bool,
-    pub manifests: Vec<PathBuf>,
-    pub timeout_secs: u64,
-}
-impl Default for ExtensionsConfig {
-    fn default() -> Self {
-        Self {
-            memory: true,
-            manifests: Vec::new(),
-            timeout_secs: 30,
-        }
     }
 }

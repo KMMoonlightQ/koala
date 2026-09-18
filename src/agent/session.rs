@@ -298,16 +298,16 @@ mod tests {
 
     #[tokio::test]
     async fn language_switch_during_active_turn_updates_backend_without_interrupting() {
-        let root = std::env::temp_dir().join(format!("kb-live-lang-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("koala-live-lang-{}", uuid::Uuid::new_v4()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut cfg = Config::default();
         cfg.llm.model = "test".into();
         cfg.llm.base_url = format!("http://{}", listener.local_addr().unwrap());
-        cfg.extensions.memory = false;
+
         cfg.lang = Lang::En;
         cfg.agent.session_dir = root.join("sessions");
         cfg.agent.memory_file = root.join("memory.md");
-        let agent = Agent::new(&cfg).unwrap();
+        let agent = Agent::new(&cfg).await.unwrap();
         let shared = agent.shared.clone();
         let (handle, mut events) = spawn(agent);
         handle.send(SessionCommand::Submit("first prompt".into()));
@@ -343,7 +343,7 @@ mod tests {
             serde_json::json!({"content": "continued answer"}),
         )])
         .await;
-        let root = std::env::temp_dir().join(format!("kb-resume-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("koala-resume-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("saved.jsonl");
         let old = concat!(
@@ -354,11 +354,11 @@ mod tests {
         let mut cfg = Config::default();
         cfg.llm.model = "test".into();
         cfg.llm.base_url = mock.url.clone();
-        cfg.extensions.memory = false;
+
         cfg.agent.session_dir = root.clone();
         cfg.agent.memory_file = root.join("memory.md");
         cfg.permissions.mode = PermissionMode::NeverAsk;
-        let agent = Agent::new(&cfg).unwrap();
+        let agent = Agent::new(&cfg).await.unwrap();
         let shared = agent.shared.clone();
         let (session, mut events) = spawn(agent);
         session.send(SessionCommand::ShowSessions);
@@ -405,9 +405,9 @@ mod tests {
         use crate::config::PermissionMode;
         let mut cfg = Config::default();
         cfg.llm.model = "test".into();
-        cfg.extensions.memory = false;
+
         cfg.permissions.mode = PermissionMode::AskWhenNeed;
-        let agent = Agent::new(&cfg).unwrap();
+        let agent = Agent::new(&cfg).await.unwrap();
         let shared = agent.shared.clone();
         let (session, mut events) = spawn(agent);
         receive_until(&mut events, |e| {
@@ -450,10 +450,10 @@ mod tests {
         let mut cfg = Config::default();
         cfg.llm.model = "test".into();
         cfg.llm.base_url = mock.url.clone();
-        cfg.extensions.memory = false;
+
         cfg.agent.memory_file = root.join("memory.md");
         cfg.agent.session_dir = root.join("sessions");
-        let (session, mut events) = spawn(Agent::new(&cfg).unwrap());
+        let (session, mut events) = spawn(Agent::new(&cfg).await.unwrap());
         for expected in [Some(120_000), Some(20_500), None] {
             session.send(SessionCommand::Submit("hi".into()));
             let usage = timeout(Duration::from_secs(3), async {
@@ -486,17 +486,17 @@ mod tests {
     async fn effort_selection_updates_requests_and_rejects_unsupported_values() {
         use crate::test_support::{MockLlm, stream};
         let mut mock = MockLlm::start(vec![stream(serde_json::json!({"content": "ok"})); 2]).await;
-        let root = std::env::temp_dir().join(format!("kb-effort-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("koala-effort-{}", uuid::Uuid::new_v4()));
         let mut cfg = Config::default();
         cfg.llm.model = "test".into();
         cfg.llm.base_url = mock.url.clone();
         cfg.llm.reasoning_efforts = vec!["low".into(), "high".into()];
         cfg.lang = crate::i18n::Lang::Zh;
         cfg.llm.context_window = std::num::NonZeroU64::new(128000);
-        cfg.extensions.memory = false;
+
         cfg.agent.memory_file = root.join("memory.md");
         cfg.agent.session_dir = root.join("sessions");
-        let (session, mut events) = spawn(Agent::new(&cfg).unwrap());
+        let (session, mut events) = spawn(Agent::new(&cfg).await.unwrap());
         receive_until(&mut events, |e| matches!(e, UiEvent::ModelSettings { reasoning_effort: Some(v), context_window: Some(128000), .. } if v == "low")).await;
         session.send(SessionCommand::Submit("first".into()));
         receive_until(&mut events, |e| matches!(e, UiEvent::Done)).await;
@@ -525,7 +525,7 @@ mod tests {
         use crate::config::ModelConfig;
         use crate::test_support::{MockLlm, stream};
         let mut mock = MockLlm::start(vec![stream(serde_json::json!({"content": "ok"})); 3]).await;
-        let root = std::env::temp_dir().join(format!("kb-model-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("koala-model-{}", uuid::Uuid::new_v4()));
         let mut cfg = Config::default();
         cfg.llm.model = "reasoner".into();
         cfg.llm.base_url = mock.url.clone();
@@ -537,10 +537,10 @@ mod tests {
             ..Default::default()
         }];
         cfg.lang = crate::i18n::Lang::Zh;
-        cfg.extensions.memory = false;
+
         cfg.agent.memory_file = root.join("memory.md");
         cfg.agent.session_dir = root.join("sessions");
-        let (session, mut events) = spawn(Agent::new(&cfg).unwrap());
+        let (session, mut events) = spawn(Agent::new(&cfg).await.unwrap());
         session.send(SessionCommand::Submit("KEEP_THIS_HISTORY".into()));
         receive_until(&mut events, |e| matches!(e, UiEvent::Done)).await;
         assert_eq!(mock.request().await["model"], "reasoner");
@@ -622,14 +622,15 @@ mod tests {
     }
 
     async fn interrupted_stream(reset: bool) {
-        let root = std::env::temp_dir().join(format!("kb-session-test-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("koala-session-test-{}", uuid::Uuid::new_v4()));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut cfg = Config::default();
         cfg.llm.model = "test".into();
         cfg.llm.base_url = format!("http://{}", listener.local_addr().unwrap());
         cfg.agent.session_dir = root.join("sessions");
         cfg.agent.memory_file = root.join("memory.md");
-        let (handle, mut events) = spawn(Agent::new(&cfg).unwrap());
+        let (handle, mut events) = spawn(Agent::new(&cfg).await.unwrap());
         handle.send(SessionCommand::Submit("first prompt".into()));
         let (mut first, _) = timeout(Duration::from_secs(3), listener.accept())
             .await
@@ -689,7 +690,7 @@ mod tests {
     }
     #[tokio::test]
     async fn task_controls_remain_responsive_while_foreground_owns_agent() {
-        let root = std::env::temp_dir().join(format!("kb-controls-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("koala-controls-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let marker = root.join("started");
         let mut cfg = Config::default();
@@ -697,7 +698,7 @@ mod tests {
         cfg.agent.session_dir = root.join("sessions");
         cfg.agent.memory_file = root.join("memory.md");
         cfg.hooks.turn_start = vec![format!("touch '{}'; sleep 30", marker.display())];
-        let agent = Agent::new(&cfg).unwrap();
+        let agent = Agent::new(&cfg).await.unwrap();
         let background = agent.background.clone();
         let id = background.register("task", "pending");
         background.attach(id, tokio::spawn(std::future::pending::<()>()));

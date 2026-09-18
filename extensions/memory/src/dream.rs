@@ -1,6 +1,6 @@
-use crate::extensions::memory::distill::slugify;
-use crate::extensions::memory::{BUCKET_NAMES, Catalog, FileStore, MemoryError, tools};
+use crate::distill::slugify;
 use crate::llm::{LlmClient, LlmError, Message};
+use crate::{BUCKET_NAMES, Catalog, FileStore, MemoryError, tools};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
@@ -283,7 +283,7 @@ mod tests {
             vec![write_reply("outside/a"), reply(Message::assistant("done"))],
             vec![write_reply("digest/wiki/a"); MAX_UNIT_ROUNDS],
         ] {
-            let root = std::env::temp_dir().join(format!("kb-dream-{}", uuid::Uuid::new_v4()));
+            let root = std::env::temp_dir().join(format!("koala-dream-{}", uuid::Uuid::new_v4()));
             let mut store = FileStore::open(&root).unwrap();
             store.write_file("daily/a.md", "daily fact").unwrap();
             let mut script = vec![reply(Message::assistant(
@@ -302,7 +302,7 @@ mod tests {
     #[tokio::test]
     async fn partial_failure_stays_pending_and_reports_actual_write_path() {
         use crate::test_support::{MockLlm, reply};
-        let root = std::env::temp_dir().join(format!("kb-dream-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("koala-dream-{}", uuid::Uuid::new_v4()));
         let mut store = FileStore::open(&root).unwrap();
         store.write_file("daily/a.md", "two facts").unwrap();
         let mock = MockLlm::start(vec![
@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn list_daily_collects_relative_paths() {
-        let dir = std::env::temp_dir().join(format!("kb-agent-dream-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!("koala-dream-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(dir.join("daily/2026-09-17")).unwrap();
         fs::write(dir.join("daily/2026-09-17/a.md"), "x").unwrap();
         fs::write(dir.join("daily/2026-09-17.md"), "index").unwrap();

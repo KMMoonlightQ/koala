@@ -366,7 +366,10 @@ mod tests {
             );
             assert_eq!(
                 catalog.policy(
-                    &Permissions::new(&PermissionsConfig::default()),
+                    &Permissions::new(&PermissionsConfig {
+                        mode: PermissionMode::Normal,
+                        ..Default::default()
+                    }),
                     "mcp__local__echo",
                     &json!({})
                 ),

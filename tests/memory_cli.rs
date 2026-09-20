@@ -6,14 +6,20 @@ struct Workspace(PathBuf);
 impl Workspace {
     fn new() -> Self {
         let root = std::env::temp_dir().join(format!("koala-memory-cli-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("home/.koala")).unwrap();
+        std::fs::write(
+            root.join("home/.koala/config.toml"),
+            format!(
+                "[agent]\nmemory_file = {}\n",
+                serde_json::to_string(&root.join("memory.json")).unwrap()
+            ),
+        )
+        .unwrap();
         for project in ["a", "b"] {
             std::fs::create_dir_all(root.join(project)).unwrap();
             std::fs::write(
                 root.join(project).join("config.toml"),
-                format!(
-                    "[agent]\nmemory_file = {}\n",
-                    serde_json::to_string(&root.join("memory.json")).unwrap()
-                ),
+                "invalid old project config [",
             )
             .unwrap();
         }
@@ -21,6 +27,8 @@ impl Workspace {
     }
     fn run(&self, project: &str, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_koala"))
+            .env("HOME", self.0.join("home"))
+            .env("USERPROFILE", self.0.join("home"))
             .current_dir(self.0.join(project))
             .arg("memory")
             .args(args)
@@ -66,6 +74,7 @@ fn cli_curates_without_an_llm_and_preserves_legacy_notes() {
             "用户明确要求",
         ],
     );
+    assert!(w.0.join("memory.json").is_file());
     assert_eq!(w.json("a", &["get", "language"])["details"], "用户明确要求");
     assert_eq!(w.json("b", &["list"]), serde_json::json!([]));
     w.json(

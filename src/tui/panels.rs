@@ -13,6 +13,7 @@ pub(super) fn dialog_chrome(app: &App) -> Option<(&'static str, &'static str)> {
     let lang = app.lang;
     let t = |key| i18n::text(lang, key);
     match app.panel {
+        Some(Panel::Graph(_)) => Some((t(Key::PanelGraph), t(Key::HintGraph))),
         Some(Panel::Sessions { .. }) => {
             Some((t(Key::PanelSessions), t(Key::HintSelectResumeCancel)))
         }
@@ -49,6 +50,7 @@ fn dialog_list_title(panel: &Option<Panel>) -> Key {
 /// its content instead of stretching to the full transcript height.
 pub(super) fn content_height(app: &App) -> usize {
     match &app.panel {
+        Some(Panel::Graph(_)) => 28,
         Some(Panel::Sessions { .. }) => (app.sessions.len() * 2).clamp(1, 16),
         Some(Panel::Theme { .. }) => super::Theme::ALL.len(),
         Some(Panel::Permissions { .. }) => super::PermissionMode::ALL.len(),
@@ -83,6 +85,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     match app.panel.as_mut() {
+        Some(Panel::Graph(view)) => super::graph::draw(f, &app.graph, view, area, app.lang),
         Some(Panel::Sessions { selected, loading }) => {
             if *loading || app.sessions.is_empty() {
                 f.render_widget(
@@ -438,7 +441,8 @@ fn render_scrolled(f: &mut Frame, lines: Vec<Line<'static>>, scroll: &mut usize,
 }
 
 pub(super) fn menu_matches(app: &App) -> Vec<usize> {
-    if app.menu_dismissed
+    if app.temporary
+        || app.menu_dismissed
         || app.panel.is_some()
         || app.transcript.detailed()
         || app.permission.is_some()

@@ -30,6 +30,13 @@ pub(super) fn toggle_mode(app: &mut App) {
 
 /// Higher priority than composer shortcuts, lower priority than permissions.
 pub(super) fn handle_key(app: &mut App, key: KeyEvent) -> bool {
+    if app.temporary {
+        if key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            app.input.insert_newline();
+            return true;
+        }
+        return false;
+    }
     if app.permission.is_some() {
         return false;
     }
@@ -115,6 +122,39 @@ fn panel_key(app: &mut App, key: KeyEvent) -> bool {
         close_panel(app);
         return true;
     }
+    if let Some(Panel::Graph(view)) = &mut app.panel {
+        if matches!(key.code, KeyCode::Char('r') | KeyCode::Enter)
+            && !ctrl
+            && super::graph::browsing(view)
+            && super::graph::retry_turn(view, &app.graph).is_some()
+        {
+            if app.busy {
+                app.hint = Some(i18n::text(app.lang, Key::NoteBusyInterruptFirst).into());
+            } else if let Some(id) = super::graph::retry_turn(view, &app.graph) {
+                if app.input.is_empty() {
+                    app.session.send(if key.code == KeyCode::Enter {
+                        SessionCommand::ContinueAfterTurn(id)
+                    } else {
+                        SessionCommand::BranchBeforeTurn(id)
+                    });
+                } else {
+                    app.hint = Some(
+                        if app.lang == crate::i18n::Lang::Zh {
+                            "请先处理输入框中的草稿"
+                        } else {
+                            "Please finish or clear the current draft first"
+                        }
+                        .into(),
+                    );
+                }
+            }
+            return true;
+        }
+        if super::graph::handle_key(view, &app.graph, key) {
+            close_panel(app);
+        }
+        return true;
+    }
     if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('c')) {
         if let Some(Panel::Tasks { output, scroll, .. }) = &mut app.panel
             && *output
@@ -127,6 +167,7 @@ fn panel_key(app: &mut App, key: KeyEvent) -> bool {
         return true;
     }
     match app.panel.as_mut().unwrap() {
+        Panel::Graph(_) => unreachable!(),
         Panel::Sessions { selected, loading } => match key.code {
             KeyCode::Up => *selected = selected.saturating_sub(1),
             KeyCode::Down => *selected = (*selected + 1).min(app.sessions.len().saturating_sub(1)),
@@ -153,7 +194,7 @@ fn panel_key(app: &mut App, key: KeyEvent) -> bool {
         },
         Panel::Permissions { selected } => match key.code {
             KeyCode::Up => *selected = selected.saturating_sub(1),
-            KeyCode::Down => *selected = (*selected + 1).min(2),
+            KeyCode::Down => *selected = (*selected + 1).min(super::PermissionMode::ALL.len() - 1),
             KeyCode::Enter => {
                 app.session.send(SessionCommand::SetPermissionMode(
                     super::PermissionMode::ALL[*selected],

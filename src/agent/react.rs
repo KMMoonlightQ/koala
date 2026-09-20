@@ -1,5 +1,6 @@
 use super::AgentError;
 use super::event::UiEvent;
+use super::graph::{Kind, Status};
 use super::hooks::{self, HookOutcome};
 use super::permissions::Policy;
 use super::tools::{self, ToolCatalog, ToolContext};
@@ -23,13 +24,14 @@ pub async fn run(
     let tool_defs = registry.definitions_for_mode(ctx.plan_mode);
     let resources = prompt::PromptResources::load(
         std::env::current_dir()?,
-        dirs::config_dir().map(|path| path.join("koala")).as_deref(),
+        crate::config::koala_dir().ok().as_deref(),
     )?;
 
     // Allow one final model response after the last permitted tool round,
     // but never execute tools beyond the configured budget.
     let mut remaining = max_rounds;
     let mut compact_attempts = 0;
+    let mut inputs = Vec::new();
     loop {
         let memory = ctx
             .agent_memory
@@ -129,8 +131,28 @@ pub async fn run(
             } else {
                 1
             };
-            let changed =
-                super::compact::compact_keeping(&ctx.shared.llm, &mut history, keep, limit).await?;
+            let mut compact = ctx
+                .graph
+                .as_ref()
+                .map(|r| {
+                    r.start(
+                        Kind::Compaction,
+                        "Automatic compaction",
+                        serde_json::json!({"before": history, "keep": keep}),
+                        inputs.clone(),
+                    )
+                })
+                .transpose()?;
+            let outcome =
+                super::compact::compact_keeping(&ctx.shared.llm, &mut history, keep, limit).await;
+            if let Some(span) = &mut compact {
+                span.finish(if outcome.is_ok() { Status::Succeeded } else { Status::Failed },
+                    serde_json::json!({"after": history, "changed": outcome.as_ref().ok(), "error": outcome.as_ref().err().map(ToString::to_string)}))?;
+                if outcome.as_ref().is_ok_and(|changed| *changed) {
+                    inputs = vec![span.node.id.clone()];
+                }
+            }
+            let changed = outcome?;
             if changed {
                 *messages = history;
                 checkpoint(ctx, messages)?;
@@ -148,23 +170,46 @@ pub async fn run(
             continue;
         }
         compact_attempts = 0;
-        let mut stream = connect_with_retry(ctx, &request, &tool_defs).await?;
-        let mut agg = DeltaAggregator::default();
-        while let Some(delta) = stream.next().await {
-            let delta = delta?;
-            if ctx.depth == 0
-                && let Some(usage) = &delta.usage
-            {
-                let _ = ctx.events.send(UiEvent::ContextUsage(Some(
-                    usage.prompt_tokens.saturating_add(usage.completion_tokens),
-                )));
-            }
-            if let Some(content) = &delta.content {
-                emit(ctx, UiEvent::Text(content.clone()))?;
-            }
-            agg.push(&delta);
+        let mut model = ctx.graph.as_ref().map(|r| r.start(Kind::Model, ctx.shared.llm.model(),
+            serde_json::json!({"messages": request, "tools": tool_defs, "model": ctx.shared.llm.model(),
+                "reasoning_effort": ctx.shared.llm.reasoning_effort()}), inputs.clone())).transpose()?;
+        let run_graph = ctx.graph.clone();
+        if let Some(model) = &model {
+            ctx.graph = Some(model.recorder());
         }
-        let assistant = agg.into_message();
+        let response = async {
+            let mut stream = connect_with_retry(ctx, &request, &tool_defs).await?;
+            let mut agg = DeltaAggregator::default();
+            let mut usage = serde_json::Value::Null;
+            while let Some(delta) = stream.next().await {
+                let delta = delta?;
+                if let Some(u) = &delta.usage {
+                    usage = serde_json::json!({"input_tokens": u.prompt_tokens, "output_tokens": u.completion_tokens});
+                    if ctx.depth == 0 {
+                        let _ = ctx.events.send(UiEvent::ContextUsage(Some(u.prompt_tokens.saturating_add(u.completion_tokens))));
+                        let _ = ctx.events.send(UiEvent::TokenUsage(u.clone()));
+                    }
+                }
+                if let Some(content) = &delta.content { emit(ctx, UiEvent::Text(content.clone()))?; }
+                agg.push(&delta);
+            }
+            Ok::<_, AgentError>((agg.into_message(), usage))
+        }.await;
+        ctx.graph = run_graph;
+        if let Some(model) = &mut model {
+            model.finish(
+                if response.is_ok() {
+                    Status::Succeeded
+                } else {
+                    Status::Failed
+                },
+                match &response {
+                    Ok((message, usage)) => serde_json::json!({"message": message, "usage": usage}),
+                    Err(e) => serde_json::json!({"error": e.to_string()}),
+                },
+            )?;
+        }
+        let (assistant, _) = response?;
         ctx.shared.extensions.hook(Stage::AfterModel,
             serde_json::json!({"message": assistant, "depth": ctx.depth, "plan_mode": ctx.plan_mode})).await.map_err(AgentError::Extension)?;
         messages.push(assistant.clone());
@@ -179,11 +224,20 @@ pub async fn run(
             }
             *rounds -= 1;
         }
+        let parent = ctx.graph.clone();
+        if let Some(model) = &model {
+            ctx.graph = Some(model.recorder());
+        }
+        inputs.clear();
         for call in calls {
-            let result = execute_one(ctx, &registry, call).await;
+            let (result, node_id) = execute_recorded(ctx, &registry, call).await;
+            if let Some(id) = node_id {
+                inputs.push(id);
+            }
             messages.push(Message::tool(call.id.clone(), result.content));
             checkpoint(ctx, messages)?;
         }
+        ctx.graph = parent;
     }
 }
 
@@ -261,7 +315,12 @@ async fn connect_with_retry(
     tool_defs: &[crate::llm::Tool],
 ) -> Result<crate::llm::BoxedDeltaStream, AgentError> {
     let mut delays = retry::backoff_delays(ctx.shared.max_retries).into_iter();
+    let mut attempts = 0;
     loop {
+        attempts += 1;
+        if let Some(graph) = &ctx.graph {
+            graph.annotate("connection_attempts", serde_json::json!(attempts))?;
+        }
         match ctx.shared.llm.chat_stream(messages, Some(tool_defs)).await {
             Ok(stream) => return Ok(stream),
             Err(e) if retry::is_retryable(&e) => match delays.next() {
@@ -271,6 +330,30 @@ async fn connect_with_retry(
             Err(e) => return Err(e.into()),
         }
     }
+}
+
+async fn execute_recorded(
+    ctx: &mut ToolContext<'_>,
+    registry: &ToolCatalog,
+    call: &ToolCall,
+) -> (tools::ToolResult, Option<String>) {
+    let mut span = match ctx.graph.as_ref().map(|r| r.start(Kind::Tool, &call.function.name,
+        serde_json::json!({"provider_call_id": call.id, "arguments": call.function.arguments}), vec![])).transpose() {
+        Ok(span) => span, Err(e) => return (tools::ToolResult::err(format!("graph write failed: {e}")), None),
+    };
+    let id = span.as_ref().map(|s| s.node.id.clone());
+    let parent = ctx.graph.clone();
+    if let Some(span) = &span {
+        ctx.graph = Some(span.recorder());
+    }
+    let result = execute_one(ctx, registry, call).await;
+    ctx.graph = parent;
+    if let Some(span) = &mut span
+        && let Err(e) = span.finish(if result.is_error { Status::Failed } else { Status::Succeeded },
+            serde_json::json!({"model_output": result.content, "display_output": result.display_content})) {
+            let _ = ctx.events.send(UiEvent::Note(format!("graph write failed: {e}")));
+        }
+    (result, id)
 }
 
 async fn execute_one(
@@ -350,6 +433,11 @@ async fn execute_checked(
         }
         Err(reason) => return tools::ToolResult::err(reason),
     }
+    if let Some(graph) = &ctx.graph
+        && let Err(e) = graph.annotate("effective_arguments", args.clone())
+    {
+        return tools::ToolResult::err(e.to_string());
+    }
     let payload = serde_json::json!({
         "hook": "pre_tool_use",
         "tool": name,
@@ -373,8 +461,18 @@ async fn execute_checked(
         ));
     }
     match registry.policy(&ctx.shared.permissions, name, &args) {
-        Policy::Deny => return tools::ToolResult::err(format!("permission denied: {name}")),
+        Policy::Deny => {
+            if let Some(graph) = &ctx.graph {
+                let _ = graph.annotate("permission", serde_json::json!("rejected"));
+            }
+            return tools::ToolResult::err(format!("permission denied: {name}"));
+        }
         Policy::Ask => {
+            if let Some(graph) = &ctx.graph
+                && let Err(e) = graph.annotate("permission", serde_json::json!("waiting"))
+            {
+                return tools::ToolResult::err(e.to_string());
+            }
             let summary = tools::summarize_args(name, &arguments);
             let (tx, rx) = tokio::sync::oneshot::channel();
             let _ = ctx.events.send(UiEvent::PermissionRequest {
@@ -383,13 +481,26 @@ async fn execute_checked(
             });
             match rx.await {
                 Ok(true) => {}
-                _ => return tools::ToolResult::err(format!("user rejected: {name}")),
+                _ => {
+                    if let Some(graph) = &ctx.graph {
+                        let _ = graph.annotate("permission", serde_json::json!("rejected"));
+                    }
+                    return tools::ToolResult::err(format!("user rejected: {name}"));
+                }
             }
         }
         Policy::Allow => {}
     }
 
+    if let Some(graph) = &ctx.graph
+        && let Err(e) = graph.annotate("permission", serde_json::json!("allowed"))
+    {
+        return tools::ToolResult::err(e.to_string());
+    }
     let result = registry.execute(ctx, name, args).await;
+    if let Some(graph) = &ctx.graph && let Err(e) = graph.annotate("tool_result", serde_json::json!({"content": result.content, "display_content": result.display_content, "is_error": result.is_error})) {
+        let _ = ctx.events.send(UiEvent::Note(format!("graph write failed: {e}")));
+    }
 
     let payload = serde_json::json!({
         "hook": "post_tool_use",
@@ -411,12 +522,32 @@ mod tests {
     use crate::config::Config;
     use crate::llm::FunctionCall;
 
+    // Tool execution also persists a work journal: never use the user's session directory.
+    struct TestStorage(std::path::PathBuf);
+
+    impl TestStorage {
+        fn new(cfg: &mut Config) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("koala-react-test-{}", uuid::Uuid::new_v4()));
+            cfg.agent.session_dir = root.join("sessions");
+            cfg.agent.memory_file = root.join("memory.md");
+            Self(root)
+        }
+    }
+
+    impl Drop for TestStorage {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     async fn execute(
         policy: &str,
         command: &str,
         silent: bool,
     ) -> (tools::ToolResult, Vec<UiEvent>) {
         let mut cfg = Config::default();
+        let _storage = TestStorage::new(&mut cfg);
         cfg.llm.model = "test".into();
         cfg.permissions.mode = if policy == "allow" {
             crate::config::PermissionMode::NeverAsk
@@ -426,8 +557,6 @@ mod tests {
         if policy == "deny" {
             cfg.permissions.deny.push("bash".into());
         }
-        cfg.agent.memory_file =
-            std::env::temp_dir().join(format!("koala-unused-{}", uuid::Uuid::new_v4()));
         let mut agent = Agent::new(&cfg).await.unwrap();
         let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let events = if silent {
@@ -436,6 +565,7 @@ mod tests {
             events
         };
         let mut ctx = ToolContext {
+            graph: None,
             todos: &mut agent.todos,
             agent_memory: &agent.agent_memory,
             background: agent.background.clone(),
@@ -466,6 +596,7 @@ mod tests {
     async fn approval_response_controls_side_effects_and_mode_switches_apply() {
         use crate::config::PermissionMode;
         let mut cfg = Config::default();
+        let _storage = TestStorage::new(&mut cfg);
         cfg.llm.model = "test".into();
 
         let marker = std::env::temp_dir().join(format!("koala-approval-{}", uuid::Uuid::new_v4()));
@@ -473,6 +604,7 @@ mod tests {
         let (events, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let shared = agent.shared.clone();
         let mut ctx = ToolContext {
+            graph: None,
             todos: &mut agent.todos,
             agent_memory: &agent.agent_memory,
             background: agent.background.clone(),
@@ -540,12 +672,14 @@ mod tests {
             .join(format!(".koala-file-policy-{}", uuid::Uuid::new_v4()));
         let path = root.join("file.txt");
         let mut cfg = Config::default();
+        let _storage = TestStorage::new(&mut cfg);
         cfg.llm.model = "test".into();
         cfg.permissions.mode = crate::config::PermissionMode::AskWhenNeed;
         cfg.permissions.deny.push("write".into());
         let mut agent = Agent::new(&cfg).await.unwrap();
         let events = crate::agent::event::null_events();
         let mut ctx = ToolContext {
+            graph: None,
             todos: &mut agent.todos,
             agent_memory: &agent.agent_memory,
             background: agent.background.clone(),
@@ -583,7 +717,11 @@ mod tests {
         );
         assert!(!path.exists());
         ctx.plan_mode = false;
-        assert!(!execute_one(&mut ctx, &registry, &write).await.is_error);
+        let blocked = execute_one(&mut ctx, &registry, &write).await;
+        assert!(blocked.content.contains("permission denied"));
+        assert!(!path.exists());
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(&path, "original").unwrap();
         let edit = call(
             "edit",
             serde_json::json!({"path":path, "edits":[{"oldText":"original","newText":"updated"}]}),
@@ -664,6 +802,7 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("koala-ext-plan-{}", uuid::Uuid::new_v4()));
         let mut cfg = Config::default();
+        let _storage = TestStorage::new(&mut cfg);
         cfg.llm.model = "test".into();
         std::fs::create_dir_all(&directory).unwrap();
         let manifest = directory.join("extension.toml");
@@ -689,6 +828,7 @@ read_only = true
         let mut agent = Agent::new(&cfg).await.unwrap();
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut ctx = ToolContext {
+            graph: None,
             todos: &mut agent.todos,
             agent_memory: &agent.agent_memory,
             background: agent.background.clone(),
@@ -724,6 +864,7 @@ read_only = true
         cfg.permissions.deny.push("test_search".into());
         let mut denied_agent = Agent::new(&cfg).await.unwrap();
         let mut denied_ctx = ToolContext {
+            graph: None,
             todos: &mut denied_agent.todos,
             agent_memory: &denied_agent.agent_memory,
             background: denied_agent.background.clone(),

@@ -63,12 +63,44 @@ impl Tool for Bash {
             if background {
                 let id = ctx.background.register("bash", &command);
                 let bg = ctx.background.clone();
+                let mut span = match ctx
+                    .graph
+                    .as_ref()
+                    .map(|r| {
+                        r.start(
+                            super::super::graph::Kind::Background,
+                            format!("bash #{id}"),
+                            serde_json::json!({"task_id": id, "command": command}),
+                            vec![],
+                        )
+                    })
+                    .transpose()
+                {
+                    Ok(span) => span,
+                    Err(e) => {
+                        ctx.background.finish(id, false, e.to_string());
+                        return ToolResult::err(e.to_string());
+                    }
+                };
                 let handle = tokio::spawn(async move {
                     let outcome = run_command(&command, Duration::from_secs(3600)).await;
                     let (success, output) = match outcome {
                         Ok(o) => (o.success, o.text),
                         Err(e) => (false, e),
                     };
+                    if let Some(span) = &mut span
+                        && let Err(e) = span.finish(
+                            if success {
+                                super::super::graph::Status::Succeeded
+                            } else {
+                                super::super::graph::Status::Failed
+                            },
+                            serde_json::json!({"output": output}),
+                        )
+                    {
+                        bg.finish(id, false, format!("{output}\ngraph write failed: {e}"));
+                        return;
+                    }
                     bg.finish(id, success, output);
                 });
                 ctx.background.attach(id, handle);

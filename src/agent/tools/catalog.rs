@@ -1,5 +1,7 @@
 //! One tool directory for definitions, capabilities and execution ownership.
-use super::{Tool, ToolContext, ToolResult, background, bash, files, remember, skill, task, todo};
+use super::{
+    Tool, ToolContext, ToolResult, background, bash, files, remember, search, skill, task, todo,
+};
 use crate::agent::permissions::{Permissions, Policy};
 use crate::extensions::{Extension, Extensions};
 use serde_json::Value;
@@ -42,6 +44,18 @@ static BUILTINS: &[Builtin] = &[
     },
     Builtin {
         tool: &files::Read,
+        plan_allowed: true,
+        approval: Approval::Always,
+        root_only: false,
+    },
+    Builtin {
+        tool: &search::Glob,
+        plan_allowed: true,
+        approval: Approval::Always,
+        root_only: false,
+    },
+    Builtin {
+        tool: &search::Grep,
         plan_allowed: true,
         approval: Approval::Always,
         root_only: false,
@@ -279,19 +293,24 @@ fn workspace_edit(root: &std::path::Path, path: &str) -> bool {
     }
 }
 
-/// Deliberately narrow: no shell operators, expansion, quoting, scripts or
-/// extensible commands. Anything outside this subset goes through approval.
+/// Parse literal arguments, but leave shell evaluation and extensible commands
+/// to explicit approval. Reject expansion/operators even inside quotes so this
+/// classifier does not need to emulate shell evaluation.
 fn read_only_shell(command: &str) -> bool {
     if !command
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || " /._-".contains(c))
+        .all(|c| c.is_alphanumeric() || " /._-\t\"'\\:@%,+=".contains(c))
     {
         return false;
     }
-    let mut words = command.split_whitespace();
+    let Some(words) = shlex::split(command) else {
+        return false;
+    };
     matches!(
-        words.next(),
-        Some("pwd" | "ls" | "cat" | "head" | "tail" | "wc")
+        words.first().map(String::as_str),
+        Some(
+            "pwd" | "ls" | "cat" | "head" | "tail" | "wc" | "du" | "stat" | "basename" | "dirname"
+        )
     )
 }
 
@@ -358,6 +377,7 @@ mod tests {
         assert!(!names.iter().any(|name| name == "task"));
         let events = crate::agent::event::null_events();
         let mut ctx = ToolContext {
+            graph: None,
             todos: &mut agent.todos,
             agent_memory: &agent.agent_memory,
             background: agent.background.clone(),
@@ -403,6 +423,8 @@ mod tests {
         });
         for (name, args, policy, plan) in [
             ("read", json!({}), Policy::Allow, true),
+            ("glob", json!({}), Policy::Allow, true),
+            ("grep", json!({}), Policy::Allow, true),
             ("edit", json!({}), Policy::Ask, false),
             ("write", json!({}), Policy::Ask, false),
             ("remember", json!({}), Policy::Allow, false),
@@ -515,6 +537,34 @@ mod tests {
             Policy::Ask
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shell_read_only_commands_support_literal_quoted_and_unicode_paths() {
+        for command in [
+            "ls -la '我的 文档'",
+            "cat \"path with spaces.txt\"",
+            "head -n 20 中文.txt",
+            r"cat path\ with\ spaces.txt",
+            "du -sh 'my directory'",
+            "stat README.md",
+            "basename '/tmp/my file.txt'",
+            "dirname /tmp/file",
+        ] {
+            assert!(read_only_shell(command), "{command:?}");
+        }
+        for command in [
+            "cat 'unfinished",
+            "cat \"$(touch pwned)\"",
+            "ls /tmp; touch marker",
+            "file -C",
+            "sort -o output input",
+            "rg --pre sh pattern",
+            "git diff",
+            "cat foo\nls",
+        ] {
+            assert!(!read_only_shell(command), "{command:?}");
+        }
     }
 
     #[test]

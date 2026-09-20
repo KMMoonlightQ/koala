@@ -1,5 +1,7 @@
 use crate::config::{PermissionMode, Theme};
+mod btw;
 mod controls;
+mod graph;
 mod input;
 mod logo;
 mod markdown;
@@ -14,7 +16,9 @@ use crate::agent::event::{SessionCommand, TaskView, UiEvent};
 use crate::agent::session::{self, SessionHandle};
 use crate::config::Config;
 use crate::i18n::{self, Key, Lang};
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+};
 use futures_util::StreamExt;
 use ratatui::style::Style;
 #[cfg(test)]
@@ -28,6 +32,7 @@ use tui_textarea::TextArea;
 use view::draw;
 
 enum Panel {
+    Graph(graph::View),
     Theme {
         selected: usize,
     },
@@ -71,10 +76,14 @@ struct PermissionPrompt {
 /// UI state only; all agent operations go through SessionCommand / UiEvent.
 struct App {
     session: SessionHandle,
+    btw: Option<btw::Conversation>,
+    temporary: bool,
     history: input::History,
     menu_selected: usize,
     menu_dismissed: bool,
     panel: Option<Panel>,
+    graph: crate::agent::graph::Graph,
+    graph_received: Instant,
     tasks: Vec<TaskView>,
     sessions: Vec<crate::agent::transcripts::SessionView>,
     tasks_received: Instant,
@@ -84,6 +93,7 @@ struct App {
     reasoning_effort: Option<String>,
     context_window: Option<u64>,
     context_used: Option<u64>,
+    token_usage: Option<crate::llm::TokenUsage>,
     directory: String,
     plan_mode: bool,
     permission_mode: PermissionMode,
@@ -116,10 +126,14 @@ impl App {
     fn new(session: SessionHandle) -> Self {
         Self {
             session,
+            btw: None,
+            temporary: false,
             history: input::History::default(),
             menu_selected: 0,
             menu_dismissed: false,
             panel: None,
+            graph: Default::default(),
+            graph_received: Instant::now(),
             tasks: Vec::new(),
             sessions: Vec::new(),
             tasks_received: Instant::now(),
@@ -129,6 +143,7 @@ impl App {
             reasoning_effort: None,
             context_window: None,
             context_used: None,
+            token_usage: None,
             directory: String::new(),
             plan_mode: false,
             permission_mode: PermissionMode::Normal,
@@ -221,12 +236,19 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
         ))),
     }
     let mut terminal = ratatui::init();
-    let result =
-        match crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste) {
-            Ok(()) => event_loop(&mut terminal, &mut app, events).await,
-            Err(e) => Err(e.into()),
-        };
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+    let result = match crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableMouseCapture
+    ) {
+        Ok(()) => event_loop(&mut terminal, &mut app, events).await,
+        Err(e) => Err(e.into()),
+    };
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste
+    );
     app.session.send(SessionCommand::Shutdown);
     ratatui::restore();
     result
@@ -244,19 +266,34 @@ async fn event_loop(
         terminal.draw(|f| draw(f, app))?;
         tokio::select! {
             key = keys.next() => match key {
-                Some(Ok(Event::Key(key))) if key.kind != KeyEventKind::Release => handle_key(app, key),
-                Some(Ok(Event::Paste(text))) => handle_paste(app, &text),
+                Some(Ok(event)) => handle_terminal_event(app, event),
                 Some(Err(e)) => return Err(e.into()),
                 None => app.quit = true,
-                _ => {}
+            },
+            ev = btw::next_event(&mut app.btw) => {
+                if let Some(side) = &mut app.btw {
+                    match ev {
+                        Some(ev) => handle_ui_event(&mut side.app, ev),
+                        None => {
+                            side.app.finish();
+                            side.app.hint = Some(i18n::text(side.app.lang, Key::BtwClosed).into());
+                        }
+                    }
+                }
             },
             ev = events.recv() => match ev {
                 Some(ev) => handle_ui_event(app, ev),
                 None => return Ok(()),
             },
-            _ = tick.tick(), if app.busy || matches!(app.panel, Some(Panel::Tasks { .. })) => {}
+            _ = tick.tick(), if app.busy || app.btw.as_ref().is_some_and(|s| s.app.busy) || matches!(app.panel, Some(Panel::Tasks { .. } | Panel::Graph(_))) => {
+                if matches!(app.panel, Some(Panel::Graph(_))) && app.graph_received.elapsed() >= Duration::from_secs(1) {
+                    app.graph_received = Instant::now();
+                    app.session.send(SessionCommand::ShowGraph);
+                }
+            }
         }
         if app.quit {
+            app.btw.take();
             app.session.send(SessionCommand::Shutdown);
             // Wait for foreground cancellation and process cleanup before exit.
             while events.recv().await.is_some() {}
@@ -265,9 +302,37 @@ async fn event_loop(
     }
 }
 
+fn handle_terminal_event(app: &mut App, event: Event) {
+    match event {
+        Event::Key(key) if key.kind != KeyEventKind::Release => handle_key(app, key),
+        Event::Paste(text) => handle_paste(app, &text),
+        Event::Mouse(mouse) => {
+            // Use paging so wheel events never reach input-history arrows or
+            // change the selected permission decision.
+            let code = match mouse.kind {
+                MouseEventKind::ScrollUp => KeyCode::PageUp,
+                MouseEventKind::ScrollDown => KeyCode::PageDown,
+                _ => return,
+            };
+            handle_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+        }
+        _ => {}
+    }
+}
+
 fn handle_ui_event(app: &mut App, ev: UiEvent) {
     match ev {
-        UiEvent::ContextUsage(tokens) => app.context_used = tokens,
+        UiEvent::Graph(graph) => {
+            app.graph = graph;
+            app.graph_received = Instant::now();
+        }
+        UiEvent::ContextUsage(tokens) => {
+            app.context_used = tokens;
+            if tokens.is_none() {
+                app.token_usage = None;
+            }
+        }
+        UiEvent::TokenUsage(usage) => app.token_usage = Some(usage),
         UiEvent::Tasks(tasks) => {
             app.tasks = tasks;
             app.tasks_received = Instant::now();
@@ -288,6 +353,7 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
         } => {
             if app.model != model {
                 app.context_used = None;
+                app.token_usage = None;
             }
             app.model = model;
             app.models = models;
@@ -340,6 +406,12 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
                 i18n::text(app.lang, Key::InfoCancelled).into(),
             ));
         }
+        UiEvent::Draft(draft) => {
+            controls::close_panel(app);
+            app.input = input::editor(&draft, app.lang);
+            app.menu_dismissed = true;
+            app.hint = Some(if app.lang == Lang::Zh { "已切换会话树位置；输入问题继续，其他分支保留。文件更改不会回滚。" } else { "Session tree position changed. Submit to continue; other branches preserved. File changes are not reverted." }.into());
+        }
         UiEvent::Sessions(items) => {
             app.sessions = items;
             if let Some(Panel::Sessions { selected, loading }) = &mut app.panel {
@@ -348,8 +420,10 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
             }
         }
         UiEvent::SessionRestored { id, records } => {
+            app.graph = Default::default();
             app.transcript.restore(records);
             app.context_used = None;
+            app.token_usage = None;
             controls::close_panel(app);
             app.restarting = false;
             app.finish();
@@ -403,8 +477,10 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
             app.push(EntryKind::Error(error));
         }
         UiEvent::SessionReset => {
+            app.graph = Default::default();
             app.transcript.reset();
             app.context_used = None;
+            app.token_usage = None;
             controls::close_panel(app);
             app.restarting = false;
             app.finish();
@@ -422,6 +498,10 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
 }
 
 fn handle_paste(app: &mut App, pasted: &str) {
+    if let Some(side) = &mut app.btw {
+        handle_paste(&mut side.app, pasted);
+        return;
+    }
     if app.permission.is_some() || app.transcript.detailed() {
         return;
     }
@@ -442,6 +522,23 @@ fn handle_paste(app: &mut App, pasted: &str) {
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
+    if let Some(side) = &mut app.btw {
+        if key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('d')
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && side.app.input.is_empty())
+        {
+            app.btw.take();
+        } else {
+            handle_key(&mut side.app, key);
+        }
+        return;
+    }
+    if !app.temporary && key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::ALT)
+    {
+        btw::open(app, "");
+        return;
+    }
     if controls::handle_key(app, key) {
         return;
     }
@@ -569,6 +666,18 @@ fn submit(app: &mut App) {
     if text.is_empty() {
         return;
     }
+    if !app.temporary && !app.restarting && text.split_whitespace().next() == Some("/btw") {
+        let question = text.strip_prefix("/btw").unwrap().trim();
+        app.input = new_input(app.lang);
+        app.menu_selected = 0;
+        app.menu_dismissed = false;
+        btw::open(app, question);
+        return;
+    }
+    if app.temporary {
+        btw::submit(app, text);
+        return;
+    }
     if matches!(text.as_str(), "/quit" | "/q") {
         consume_input(app, &text);
         app.quit = true;
@@ -581,10 +690,12 @@ fn submit(app: &mut App) {
         app.session.send(SessionCommand::NewSession);
         return;
     }
-    // Frontend settings and panels also work during an active turn.
-    if matches!(text.as_str(), "/help" | "/tasks" | "/todos")
+    // Live settings and panels also work during an active turn.
+    if matches!(text.as_str(), "/help" | "/tasks" | "/todos" | "/tree")
         || text == "/lang"
         || text.starts_with("/lang ")
+        || text == "/permissions"
+        || text.starts_with("/permissions ")
         || text == "/theme"
         || text.starts_with("/theme ")
     {
@@ -761,6 +872,11 @@ fn handle_command(app: &mut App, cmd: &str) -> bool {
         "plan" => controls::toggle_mode(app),
         "help" => app.panel = Some(Panel::Help { scroll: 0 }),
         "todos" => app.panel = Some(Panel::Todos { scroll: 0 }),
+        "tree" => {
+            controls::close_panel(app);
+            app.panel = Some(Panel::Graph(graph::View::default()));
+            app.session.send(SessionCommand::ShowGraph);
+        }
         "tasks" => controls::open_tasks(app),
         "sessions" => {
             app.sessions.clear();
@@ -790,6 +906,123 @@ fn handle_command(app: &mut App, cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn btw_shortcut_preserves_draft_cursor_and_permission_and_never_saves_input() {
+        let (session, mut commands) = SessionHandle::test_channel();
+        let mut app = test_app(session);
+        let root = std::env::temp_dir().join(format!("koala-btw-ui-{}", uuid::Uuid::new_v4()));
+        let path = root.join("history");
+        app.history = input::History::load(path.clone(), "test".into()).unwrap();
+        app.history.record("existing history").unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        app.input = input::editor("unfinished main draft", Lang::Zh);
+        app.input.move_cursor(tui_textarea::CursorMove::Head);
+        let cursor = app.input.cursor();
+        let (respond, mut decision) = oneshot::channel();
+        handle_ui_event(
+            &mut app,
+            UiEvent::PermissionRequest {
+                text: "main permission".into(),
+                respond,
+            },
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+        );
+        let SessionCommand::OpenBtw {
+            mut commands,
+            events,
+        } = commands.try_recv().unwrap()
+        else {
+            panic!("open aside")
+        };
+        handle_paste(&mut app, "private side question");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(commands.try_recv().unwrap(), SessionCommand::Submit(s) if s == "private side question")
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), saved);
+        assert!(decision.try_recv().is_err());
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            SessionCommand::Shutdown
+        ));
+        assert!(
+            events
+                .send(UiEvent::Text("late side answer".into()))
+                .is_err()
+        );
+        assert_eq!(app.input.lines().join("\n"), "unfinished main draft");
+        assert_eq!(app.input.cursor(), cursor);
+        assert!(app.permission.is_some());
+        assert!(decision.try_recv().is_err());
+        assert!(!render(&mut app, 100, 24).contains("private side question"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn btw_command_is_not_saved_and_cancel_targets_only_the_side() {
+        let (session, mut main_commands) = SessionHandle::test_channel();
+        let mut app = test_app(session);
+        app.input = input::editor("/btw secret", Lang::Zh);
+        submit(&mut app);
+        assert!(app.history.search("secret").is_empty());
+        let SessionCommand::OpenBtw {
+            mut commands,
+            events: _events,
+        } = main_commands.try_recv().unwrap()
+        else {
+            panic!("open aside")
+        };
+        assert!(matches!(commands.try_recv().unwrap(), SessionCommand::Submit(s) if s == "secret"));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            SessionCommand::Cancel
+        ));
+        assert!(main_commands.try_recv().is_err());
+        assert!(app.btw.is_some());
+        for (width, height) in [(1, 1), (20, 8), (100, 24)] {
+            render(&mut app, width, height);
+        }
+    }
+
+    #[test]
+    fn btw_opens_while_main_is_busy_and_escape_returns_to_main() {
+        let (session, mut commands) = SessionHandle::test_channel();
+        let mut app = test_app(session);
+        app.push(EntryKind::User("main question".into()));
+        app.start("main running");
+        app.input = input::editor("/btw side question", Lang::Zh);
+        submit(&mut app);
+        let screen = render(&mut app, 100, 24);
+        assert!(screen.contains("side question"), "{screen}");
+        assert!(!screen.contains("main question"), "{screen}");
+        assert!(
+            commands.try_recv().is_ok(),
+            "must open a separate conversation"
+        );
+        handle_ui_event(&mut app, UiEvent::Text("main answer".into()));
+        handle_ui_event(&mut app, UiEvent::Done);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let screen = render(&mut app, 100, 24);
+        assert!(
+            screen.contains("main question") && screen.contains("main answer"),
+            "{screen}"
+        );
+        assert!(!screen.contains("side question"), "{screen}");
+        assert!(!app.busy);
+        assert!(
+            commands.try_recv().is_err(),
+            "closing must not cancel the main turn"
+        );
+    }
 
     #[test]
     fn sessions_picker_restores_on_enter_and_preserves_conversation_on_failure() {
@@ -966,10 +1199,6 @@ mod tests {
         app.input = input::editor("/permissions never_ask", Lang::Zh);
         app.busy = true;
         submit(&mut app);
-        assert!(commands.try_recv().is_err());
-        assert_eq!(app.input.lines()[0], "/permissions never_ask");
-        app.busy = false;
-        submit(&mut app);
         assert!(matches!(
             commands.try_recv().unwrap(),
             SessionCommand::SetPermissionMode(PermissionMode::NeverAsk)
@@ -977,6 +1206,24 @@ mod tests {
         handle_ui_event(&mut app, UiEvent::PermissionMode(PermissionMode::NeverAsk));
         assert!(handle_command(&mut app, "permissions"));
         render(&mut app, 20, 8);
+    }
+
+    #[test]
+    fn permission_picker_reaches_never_ask_while_busy() {
+        let (session, mut commands) = SessionHandle::test_channel();
+        let mut app = test_app(session);
+        app.busy = true;
+        app.input = input::editor("/permissions", Lang::Zh);
+        submit(&mut app);
+        assert!(matches!(app.panel, Some(Panel::Permissions { .. })));
+        for _ in 0..5 {
+            handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            SessionCommand::SetPermissionMode(PermissionMode::NeverAsk)
+        ));
     }
 
     #[test]
@@ -1091,6 +1338,40 @@ mod tests {
                 theme::foreground(app.theme, theme::TEXT)
             );
             assert!(buffer[(113, 23)].modifier.contains(Modifier::DIM));
+        }
+    }
+
+    #[test]
+    fn statusbar_shows_input_output_token_counts() {
+        let mut app = app();
+        for (input, output, expected) in [
+            (0, 999, "Token: ↑ 0 ↓ 999"),
+            (1_000, 12_345, "Token: ↑ 1K ↓ 12.3K"),
+            (999_999, 1_250_000, "Token: ↑ 1M ↓ 1.3M"),
+            (2_000_000, 10_000, "Token: ↑ 2M ↓ 10K"),
+        ] {
+            handle_ui_event(
+                &mut app,
+                UiEvent::TokenUsage(crate::llm::TokenUsage {
+                    prompt_tokens: input,
+                    completion_tokens: output,
+                }),
+            );
+            assert!(render(&mut app, 120, 24).contains(expected), "{expected}");
+        }
+        handle_ui_event(&mut app, UiEvent::ContextUsage(None));
+        assert!(render(&mut app, 120, 24).contains("Token: ↑ -- ↓ --"));
+        handle_ui_event(
+            &mut app,
+            UiEvent::TokenUsage(crate::llm::TokenUsage {
+                prompt_tokens: 20_000,
+                completion_tokens: 500,
+            }),
+        );
+        handle_ui_event(&mut app, UiEvent::SessionReset);
+        assert!(render(&mut app, 120, 24).contains("Token: ↑ -- ↓ --"));
+        for (width, height) in [(40, 10), (20, 8), (1, 1)] {
+            render(&mut app, width, height);
         }
     }
 
@@ -1538,6 +1819,52 @@ mod tests {
         handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(!app.quit);
     }
+    #[test]
+    fn graph_retry_sends_branch_command_and_restores_editable_draft() {
+        let (session, mut commands) = SessionHandle::test_channel();
+        let mut app = test_app(session);
+        app.graph.apply(serde_json::from_value(serde_json::json!({"id":"turn","session_id":"s","run_id":"turn","parent_id":null,"inputs":[],"kind":"turn","label":"question","started_at":"now","finished_at":null,"duration_ms":null,"status":"failed","data":{"input":"question"}})).unwrap());
+        handle_command(&mut app, "tree");
+        commands.try_recv().unwrap();
+        render(&mut app, 100, 20);
+        app.busy = true;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        );
+        assert!(commands.try_recv().is_err());
+        app.busy = false;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        );
+        assert!(
+            matches!(commands.try_recv().unwrap(), SessionCommand::BranchBeforeTurn(id) if id == "turn")
+        );
+        handle_ui_event(&mut app, UiEvent::SessionReset);
+        handle_ui_event(&mut app, UiEvent::Draft("question".into()));
+        assert_eq!(app.input.lines(), &["question"]);
+        assert!(app.panel.is_none());
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn tree_command_opens_while_busy_without_submitting_to_model() {
+        let (session, mut commands) = SessionHandle::test_channel();
+        let mut app = App::new(session);
+        app.busy = true;
+        app.input = input::editor("/tree", Lang::En);
+        submit(&mut app);
+        assert!(matches!(app.panel, Some(Panel::Graph(_))));
+        assert!(matches!(commands.try_recv(), Ok(SessionCommand::ShowGraph)));
+        assert!(commands.try_recv().is_err());
+        assert!(app.busy);
+        assert!(render(&mut app, 100, 30).contains("Session Tree"));
+        controls::handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.panel.is_none());
+        assert!(app.busy);
+    }
+
     fn render(app: &mut App, width: u16, height: u16) -> String {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1903,6 +2230,70 @@ mod tests {
         handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.input.lines(), ["检查代码", "运行测试"]);
         assert!(commands.try_recv().is_err());
+    }
+
+    fn wheel(app: &mut App, kind: crossterm::event::MouseEventKind) {
+        handle_terminal_event(
+            app,
+            Event::Mouse(crossterm::event::MouseEvent {
+                kind,
+                column: 10,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_content_without_recalling_history() {
+        use crossterm::event::MouseEventKind;
+        for detailed in [false, true] {
+            let mut app = app();
+            app.history.record("old input").unwrap();
+            app.input = input::editor("unsent draft", Lang::Zh);
+            let cursor = app.input.cursor();
+            app.push(EntryKind::Assistant("history\n\n".repeat(40)));
+            if detailed {
+                app.toggle_details();
+            }
+            render(&mut app, 80, 15);
+            let bottom = app.transcript.scroll_offset();
+            wheel(&mut app, MouseEventKind::ScrollUp);
+            assert!(app.transcript.scroll_offset() < bottom);
+            assert!(!app.transcript.following());
+            assert_eq!(app.input.lines(), ["unsent draft"]);
+            assert_eq!(app.input.cursor(), cursor);
+            wheel(&mut app, MouseEventKind::ScrollDown);
+            assert_eq!(app.transcript.scroll_offset(), bottom);
+            assert!(app.transcript.following());
+            assert_eq!(app.input.lines(), ["unsent draft"]);
+        }
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_modal_without_changing_permission() {
+        use crossterm::event::MouseEventKind;
+        let mut app = app();
+        app.panel = Some(Panel::Help { scroll: 0 });
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        assert!(matches!(app.panel, Some(Panel::Help { scroll }) if scroll > 0));
+        let (respond, mut rx) = oneshot::channel();
+        app.permission = Some(PermissionPrompt {
+            text: "long command".into(),
+            respond,
+            allow: false,
+            scroll: 0,
+        });
+        wheel(&mut app, MouseEventKind::ScrollDown);
+        let prompt = app.permission.as_ref().unwrap();
+        assert!(prompt.scroll > 0);
+        assert!(!prompt.allow);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        wheel(&mut app, MouseEventKind::ScrollUp);
+        assert_eq!(app.permission.as_ref().unwrap().scroll, 0);
     }
 
     #[test]

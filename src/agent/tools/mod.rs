@@ -3,6 +3,7 @@ pub mod bash;
 pub mod catalog;
 pub mod files;
 pub mod remember;
+pub mod search;
 pub mod skill;
 pub mod task;
 pub mod todo;
@@ -66,6 +67,7 @@ impl ToolResult {
 
 /// Everything a tool may touch. Borrows are scoped to one ReAct run.
 pub struct ToolContext<'a> {
+    pub graph: Option<super::graph::Recorder>,
     pub todos: &'a mut TodoList,
     pub agent_memory: &'a AgentMemory,
     pub background: BackgroundManager,
@@ -81,6 +83,7 @@ pub struct ToolContext<'a> {
 /// context is the single point where `depth` increments and `plan_mode`
 /// propagates — callers never fill those fields by hand.
 pub struct SubagentSeed {
+    graph: Option<super::graph::Recorder>,
     background: BackgroundManager,
     skills: Arc<Skills>,
     shared: Arc<SharedState>,
@@ -91,6 +94,7 @@ pub struct SubagentSeed {
 impl ToolContext<'_> {
     pub fn subagent_seed(&self) -> SubagentSeed {
         SubagentSeed {
+            graph: self.graph.clone(),
             background: self.background.clone(),
             skills: Arc::clone(self.skills),
             shared: Arc::clone(self.shared),
@@ -110,6 +114,7 @@ impl SubagentSeed {
         events: &'a EventSender,
     ) -> ToolContext<'a> {
         ToolContext {
+            graph: self.graph.clone(),
             todos,
             agent_memory,
             background: self.background.clone(),
@@ -153,6 +158,7 @@ pub fn summarize_args(name: &str, arguments: &str) -> String {
     };
     let summary = match name {
         "bash" => pick("command"),
+        "glob" | "grep" => pick("pattern"),
         "read" | "edit" | "write" => pick("path"),
         "remember" => pick("key"),
         "recall" => args
@@ -237,6 +243,7 @@ mod tests {
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
         let shared = shared_state();
         let root = ToolContext {
+            graph: None,
             todos: &mut todos,
             agent_memory: &mem,
             background,
@@ -273,6 +280,7 @@ mod tests {
         let (events, _rx) = tokio::sync::mpsc::unbounded_channel();
         let shared = shared_state();
         let mut ctx = ToolContext {
+            graph: None,
             todos: &mut todos,
             agent_memory: &mem,
             background: BackgroundManager::default(),
@@ -335,3 +343,6 @@ mod tests {
         assert_eq!(mem.content().unwrap(), "");
     }
 }
+
+#[cfg(test)]
+mod search_tests;

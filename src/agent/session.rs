@@ -15,6 +15,17 @@ impl SessionHandle {
         let _ = self.tx.send(cmd);
     }
 
+    pub(crate) fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
+    pub fn open_btw(&self) -> (Self, mpsc::UnboundedReceiver<UiEvent>) {
+        let (tx, commands) = mpsc::unbounded_channel();
+        let (events, rx) = mpsc::unbounded_channel();
+        self.send(SessionCommand::OpenBtw { commands, events });
+        (Self { tx }, rx)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_channel() -> (Self, mpsc::UnboundedReceiver<SessionCommand>) {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -39,11 +50,13 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
     let _ = ev_tx.send(agent.model_settings());
     let _ = ev_tx.send(UiEvent::PermissionMode(agent.shared.permissions.mode()));
     let _ = ev_tx.send(UiEvent::BackgroundCount(*background_count.borrow()));
+    let mut snapshot = agent.history.clone();
     let agent = Arc::new(Mutex::new(agent));
     tokio::spawn(async move {
         let mut active: Option<JoinHandle<()>> = None;
         let mut progress = String::new();
         let mut watch_tasks = false;
+        let mut asides = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
                 // Complete and drain an old operation before accepting another.
@@ -67,6 +80,36 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                         break;
                     };
                     match cmd {
+                        SessionCommand::OpenBtw { commands, events } => {
+                            // The foreground task may be scheduled but not yet holding
+                            // the mutex. Its saved snapshot already includes its input.
+                            let history = if active.is_some() {
+                                snapshot.clone()
+                            } else {
+                                agent.lock().await.history.clone()
+                            };
+                            asides.spawn(super::btw::run(shared.clone(), history, commands, events));
+                        }
+                        SessionCommand::SetPermissionMode(mode) => {
+                            // Save before applying, without waiting for a running turn's mutex.
+                            if let Some(journal) = &current_background.journal
+                                && let Err(error) = journal.permission_mode(mode)
+                            {
+                                let _ = ev_tx.send(UiEvent::Error(error.to_string()));
+                                continue;
+                            }
+                            shared.permissions.set_mode(mode);
+                            let lang = shared.lang.get();
+                            let _ = ev_tx.send(UiEvent::PermissionMode(mode));
+                            let _ = ev_tx.send(UiEvent::Info(i18n::fill(
+                                lang,
+                                Key::InfoPermissionSwitched,
+                                &[
+                                    ("mode", mode.label()),
+                                    ("description", mode.description(lang)),
+                                ],
+                            )));
+                        }
                         SessionCommand::SetLang(value) => shared.lang.set(value),
                         SessionCommand::Cancel => {
                             if stop(&mut active, &agent, &mut work_rx, &ev_tx, &mut progress, shared.lang.get()).await {
@@ -90,6 +133,8 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                             let _ = ev_tx.send(UiEvent::PlanMode(agent.lock().await.plan_mode()));
                         }
                         SessionCommand::Submit(text) if active.is_none() => {
+                            snapshot = agent.lock().await.history.clone();
+                            snapshot.push(crate::llm::Message::user(&text));
                             progress.clear();
                             let agent = agent.clone();
                             let events = work_tx.clone();
@@ -101,6 +146,7 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                             }));
                         }
                         SessionCommand::Compact if active.is_none() => {
+                            snapshot = agent.lock().await.history.clone();
                             progress.clear();
                             let agent = agent.clone();
                             let events = work_tx.clone();
@@ -123,6 +169,10 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                                 };
                                 let _ = events.send(ev);
                             }));
+                        }
+                        SessionCommand::ShowGraph => {
+                            let graph = current_background.journal.as_ref().map(|j| j.graph_snapshot()).unwrap_or_default();
+                            let _ = ev_tx.send(UiEvent::Graph(graph));
                         }
                         SessionCommand::ShowTasks => {
                             watch_tasks = true;
@@ -152,6 +202,31 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                             let _ = ev_tx.send(UiEvent::Note(
                                 i18n::text(lang, Key::NoteBusyInterruptFirst).into(),
                             ));
+                        }
+                        cmd @ (SessionCommand::BranchBeforeTurn(_) | SessionCommand::ContinueAfterTurn(_)) => {
+                            let (id, after) = match cmd {
+                                SessionCommand::BranchBeforeTurn(id) => (id, false),
+                                SessionCommand::ContinueAfterTurn(id) => (id, true),
+                                _ => unreachable!(),
+                            };
+                            let mut guard = agent.lock().await;
+                            match guard.navigate_turn(&id, after) {
+                                Ok(draft) => {
+                                    current_background = guard.background.clone();
+                                    (work_tx, work_rx) = mpsc::unbounded_channel();
+                                    progress.clear();
+                                    let _ = ev_tx.send(UiEvent::SessionReset);
+                                    if let Some(journal) = &guard.background.journal {
+                                        if let Ok(Some(saved)) = journal.load() {
+                                            let _ = ev_tx.send(UiEvent::WorkRestored(saved.trace));
+                                        }
+                                    }
+                                    let _ = ev_tx.send(UiEvent::Todos(guard.todos.items.iter().map(super::event::TodoView::from).collect()));
+                                    let _ = ev_tx.send(UiEvent::Tasks(background.list()));
+                                    let _ = ev_tx.send(UiEvent::Draft(draft));
+                                }
+                                Err(error) => { let _ = ev_tx.send(UiEvent::Error(error)); }
+                            }
                         }
                         SessionCommand::Memory { control } => {
                             let guard = agent.lock().await;
@@ -198,30 +273,17 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                                     let _ = ev_tx.send(UiEvent::Todos(guard.todos.items.iter().map(super::event::TodoView::from).collect()));
                                     let _ = ev_tx.send(UiEvent::Tasks(background.list()));
                                     let _ = ev_tx.send(UiEvent::BackgroundCount(*background_count.borrow()));
-                                    let _ = ev_tx.send(UiEvent::PlanMode(false));
-                                    let _ = ev_tx.send(UiEvent::PermissionMode(crate::config::PermissionMode::Normal));
+                                    let _ = ev_tx.send(UiEvent::PlanMode(guard.plan_mode()));
+                                    let _ = ev_tx.send(UiEvent::PermissionMode(shared.permissions.mode()));
                                 }
                                 Err(error) => { let _ = ev_tx.send(UiEvent::SessionRestoreFailed(error)); }
                             }
                         }
-                        SessionCommand::SetPermissionMode(mode) => {
-                            let guard = agent.lock().await;
-                            guard.shared.permissions.set_mode(mode);
-                            let lang = guard.lang();
-                            drop(guard);
-                            let _ = ev_tx.send(UiEvent::PermissionMode(mode));
-                            let _ = ev_tx.send(UiEvent::Info(i18n::fill(
-                                lang,
-                                Key::InfoPermissionSwitched,
-                                &[
-                                    ("mode", mode.label()),
-                                    ("description", mode.description(lang)),
-                                ],
-                            )));
-                        }
                         SessionCommand::TogglePlanMode => {
-                            let on = agent.lock().await.toggle_plan_mode();
-                            let _ = ev_tx.send(UiEvent::PlanMode(on));
+                            match agent.lock().await.toggle_plan_mode() {
+                                Ok(on) => { let _ = ev_tx.send(UiEvent::PlanMode(on)); }
+                                Err(error) => { let _ = ev_tx.send(UiEvent::Error(error.to_string())); }
+                            }
                         }
                         SessionCommand::SelectModel(name) => {
                             let mut agent = agent.lock().await;
@@ -266,6 +328,7 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                     let _ = ev_tx.send(UiEvent::BackgroundCount(*background_count.borrow_and_update()));
                     if watch_tasks { let _ = ev_tx.send(UiEvent::Tasks(background.list())); }
                 }
+                _ = asides.join_next(), if !asides.is_empty() => {},
                 Some(ev) = work_rx.recv() => forward(ev, &ev_tx, &mut progress, shared.lang.get()),
             }
         }
@@ -331,6 +394,245 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn btw_opened_immediately_after_submit_includes_current_main_question() {
+        use crate::test_support::{MockLlm, stream};
+        let mut mock = MockLlm::respond(|_| stream(serde_json::json!({"content":"answer"}))).await;
+        let root = std::env::temp_dir().join(format!("koala-btw-queued-{}", uuid::Uuid::new_v4()));
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.llm.base_url = mock.url.clone();
+        cfg.agent.session_dir = root.join("sessions");
+        cfg.agent.memory_file = root.join("memory.md");
+        let (main, mut events) = spawn(Agent::new(&cfg).await.unwrap());
+        main.send(SessionCommand::Submit(
+            "just submitted main question".into(),
+        ));
+        let (aside, mut side_events) = main.open_btw();
+        aside.send(SessionCommand::Submit("immediate aside".into()));
+        receive_until(&mut side_events, |e| matches!(e, UiEvent::Done)).await;
+        receive_until(&mut events, |e| matches!(e, UiEvent::Done)).await;
+        for _ in 0..2 {
+            let request = mock.request().await;
+            let messages = request["messages"].as_array().unwrap();
+            if messages.last().unwrap()["content"] == "immediate aside" {
+                assert!(
+                    messages
+                        .iter()
+                        .any(|m| m["content"] == "just submitted main question")
+                );
+            }
+        }
+        main.send(SessionCommand::Shutdown);
+        while events.recv().await.is_some() {}
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn btw_inherits_context_remembers_followups_but_never_persists_or_changes_main() {
+        use crate::llm::Message;
+        use crate::test_support::{MockLlm, stream};
+        let mut mock = MockLlm::start(vec![
+            stream(serde_json::json!({"content":"private answer"})),
+            stream(serde_json::json!({"content":"private followup answer"})),
+            stream(serde_json::json!({"content":"fresh aside answer"})),
+            stream(serde_json::json!({"content":"main answer"})),
+        ])
+        .await;
+        let root = std::env::temp_dir().join(format!("koala-btw-{}", uuid::Uuid::new_v4()));
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.llm.base_url = mock.url.clone();
+        cfg.agent.session_dir = root.join("sessions");
+        cfg.agent.memory_file = root.join("memory.md");
+        let mut agent = Agent::new(&cfg).await.unwrap();
+        agent.history = vec![
+            Message::user("main context"),
+            Message::assistant("prior answer"),
+        ];
+        let (main, mut events) = spawn(agent);
+        let (aside, mut side_events) = main.open_btw();
+        aside.send(SessionCommand::Submit("private question".into()));
+        receive_until(&mut side_events, |e| matches!(e, UiEvent::Done)).await;
+        let request = mock.request().await;
+        let text = request["messages"].to_string();
+        assert!(
+            text.contains("main context")
+                && text.contains("prior answer")
+                && text.contains("private question")
+        );
+        assert!(request.get("tools").is_none());
+        aside.send(SessionCommand::Submit("private followup".into()));
+        receive_until(&mut side_events, |e| matches!(e, UiEvent::Done)).await;
+        let request = mock.request().await;
+        let text = request["messages"].to_string();
+        assert!(
+            text.contains("private question")
+                && text.contains("private answer")
+                && text.contains("private followup")
+        );
+        assert!(
+            !cfg.agent.session_dir.exists()
+                || std::fs::read_dir(&cfg.agent.session_dir)
+                    .unwrap()
+                    .next()
+                    .is_none()
+        );
+        aside.send(SessionCommand::Shutdown);
+        timeout(Duration::from_secs(3), async {
+            while side_events.recv().await.is_some() {}
+        })
+        .await
+        .unwrap();
+        let (fresh, mut fresh_events) = main.open_btw();
+        fresh.send(SessionCommand::Submit("fresh aside".into()));
+        receive_until(&mut fresh_events, |e| matches!(e, UiEvent::Done)).await;
+        let request = mock.request().await;
+        let text = request["messages"].to_string();
+        assert!(text.contains("main context"));
+        assert!(!text.contains("private question") && !text.contains("private answer"));
+        fresh.send(SessionCommand::Shutdown);
+        main.send(SessionCommand::Submit("continue main".into()));
+        receive_until(&mut events, |e| matches!(e, UiEvent::Done)).await;
+        let request = mock.request().await;
+        let text = request["messages"].to_string();
+        assert!(text.contains("main context") && text.contains("continue main"));
+        assert!(
+            !text.contains("private question")
+                && !text.contains("private answer")
+                && !text.contains("private followup")
+                && !text.contains("fresh aside")
+        );
+        main.send(SessionCommand::Shutdown);
+        while events.recv().await.is_some() {}
+        for entry in std::fs::read_dir(&cfg.agent.session_dir).unwrap() {
+            let content = std::fs::read_to_string(entry.unwrap().path()).unwrap();
+            assert!(
+                !content.contains("private question")
+                    && !content.contains("private answer")
+                    && !content.contains("private followup")
+                    && !content.contains("fresh aside")
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn btw_runs_and_cancels_while_main_stream_is_still_active() {
+        use crate::llm::Message;
+        let root =
+            std::env::temp_dir().join(format!("koala-btw-concurrent-{}", uuid::Uuid::new_v4()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.llm.base_url = format!("http://{}", listener.local_addr().unwrap());
+        cfg.agent.session_dir = root.join("sessions");
+        cfg.agent.memory_file = root.join("memory.md");
+        let mut agent = Agent::new(&cfg).await.unwrap();
+        agent.history = vec![
+            Message::user("completed main question"),
+            Message::assistant("completed main answer"),
+        ];
+        let (main, mut events) = spawn(agent);
+        main.send(SessionCommand::Submit("active main question".into()));
+        let (mut main_socket, _) = timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        request(&mut main_socket).await;
+        main_socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"main partial\"}}]}\n\n").await.unwrap();
+        receive_until(
+            &mut events,
+            |e| matches!(e, UiEvent::Text(t) if t == "main partial"),
+        )
+        .await;
+        let (aside, mut side_events) = main.open_btw();
+        aside.send(SessionCommand::Submit("side while busy".into()));
+        let (mut side_socket, _) = timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let body = request(&mut side_socket).await;
+        let text = body["messages"].to_string();
+        assert!(text.contains("completed main answer") && text.contains("active main question"));
+        side_socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"side partial\"}}]}\n\n").await.unwrap();
+        receive_until(
+            &mut side_events,
+            |e| matches!(e, UiEvent::Text(t) if t == "side partial"),
+        )
+        .await;
+        aside.send(SessionCommand::Cancel);
+        receive_until(&mut side_events, |e| matches!(e, UiEvent::Cancelled)).await;
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(
+                event,
+                UiEvent::Done | UiEvent::Cancelled | UiEvent::Text(_)
+            ));
+        }
+        aside.send(SessionCommand::Submit("retry side".into()));
+        let (mut retry_socket, _) = timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let body = request(&mut retry_socket).await;
+        let text = body["messages"].to_string();
+        assert!(!text.contains("side partial") && !text.contains("side while busy"));
+        // The main turn completes normally while a second side request is pending.
+        main_socket.write_all(b"data: [DONE]\n\n").await.unwrap();
+        receive_until(&mut events, |e| matches!(e, UiEvent::Done)).await;
+        main.send(SessionCommand::Shutdown);
+        timeout(Duration::from_secs(3), async {
+            while events.recv().await.is_some() {}
+            while side_events.recv().await.is_some() {}
+        })
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restoring_plan_session_updates_frontend_mode() {
+        let root = std::env::temp_dir().join(format!("koala-plan-ui-{}", uuid::Uuid::new_v4()));
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.agent.session_dir = root.join("sessions");
+        cfg.agent.memory_file = root.join("memory.json");
+        let mut agent = Agent::new(&cfg).await.unwrap();
+        let id = agent.session_id().to_owned();
+        agent
+            .background
+            .journal
+            .as_ref()
+            .unwrap()
+            .context(&[crate::llm::Message::user("plan")], &[])
+            .unwrap();
+        agent.toggle_plan_mode().unwrap();
+        agent.new_session();
+        agent.toggle_plan_mode().unwrap();
+        let (session, mut events) = spawn(agent);
+        session.send(SessionCommand::RestoreSession(id));
+        timeout(Duration::from_secs(3), async {
+            let mut restored = false;
+            while let Some(event) = events.recv().await {
+                match event {
+                    UiEvent::SessionRestored { .. } => restored = true,
+                    UiEvent::PlanMode(on) if restored => {
+                        assert!(on);
+                        break;
+                    }
+                    UiEvent::SessionRestoreFailed(error) => panic!("{error}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        session.send(SessionCommand::Shutdown);
+        drop(session);
+        while events.recv().await.is_some() {}
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn legacy_compact_restore_preserves_display_history() {
@@ -564,6 +866,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn permission_switch_during_active_turn_applies_to_next_tool() {
+        use crate::config::PermissionMode;
+        use crate::test_support::{MockLlm, stream};
+        let root =
+            std::env::temp_dir().join(format!("koala-live-permission-{}", uuid::Uuid::new_v4()));
+        let path = std::env::current_dir()
+            .unwrap()
+            .join(format!(".permission-test-{}", uuid::Uuid::new_v4()));
+        let mut mock = MockLlm::start(vec![
+            stream(serde_json::json!({"tool_calls":[{"index":0,"id":"first","function":{"name":"read","arguments":"{\"path\":\"Cargo.toml\"}"}}]})),
+            stream(serde_json::json!({"tool_calls":[{"index":0,"id":"second","function":{"name":"write","arguments":serde_json::json!({"path":path,"content":"edited"}).to_string()}}]})),
+            stream(serde_json::json!({"content":"done"})),
+        ]).await;
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.llm.base_url = mock.url.clone();
+        cfg.agent.session_dir = root.join("sessions");
+        cfg.agent.memory_file = root.join("memory.md");
+        let agent = Agent::new(&cfg).await.unwrap();
+        let shared = agent.shared.clone();
+        let (session, mut events) = spawn(agent);
+        session.send(SessionCommand::Submit("edit a file".into()));
+        mock.request().await;
+        let respond = timeout(Duration::from_secs(3), async {
+            loop {
+                if let UiEvent::PermissionRequest { respond, .. } = events.recv().await.unwrap() {
+                    break respond;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        session.send(SessionCommand::SetPermissionMode(PermissionMode::AutoEdit));
+        receive_until(&mut events, |e| {
+            matches!(e, UiEvent::PermissionMode(PermissionMode::AutoEdit))
+        })
+        .await;
+        assert_eq!(shared.permissions.mode(), PermissionMode::AutoEdit);
+        respond.send(true).unwrap();
+        timeout(Duration::from_secs(3), async {
+            loop {
+                match events.recv().await.unwrap() {
+                    UiEvent::PermissionRequest { .. } => panic!("workspace edit asked again"),
+                    UiEvent::Error(e) => panic!("{e}"),
+                    UiEvent::Done => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited");
+        session.send(SessionCommand::Shutdown);
+        while events.recv().await.is_some() {}
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restored_session_inherits_saved_permission_after_restart() {
+        use crate::config::PermissionMode;
+        use crate::test_support::{MockLlm, stream};
+        let mock = MockLlm::start(vec![stream(serde_json::json!({"content": "answer"}))]).await;
+        let root = std::env::temp_dir().join(format!("koala-permission-{}", uuid::Uuid::new_v4()));
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.llm.base_url = mock.url.clone();
+        cfg.agent.session_dir = root.clone();
+        cfg.agent.memory_file = root.join("memory.md");
+        cfg.permissions.mode = PermissionMode::AutoEdit;
+        let mut agent = Agent::new(&cfg).await.unwrap();
+        let id = agent.session_id().to_owned();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        agent.run_turn("question", tx).await.unwrap();
+        drop(agent);
+        cfg.permissions.mode = PermissionMode::Normal;
+        let agent = Agent::new(&cfg).await.unwrap();
+        let shared = agent.shared.clone();
+        let (session, mut events) = spawn(agent);
+        session.send(SessionCommand::RestoreSession(id.clone()));
+        receive_until(&mut events, |e| {
+            matches!(e, UiEvent::SessionRestored { .. })
+        })
+        .await;
+        receive_until(&mut events, |e| {
+            if let UiEvent::PermissionMode(mode) = e {
+                assert_eq!(*mode, PermissionMode::AutoEdit);
+                true
+            } else {
+                false
+            }
+        })
+        .await;
+        assert_eq!(shared.permissions.mode(), PermissionMode::AutoEdit);
+        for mode in PermissionMode::ALL {
+            session.send(SessionCommand::SetPermissionMode(mode));
+            receive_until(&mut events, |e| matches!(e, UiEvent::PermissionMode(_))).await;
+            let mut reopened = Agent::new(&cfg).await.unwrap();
+            reopened.restore_session(&id).unwrap();
+            assert_eq!(reopened.shared.permissions.mode(), mode);
+            assert!(reopened.restore_session("missing").is_err());
+            assert_eq!(reopened.shared.permissions.mode(), mode);
+        }
+        session.send(SessionCommand::Shutdown);
+        while events.recv().await.is_some() {}
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn saved_permission_on_legacy_session_preserves_conversation() {
+        use crate::config::PermissionMode;
+        let root =
+            std::env::temp_dir().join(format!("koala-legacy-permission-{}", uuid::Uuid::new_v4()));
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.agent.session_dir = root.clone();
+        cfg.agent.memory_file = root.join("memory.md");
+        let agent = Agent::new(&cfg).await.unwrap();
+        let id = agent.session_id().to_owned();
+        agent
+            .transcript
+            .append_turn("old question", "old answer")
+            .unwrap();
+        let (session, mut events) = spawn(agent);
+        receive_until(&mut events, |e| matches!(e, UiEvent::PermissionMode(_))).await;
+        session.send(SessionCommand::SetPermissionMode(PermissionMode::NeverAsk));
+        receive_until(&mut events, |e| matches!(e, UiEvent::PermissionMode(_))).await;
+        let mut reopened = Agent::new(&cfg).await.unwrap();
+        reopened.restore_session(&id).unwrap();
+        assert_eq!(reopened.shared.permissions.mode(), PermissionMode::NeverAsk);
+        assert_eq!(reopened.history.len(), 2);
+        assert_eq!(reopened.history[0].content.as_deref(), Some("old question"));
+        session.send(SessionCommand::Shutdown);
+        while events.recv().await.is_some() {}
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn permission_switch_updates_shared_state_and_survives_new_session() {
         use crate::config::PermissionMode;
         let mut cfg = Config::default();
@@ -617,18 +1057,27 @@ mod tests {
         cfg.agent.memory_file = root.join("memory.md");
         cfg.agent.session_dir = root.join("sessions");
         let (session, mut events) = spawn(Agent::new(&cfg).await.unwrap());
-        for expected in [Some(120_000), Some(20_500), None] {
+        for (expected, breakdown) in [
+            (Some(120_000), Some((110_000, 10_000))),
+            (Some(20_500), Some((20_000, 500))),
+            (None, None),
+        ] {
             session.send(SessionCommand::Submit("hi".into()));
             let usage = timeout(Duration::from_secs(3), async {
                 let mut usage = Vec::new();
+                let mut token_usage = None;
                 loop {
                     match events.recv().await.expect("event stream closed") {
                         UiEvent::ContextUsage(value) => usage.push(value),
+                        UiEvent::TokenUsage(value) => {
+                            token_usage = Some((value.prompt_tokens, value.completion_tokens));
+                        }
                         UiEvent::Done => break,
                         UiEvent::Error(error) => panic!("{error}"),
                         _ => {}
                     }
                 }
+                assert_eq!(token_usage, breakdown);
                 usage
             })
             .await
@@ -874,6 +1323,8 @@ mod tests {
         })
         .await
         .unwrap();
+        handle.send(SessionCommand::ShowGraph);
+        receive_until(&mut events, |ev| matches!(ev, UiEvent::Graph(graph) if graph.nodes.iter().any(|n| n.status == super::super::graph::Status::Running))).await;
         handle.send(SessionCommand::ShowTasks);
         receive_until(
             &mut events,

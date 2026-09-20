@@ -6,6 +6,10 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 
 pub(super) fn draw(f: &mut Frame, app: &mut App) {
+    if let Some(side) = &mut app.btw {
+        draw(f, &mut side.app);
+        return;
+    }
     let area = f.area().inner(Margin {
         horizontal: u16::from(f.area().width > 4),
         vertical: 0,
@@ -53,7 +57,11 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
     if let Some((title, hint)) = panels::dialog_chrome(app) {
         let region = rows[1];
         let max_h = (panels::content_height(app) as u16 + 2).max(3);
-        let dialog = centered(region, 88, max_h);
+        let dialog = if matches!(app.panel, Some(super::Panel::Graph(_))) {
+            centered(region, region.width, region.height)
+        } else {
+            centered(region, 88, max_h)
+        };
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(theme::suggestion())
@@ -106,7 +114,9 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
     if app.busy {
         let elapsed = app.started.map(|t| t.elapsed()).unwrap_or_default();
-        let action = if app.permission.is_some() {
+        let action = if app.temporary {
+            i18n::text(app.lang, Key::BtwKeys)
+        } else if app.permission.is_some() {
             i18n::text(app.lang, Key::ActionDenyOrInterrupt)
         } else if app.transcript.detailed() || app.panel.is_some() {
             i18n::text(app.lang, Key::ActionClosePanelToInterrupt)
@@ -143,6 +153,11 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         .borders(ratatui::widgets::Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border_style);
+    let block = if app.temporary {
+        block.title(i18n::text(app.lang, Key::BtwTitle))
+    } else {
+        block
+    };
     let inner = block.inner(area);
     f.render_widget(block, area);
     let input = Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).split(inner);
@@ -153,6 +168,18 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
 /// Bottom bar: session metadata on the left, contextual key hints flushed
 /// right — the dsh-TUI status-row arrangement.
 fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
+    if app.temporary {
+        f.render_widget(
+            Paragraph::new(
+                app.hint
+                    .as_deref()
+                    .unwrap_or(i18n::text(app.lang, Key::BtwKeys)),
+            )
+            .style(theme::key_hint()),
+            area,
+        );
+        return;
+    }
     let permission_style = match app.permission_mode {
         crate::config::PermissionMode::Normal => theme::text(),
         crate::config::PermissionMode::AskWhenNeed | crate::config::PermissionMode::AutoEdit => {
@@ -197,6 +224,19 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(" · ", theme::muted()));
         spans.push(Span::styled(format!("CTX [{usage}]"), style));
     }
+    let (input, output) = app.token_usage.as_ref().map_or_else(
+        || ("--".into(), "--".into()),
+        |usage| {
+            (
+                compact_tokens(usage.prompt_tokens),
+                compact_tokens(usage.completion_tokens),
+            )
+        },
+    );
+    spans.push(Span::styled(
+        format!(" · Token: ↑ {input} ↓ {output}"),
+        theme::muted(),
+    ));
     let left = Line::from(spans);
     let left_width = left.width() as u16;
     f.render_widget(Paragraph::new(left), area);
@@ -228,6 +268,24 @@ fn draw_statusbar(f: &mut Frame, app: &App, area: Rect) {
                 .alignment(Alignment::Right),
             hint_area,
         );
+    }
+}
+
+fn compact_tokens(tokens: u64) -> String {
+    if tokens < 1_000 {
+        return tokens.to_string();
+    }
+    // Round to one decimal, promoting values that would display as 1000K.
+    let (scale, suffix) = if tokens < 999_950 {
+        (1_000u128, "K")
+    } else {
+        (1_000_000u128, "M")
+    };
+    let tenths = (u128::from(tokens) * 10 + scale / 2) / scale;
+    if tenths % 10 == 0 {
+        format!("{}{suffix}", tenths / 10)
+    } else {
+        format!("{}.{}{suffix}", tenths / 10, tenths % 10)
     }
 }
 

@@ -8,11 +8,19 @@ use tokio::sync::oneshot;
 pub enum SessionCommand {
     /// Run one agent turn with the given user input.
     Submit(String),
+    /// Open an ephemeral conversation on independent command/event channels.
+    OpenBtw {
+        commands: tokio::sync::mpsc::UnboundedReceiver<SessionCommand>,
+        events: EventSender,
+    },
     /// Stop the foreground operation, leaving background tasks running.
     Cancel,
     Shutdown,
     /// Start a fresh session (clears history and todos).
     NewSession,
+    ShowGraph,
+    BranchBeforeTurn(String),
+    ContinueAfterTurn(String),
     ShowSessions,
     RestoreSession(String),
     /// Toggle plan mode; the new state is reported back as `UiEvent::PlanMode`.
@@ -107,6 +115,8 @@ impl From<&TodoItem> for TodoView {
 pub enum UiEvent {
     /// Latest foreground request input + output tokens; None means unavailable.
     ContextUsage(Option<u64>),
+    /// Input/output breakdown for the latest foreground request.
+    TokenUsage(crate::llm::TokenUsage),
     ModelSettings {
         model: String,
         models: Vec<String>,
@@ -122,6 +132,8 @@ pub enum UiEvent {
         id: String,
         records: Vec<super::transcripts::Record>,
     },
+    Graph(super::graph::Graph),
+    Draft(String),
     WorkRestored(Vec<super::work::Trace>),
     SessionRestoreFailed(String),
     PlanMode(bool),
@@ -160,6 +172,7 @@ impl std::fmt::Debug for UiEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             UiEvent::ContextUsage(tokens) => write!(f, "ContextUsage({tokens:?})"),
+            UiEvent::TokenUsage(usage) => write!(f, "TokenUsage({usage:?})"),
             UiEvent::ModelSettings {
                 reasoning_effort,
                 context_window,
@@ -167,9 +180,11 @@ impl std::fmt::Debug for UiEvent {
             } => write!(f, "ModelSettings({reasoning_effort:?}, {context_window:?})"),
             UiEvent::Status(s) => write!(f, "Status({s:?})"),
             UiEvent::Cancelled => write!(f, "Cancelled"),
+            UiEvent::Draft(_) => write!(f, "Draft"),
             UiEvent::Sessions(items) => write!(f, "Sessions({} items)", items.len()),
             UiEvent::SessionRestored { id, .. } => write!(f, "SessionRestored({id})"),
             UiEvent::SessionRestoreFailed(error) => write!(f, "SessionRestoreFailed({error})"),
+            UiEvent::Graph(graph) => write!(f, "Graph({} nodes)", graph.nodes.len()),
             UiEvent::WorkRestored(_) => write!(f, "WorkRestored"),
             UiEvent::SessionReset => write!(f, "SessionReset"),
             UiEvent::PermissionMode(mode) => write!(f, "PermissionMode({mode:?})"),

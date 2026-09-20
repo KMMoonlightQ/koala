@@ -1,8 +1,10 @@
 pub mod agentmem;
 pub mod background;
+mod btw;
 pub mod compact;
 pub mod event;
 mod file_io;
+pub mod graph;
 pub mod hooks;
 pub mod permissions;
 pub mod plan;
@@ -233,6 +235,11 @@ impl Agent {
         let journal =
             work::Journal::new(self.transcript.path().with_file_name(format!("{id}.work")));
         let saved = journal.load()?;
+        let plan_mode = saved.as_ref().and_then(|s| s.plan_mode).unwrap_or(false);
+        let permission_mode = saved
+            .as_ref()
+            .and_then(|s| s.permission_mode)
+            .unwrap_or(crate::config::PermissionMode::Normal);
         self.transcript.restore(id, self.lang())?;
         self.agent_memory
             .set_source(self.transcript.path().display().to_string());
@@ -248,7 +255,10 @@ impl Agent {
             .collect();
         self.todos = TodoList::default();
         let tasks = if let Some(saved) = saved {
-            self.history = saved.messages;
+            // A settings-only journal must not replace a legacy transcript's context.
+            if saved.has_conversation {
+                self.history = saved.messages;
+            }
             self.todos.replace(saved.todos);
             saved.tasks
         } else {
@@ -256,11 +266,50 @@ impl Agent {
         };
         self.background = self.background.for_session(journal, tasks);
         self.pending_input = None;
-        self.plan_mode = false;
-        self.shared
-            .permissions
-            .set_mode(crate::config::PermissionMode::Normal);
+        self.plan_mode = plan_mode;
+        self.shared.permissions.set_mode(permission_mode);
         Ok(records)
+    }
+
+    /// Move within a session without deleting or copying its alternate paths.
+    pub fn branch_before_turn(&mut self, id: &str) -> Result<String, String> {
+        self.navigate_turn(id, false)
+    }
+
+    pub fn navigate_turn(&mut self, id: &str, after: bool) -> Result<String, String> {
+        let journal = self
+            .background
+            .journal
+            .as_ref()
+            .ok_or("No session journal")?;
+        let graph = journal.graph_snapshot();
+        let node = graph
+            .get(id)
+            .filter(|n| n.kind == graph::Kind::Turn)
+            .ok_or("Select a conversation turn")?;
+        let draft = if after {
+            String::new()
+        } else {
+            node.data["input"]
+                .as_str()
+                .ok_or("Turn has no saved input")?
+                .to_owned()
+        };
+        let state = journal
+            .load_at(Some(id), after)?
+            .ok_or("No saved context")?;
+        let current = if after {
+            Some(id.to_owned())
+        } else {
+            graph.turn_parent(id)
+        };
+        journal
+            .navigate(current, &state)
+            .map_err(|e| e.to_string())?;
+        self.history = state.messages;
+        self.todos.replace(state.todos);
+        self.pending_input = None;
+        Ok(draft)
     }
 
     pub fn new_session(&mut self) {
@@ -276,9 +325,13 @@ impl Agent {
         self.pending_input = None;
     }
 
-    pub fn toggle_plan_mode(&mut self) -> bool {
-        self.plan_mode = !self.plan_mode;
-        self.plan_mode
+    pub fn toggle_plan_mode(&mut self) -> std::io::Result<bool> {
+        let next = !self.plan_mode;
+        if let Some(journal) = &self.background.journal {
+            journal.plan_mode(next)?;
+        }
+        self.plan_mode = next;
+        Ok(next)
     }
 
     pub fn plan_mode(&self) -> bool {
@@ -293,10 +346,11 @@ impl Agent {
         let Some(journal) = &self.background.journal else {
             return Ok(());
         };
-        if journal
-            .load()
-            .map_err(std::io::Error::other)?
-            .is_some_and(|saved| !saved.trace.is_empty())
+        if journal.has_trace()
+            || journal
+                .load()
+                .map_err(std::io::Error::other)?
+                .is_some_and(|saved| saved.navigated || !saved.trace.is_empty())
         {
             return Ok(());
         }
@@ -342,13 +396,36 @@ impl Agent {
             .await
             .map_err(AgentError::Extension)?;
         self.initialize_work_trace()?;
-        let changed = compact::compact_keeping(
+        if let Some(journal) = &self.background.journal {
+            journal.initialize_permission_mode(self.shared.permissions.mode())?;
+            journal.plan_mode(self.plan_mode)?;
+        }
+        let mut span = self
+            .background
+            .journal
+            .clone()
+            .map(graph::Recorder::new)
+            .map(|r| {
+                r.start(
+                    graph::Kind::Compaction,
+                    "Manual compaction",
+                    serde_json::json!({"before": self.history}),
+                    vec![],
+                )
+            })
+            .transpose()?;
+        let outcome = compact::compact_keeping(
             &self.shared.llm,
             &mut self.history,
             compact::KEEP_RECENT,
             self.shared.compact_threshold,
         )
-        .await?;
+        .await;
+        if let Some(span) = &mut span {
+            span.finish(if outcome.is_ok() { graph::Status::Succeeded } else { graph::Status::Failed },
+                serde_json::json!({"after": self.history, "changed": outcome.as_ref().ok(), "error": outcome.as_ref().err().map(ToString::to_string)}))?;
+        }
+        let changed = outcome?;
         self.shared.extensions.hook(crate::extensions::Stage::AfterCompact, serde_json::json!({"session": self.transcript.id(), "messages": self.history, "changed": changed})).await.map_err(AgentError::Extension)?;
         if let Some(journal) = &self.background.journal {
             journal.context(&self.history, &self.todos.items)?;
@@ -360,6 +437,49 @@ impl Agent {
         &mut self,
         input: &str,
         events: EventSender,
+    ) -> Result<String, AgentError> {
+        self.initialize_work_trace()?;
+        if let Some(journal) = &self.background.journal {
+            journal.initialize_permission_mode(self.shared.permissions.mode())?;
+            journal.plan_mode(self.plan_mode)?;
+        }
+        let mut span = self
+            .background
+            .journal
+            .clone()
+            .map(graph::Recorder::new)
+            .map(|r| {
+                r.start(
+                    graph::Kind::Turn,
+                    input.lines().next().unwrap_or("Turn"),
+                    serde_json::json!({"input": input, "conversation_parent": self.background.journal.as_ref().and_then(|j| j.graph_snapshot().current_turn)}),
+                    vec![],
+                )
+            })
+            .transpose()?;
+        let recorder = span.as_ref().map(graph::Span::recorder);
+        let result = self.run_turn_recorded(input, events, recorder).await;
+        if let Some(span) = &mut span {
+            span.finish(
+                if result.is_ok() {
+                    graph::Status::Succeeded
+                } else {
+                    graph::Status::Failed
+                },
+                match &result {
+                    Ok(text) => serde_json::json!({"output": text}),
+                    Err(e) => serde_json::json!({"error": e.to_string()}),
+                },
+            )?;
+        }
+        result
+    }
+
+    async fn run_turn_recorded(
+        &mut self,
+        input: &str,
+        events: EventSender,
+        graph: Option<graph::Recorder>,
     ) -> Result<String, AgentError> {
         self.initialize_work_trace()?;
         if let Some(journal) = &self.background.journal {
@@ -386,6 +506,7 @@ impl Agent {
 
         let reply = {
             let mut ctx = ToolContext {
+                graph,
                 todos: &mut self.todos,
                 agent_memory: &self.agent_memory,
                 background: self.background.clone(),
@@ -480,6 +601,83 @@ impl Agent {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn graph_records_nested_runs_and_consumed_tool_results_after_restart() {
+        use crate::test_support::{MockLlm, stream};
+        use serde_json::json;
+        let mut mock = MockLlm::start(vec![
+            stream(json!({"tool_calls":[{"index":0,"id":"reused","function":{"name":"task","arguments":json!({"description":"child","prompt":"inspect"}).to_string()}}]})),
+            stream(json!({"tool_calls":[{"index":0,"id":"reused","function":{"name":"bash","arguments":json!({"command":"printf graph-child"}).to_string()}}]})),
+            stream(json!({"content":"child finished"})),
+            stream(json!({"content":"parent finished"})),
+        ]).await;
+        let (mut agent, root) = mock_agent(&mock.url).await;
+        agent
+            .shared
+            .permissions
+            .set_mode(crate::config::PermissionMode::NeverAsk);
+        agent
+            .run_turn("nested task", event::null_events())
+            .await
+            .unwrap();
+        let journal = agent.background.journal.as_ref().unwrap();
+        let graph = work::Journal::new(journal.path.clone())
+            .load()
+            .unwrap()
+            .unwrap()
+            .graph;
+        assert_eq!(graph.nodes.len(), 8);
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .all(|n| n.status == graph::Status::Succeeded)
+        );
+        let task = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == graph::Kind::Tool && n.label == "task")
+            .unwrap();
+        let child = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == graph::Kind::Subagent)
+            .unwrap();
+        let bash = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == graph::Kind::Tool && n.label == "bash")
+            .unwrap();
+        assert_eq!(child.parent_id.as_ref(), Some(&task.id));
+        assert_eq!(bash.run_id, child.id);
+        assert_ne!(
+            bash.id, task.id,
+            "provider call ids must not be graph identities"
+        );
+        assert_eq!(bash.data["result"]["model_output"], "graph-child");
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| n.kind == graph::Kind::Model && n.inputs.contains(&bash.id))
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|n| n.kind == graph::Kind::Model && n.inputs.contains(&task.id))
+        );
+        let request = mock.request().await;
+        let first_model = graph
+            .nodes
+            .iter()
+            .find(|n| n.kind == graph::Kind::Model)
+            .unwrap();
+        assert_eq!(first_model.data["messages"], request["messages"]);
+        assert_eq!(first_model.data["tools"], request["tools"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     async fn mock_agent(url: &str) -> (Agent, PathBuf) {
         let root = std::env::temp_dir().join(format!("koala-review-{}", uuid::Uuid::new_v4()));
         let mut cfg = Config::default();
@@ -523,6 +721,7 @@ mod tests {
         ));
         let events = event::null_events();
         let mut ctx = ToolContext {
+            graph: None,
             todos: &mut agent.todos,
             agent_memory: &agent.agent_memory,
             background: agent.background.clone(),
@@ -645,6 +844,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_plan_save_preserves_the_active_mode() {
+        let (mut agent, root) = mock_agent("http://localhost:1").await;
+        let path = agent.background.journal.as_ref().unwrap().path.clone();
+        std::fs::create_dir_all(&path).unwrap();
+        assert!(agent.toggle_plan_mode().is_err());
+        assert!(!agent.plan_mode());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_keeps_plan_mode_across_sessions_and_restart() {
+        let (mut agent, root) = mock_agent("http://localhost:1").await;
+        let id = agent.session_id().to_owned();
+        agent
+            .background
+            .journal
+            .as_ref()
+            .unwrap()
+            .context(&[Message::user("investigate only")], &[])
+            .unwrap();
+        agent.toggle_plan_mode().unwrap();
+        agent.new_session();
+        agent.toggle_plan_mode().unwrap();
+        agent.restore_session(&id).unwrap();
+        assert!(
+            agent.plan_mode(),
+            "restore must not enable execution for a planning session"
+        );
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.agent.session_dir = root.join("sessions");
+        cfg.agent.memory_file = root.join("memory.md");
+        let mut restarted = Agent::new(&cfg).await.unwrap();
+        restarted.restore_session(&id).unwrap();
+        assert!(restarted.plan_mode());
+        assert_eq!(
+            restarted.history[0].content.as_deref(),
+            Some("investigate only")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn restore_recovers_tool_protocol_and_working_todos() {
         use crate::test_support::{MockLlm, stream};
         let mut mock = MockLlm::start(vec![
@@ -745,7 +987,7 @@ mod tests {
                     .any(|tool| tool["function"]["name"] == name)
             );
         }
-        agent.toggle_plan_mode();
+        agent.toggle_plan_mode().unwrap();
         agent
             .run_turn("plan only", event::null_events())
             .await
@@ -925,6 +1167,191 @@ mod tests {
         agent.record_interruption("partial answer").unwrap();
         assert_eq!(agent.history.len(), 4);
         assert!(agent.pending_input.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_tree_keeps_siblings_and_restores_selected_context() {
+        use crate::test_support::{MockLlm, stream};
+        let root = std::env::temp_dir().join(format!("koala-tree-{}", uuid::Uuid::new_v4()));
+        let mut mock = MockLlm::start(
+            ["answer A", "answer B", "answer C", "answer D"]
+                .into_iter()
+                .map(|text| stream(serde_json::json!({"content":text})))
+                .collect(),
+        )
+        .await;
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.llm.base_url = mock.url.clone();
+        cfg.agent.session_dir = root.join("sessions");
+        cfg.agent.memory_file = root.join("memory.md");
+        let mut agent = Agent::new(&cfg).await.unwrap();
+        let session_id = agent.session_id().to_owned();
+        agent
+            .run_turn("question A", event::null_events())
+            .await
+            .unwrap();
+        mock.request().await;
+        let a = agent
+            .background
+            .journal
+            .as_ref()
+            .unwrap()
+            .graph_snapshot()
+            .current_turn
+            .unwrap();
+        agent
+            .run_turn("question B", event::null_events())
+            .await
+            .unwrap();
+        mock.request().await;
+        let b = agent
+            .background
+            .journal
+            .as_ref()
+            .unwrap()
+            .graph_snapshot()
+            .current_turn
+            .unwrap();
+        agent.navigate_turn(&a, true).unwrap();
+        agent
+            .run_turn("question C", event::null_events())
+            .await
+            .unwrap();
+        let request = mock.request().await;
+        let messages = request["messages"].to_string();
+        assert!(
+            messages.contains("question A")
+                && messages.contains("answer A")
+                && messages.contains("question C")
+        );
+        assert!(!messages.contains("question B") && !messages.contains("answer B"));
+        let graph = agent.background.journal.as_ref().unwrap().graph_snapshot();
+        let c = graph.current_turn.clone().unwrap();
+        assert_eq!(graph.turn_parent(&b).as_deref(), Some(a.as_str()));
+        assert_eq!(graph.turn_parent(&c).as_deref(), Some(a.as_str()));
+        assert_eq!(agent.session_id(), session_id);
+        agent.navigate_turn(&b, true).unwrap();
+        agent.new_session();
+        agent.restore_session(&session_id).unwrap();
+        assert_eq!(
+            agent
+                .background
+                .journal
+                .as_ref()
+                .unwrap()
+                .graph_snapshot()
+                .current_turn
+                .as_deref(),
+            Some(b.as_str())
+        );
+        assert!(
+            agent
+                .history
+                .iter()
+                .any(|m| m.content.as_deref() == Some("answer B"))
+        );
+        assert!(
+            !agent
+                .history
+                .iter()
+                .any(|m| m.content.as_deref() == Some("answer C"))
+        );
+        // Re-asking the first turn must not seed history from the linear transcript.
+        assert_eq!(agent.branch_before_turn(&a).unwrap(), "question A");
+        agent
+            .run_turn("question D", event::null_events())
+            .await
+            .unwrap();
+        let request = mock.request().await;
+        let messages = request["messages"].as_array().unwrap();
+        let users: Vec<_> = messages.iter().filter(|m| m["role"] == "user").collect();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0]["content"], "question D");
+        let graph = agent.background.journal.as_ref().unwrap().graph_snapshot();
+        assert!(
+            graph
+                .turn_parent(graph.current_turn.as_deref().unwrap())
+                .is_none()
+        );
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .filter(|n| n.kind == graph::Kind::Turn)
+                .count(),
+            4
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join("sessions"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.path().extension().is_some_and(|x| x == "work"))
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn branching_keeps_only_prior_context_and_preserves_original() {
+        let root = std::env::temp_dir().join(format!("koala-branch-{}", uuid::Uuid::new_v4()));
+        let mut cfg = crate::config::Config::default();
+        cfg.llm.model = "test".into();
+        cfg.agent.session_dir = root.join("sessions");
+        cfg.agent.memory_file = root.join("memory.md");
+        let mut agent = Agent::new(&cfg).await.unwrap();
+        let journal = agent.background.journal.clone().unwrap();
+        journal
+            .trace(work::Trace::User("prior question".into()))
+            .unwrap();
+        journal
+            .trace(work::Trace::Text("prior answer".into()))
+            .unwrap();
+        journal
+            .context(
+                &[
+                    Message::user("prior question"),
+                    Message::assistant("prior answer"),
+                ],
+                &[],
+            )
+            .unwrap();
+        let mut turn = graph::Recorder::new(journal.clone())
+            .start(
+                graph::Kind::Turn,
+                "retry",
+                serde_json::json!({"input":"retry\nthis"}),
+                vec![],
+            )
+            .unwrap();
+        journal
+            .trace(work::Trace::User("retry\nthis".into()))
+            .unwrap();
+        journal
+            .context(&[Message::user("future content must be excluded")], &[])
+            .unwrap();
+        turn.finish(graph::Status::Failed, serde_json::json!({}))
+            .unwrap();
+        let before = std::fs::read(&journal.path).unwrap();
+        let original = agent.session_id().to_owned();
+        assert!(agent.branch_before_turn("missing").is_err());
+        assert_eq!(agent.session_id(), original);
+        assert_eq!(
+            agent.branch_before_turn(&turn.node.id).unwrap(),
+            "retry\nthis"
+        );
+        assert_eq!(agent.session_id(), original);
+        assert_eq!(agent.history.len(), 2);
+        assert_eq!(agent.history[1].content.as_deref(), Some("prior answer"));
+        assert!(std::fs::read(&journal.path).unwrap().starts_with(&before));
+        assert!(journal.graph_snapshot().get(&turn.node.id).is_some());
+        let branch = agent.session_id().to_owned();
+        agent.new_session();
+        agent.restore_session(&branch).unwrap();
+        assert_eq!(agent.history.len(), 2);
+        assert_eq!(agent.history[0].content.as_deref(), Some("prior question"));
         std::fs::remove_dir_all(root).unwrap();
     }
 

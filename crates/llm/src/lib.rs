@@ -28,6 +28,8 @@ pub struct Message {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -90,6 +92,7 @@ pub use koala_extension_api::{Tool, ToolFunction};
 pub struct StreamDelta {
     pub usage: Option<TokenUsage>,
     pub content: Option<String>,
+    pub reasoning_content: Option<String>,
     pub tool_calls: Vec<ToolCallDelta>,
 }
 
@@ -126,6 +129,8 @@ struct ChunkChoice {
 
 #[derive(Debug, Deserialize)]
 struct ChunkDelta {
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
@@ -250,6 +255,7 @@ impl SseParser {
         Some(Ok(StreamDelta {
             usage: chunk.usage,
             content: choice.delta.content,
+            reasoning_content: choice.delta.reasoning_content,
             tool_calls,
         }))
     }
@@ -259,6 +265,7 @@ impl SseParser {
 /// Tool call fragments are concatenated in arrival order, grouped by `index`.
 #[derive(Debug, Default)]
 pub struct DeltaAggregator {
+    reasoning_content: Option<String>,
     content: String,
     tool_calls: BTreeMap<usize, ToolCallBuild>,
 }
@@ -272,6 +279,11 @@ struct ToolCallBuild {
 
 impl DeltaAggregator {
     pub fn push(&mut self, delta: &StreamDelta) {
+        if let Some(reasoning) = &delta.reasoning_content {
+            self.reasoning_content
+                .get_or_insert_with(String::new)
+                .push_str(reasoning);
+        }
         if let Some(content) = &delta.content {
             self.content.push_str(content);
         }
@@ -303,6 +315,7 @@ impl DeltaAggregator {
             })
             .collect();
         Message {
+            reasoning_content: self.reasoning_content,
             role: "assistant".into(),
             content: if self.content.is_empty() {
                 None
@@ -394,6 +407,35 @@ impl LlmClient {
         format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
     }
 
+    /// DeepSeek requires the field even for synthetic/legacy assistant messages.
+    /// Preserve returned reasoning verbatim; an empty value marks unavailable
+    /// reasoning, rather than inventing it or rewriting persisted history.
+    fn request_messages<'a>(
+        &self,
+        model: &str,
+        messages: &'a [Message],
+    ) -> std::borrow::Cow<'a, [Message]> {
+        let deepseek = model.to_ascii_lowercase().contains("deepseek")
+            || reqwest::Url::parse(&self.base_url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .is_some_and(|host| host == "api.deepseek.com");
+        if !deepseek
+            || !messages
+                .iter()
+                .any(|m| m.role == "assistant" && m.reasoning_content.is_none())
+        {
+            return std::borrow::Cow::Borrowed(messages);
+        }
+        let mut prepared = messages.to_vec();
+        for message in &mut prepared {
+            if message.role == "assistant" && message.reasoning_content.is_none() {
+                message.reasoning_content = Some(String::new());
+            }
+        }
+        std::borrow::Cow::Owned(prepared)
+    }
+
     async fn send(
         &self,
         messages: &[Message],
@@ -401,10 +443,11 @@ impl LlmClient {
         stream: bool,
     ) -> Result<reqwest::Response, LlmError> {
         let (model, reasoning_effort) = self.selection.read().unwrap().clone();
+        let messages = self.request_messages(&model, messages);
         let request = ChatRequest {
             model: &model,
             reasoning_effort,
-            messages,
+            messages: &messages,
             tools,
             stream,
             stream_options: stream.then_some(StreamOptions {
@@ -577,6 +620,62 @@ mod tests {
 
     fn chunk(delta: serde_json::Value) -> serde_json::Value {
         serde_json::json!({"choices": [{"delta": delta}]})
+    }
+
+    #[test]
+    fn reasoning_compatibility_is_scoped_to_deepseek_and_preserves_existing_values() {
+        let client = LlmClient::new(
+            "https://gateway.example/v1",
+            "",
+            "test",
+            &Default::default(),
+        );
+        let mut original = Message::assistant("answer");
+        original.reasoning_content = Some("full original reasoning".into());
+        let messages = [
+            Message::user("question"),
+            Message::assistant("synthetic"),
+            original,
+        ];
+        let generic = client.request_messages("other-model", &messages);
+        assert!(generic[1].reasoning_content.is_none());
+        let prepared = client.request_messages("vendor/DeepSeek-v4-flash", &messages);
+        assert_eq!(prepared[1].reasoning_content.as_deref(), Some(""));
+        assert_eq!(prepared[2].reasoning_content, messages[2].reasoning_content);
+        assert!(prepared[0].reasoning_content.is_none());
+        let native = LlmClient::new(
+            "https://api.deepseek.com/v1",
+            "",
+            "alias",
+            &Default::default(),
+        );
+        assert_eq!(
+            native.request_messages("alias", &messages)[1]
+                .reasoning_content
+                .as_deref(),
+            Some("")
+        );
+        assert!(messages[1].reasoning_content.is_none());
+    }
+
+    #[test]
+    fn reasoning_content_survives_tool_round_trip() {
+        let mut parser = SseParser::new();
+        let mut aggregator = DeltaAggregator::default();
+        let fixture = [
+            sse(chunk(serde_json::json!({"reasoning_content":"think "}))),
+            sse(chunk(serde_json::json!({"reasoning_content":"more"}))),
+            sse(chunk(serde_json::json!({"tool_calls":[{"index":0,"id":"c1","function":{"name":"read","arguments":"{}"}}]}))),
+            "data: [DONE]\n".into(),
+        ].concat();
+        for delta in parser.feed(fixture.as_bytes()) {
+            aggregator.push(&delta.unwrap());
+        }
+        let messages = vec![aggregator.into_message(), Message::tool("c1", "result")];
+        let request = serde_json::to_value(messages).unwrap();
+        assert_eq!(request[0]["reasoning_content"], "think more");
+        assert_eq!(request[0]["tool_calls"][0]["id"], "c1");
+        assert!(request[1].get("reasoning_content").is_none());
     }
 
     #[test]

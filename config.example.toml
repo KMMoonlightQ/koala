@@ -1,3 +1,4 @@
+# 将此模板复制到 ~/.koala/config.toml 后编辑。
 # 界面语言：en（默认）或 zh。也可用 /lang 在对话中切换，或用 KOALA_LANG 覆盖。
 # lang = "zh"
 
@@ -33,7 +34,7 @@ max_retries = 5
 compact_threshold = 40000                # 每次请求的序列化字节预算，含工具、动态上下文及 4096 字节回复预留
 subagent_max_rounds = "unlimited"
 session_dir = ".koala/session"              # 会话转录目录：通用 JSONL 会话转录
-# memory_file = "..."                    # 结构化私有记忆，默认 <config dir>/koala/memory.json
+# memory_file = "..."                    # 结构化私有记忆，默认 ~/.koala/memory.json
 # memory_read = true                     # 自动加载索引及 recall；与写入开关独立
 # memory_write = true                    # remember 更新/删除；不影响已有条目的读取
 # memory_index_bytes = 4000              # 索引 UTF-8 字节预算，限制在 1024..=32000
@@ -41,9 +42,9 @@ session_dir = ".koala/session"              # 会话转录目录：通用 JSONL 
 # 权限等级：normal / ask_when_need / auto_edit / never_ask
 # 对话内 /permissions 切换；方向键选择，Enter 确认，Esc 取消
 [permissions]
-mode = "normal"
-# allow 在 ask_when_need / auto_edit 下自动放行指定工具；deny 优先。
-# never_ask 自动放行全部工具，不应用 allow/deny。
+mode = "ask_when_need"
+# allow 在 ask_when_need / auto_edit 下自动放行指定工具；所有档位都优先执行 deny。
+# never_ask 自动放行未被 deny 禁止的工具，不再请求审批。
 allow = []
 deny = []
 
@@ -57,7 +58,7 @@ turn_end = []
 
 # Extensions are trusted local programs. All extensions load in the listed order.
 [extensions]
-manifests = [] # e.g. [".koala/extensions/context-example/extension.toml"]
+manifests = [] # e.g. ["/absolute/path/to/.koala/extensions/context-example/extension.toml"]
 timeout_secs = 30
 
 # MCP 客户端（可配置多个服务器；修改后重启）

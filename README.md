@@ -28,8 +28,9 @@ OpenAI 兼容 Chat Completions 端点。
 在项目根目录执行：
 
 ```bash
-cp config.example.toml config.toml
-# 编辑 config.toml：[llm] 段填 base_url / api_key / model
+mkdir -p ~/.koala
+cp -n config.example.toml ~/.koala/config.toml
+# 编辑 ~/.koala/config.toml：[llm] 段填 base_url / api_key / model
 
 cargo build --release
 ./target/release/koala            # 进入对话，等同于 koala chat
@@ -47,17 +48,24 @@ koala --help
 
 ## 配置
 
-配置按以下顺序读取，找到第一个文件后停止，不合并多个文件：
+主配置统一读取用户主目录下的 `~/.koala/config.toml`，与安装位置和启动目录无关。
+文件不存在时使用内置默认值；环境变量仍可覆盖文件配置。本文中的 `config.toml`
+均指此文件。程序不再读取项目根目录或系统配置目录中的旧主配置。
+从旧版本升级时，将原有配置复制到 `~/.koala/config.toml`；已有目标文件时请手动合并。
 
-1. 当前工作目录的 `config.toml`。
-2. 系统配置目录下的 `koala/config.toml`。
-3. 如果都不存在，使用内置默认值。
+全局资源统一放在用户主目录下的 `.koala`，不再使用系统配置目录：
 
-系统配置目录通过 `dirs::config_dir()` 获取：Linux 通常为 `~/.config`（可由
-`XDG_CONFIG_HOME` 覆盖），macOS 为 `~/Library/Application Support`，Windows 为
-Roaming AppData 目录。全局配置、Agent 私有记忆和全局 skills 均使用此目录。
-统一使用 `koala` 配置子目录、`KOALA_*` 环境变量和 `.koala` 数据目录。
-从旧版本升级时，请迁移数据和全局配置目录，并同步更新自定义路径及环境变量名称。
+| 资源 | 默认位置 |
+|---|---|
+| 主配置及 MCP 服务器配置 | `~/.koala/config.toml` 中的 `[mcp.servers.*]` |
+| 全局 skills | `~/.koala/skills/<name>/SKILL.md` |
+| Agent 私有记忆 | `~/.koala/memory.json` |
+| 扩展安装目录 | `~/.koala/extensions/` |
+| 全局提示词与指令 | `~/.koala/SYSTEM.md`、`APPEND_SYSTEM.md`、`AGENTS.md` 等 |
+
+可用 `mkdir -p ~/.koala/skills` 创建 skills 目录；记忆和扩展目录在写入或安装时自动创建。
+升级时将旧系统配置目录 `koala/` 中的相应文件迁入 `~/.koala/`，已有目标文件时手动合并。
+旧 `memory.md` 可一并保留，仍不会自动导入结构化记忆。显式配置的自定义路径继续生效。
 
 最小配置示例：
 
@@ -83,14 +91,14 @@ model = "your-model-name"
 会话转录目录由 `agent.session_dir` 单独控制，
 默认仍为 `.koala/session`；相对路径均相对于启动时的工作目录。
 
-工具权限默认使用 **Normal**，每次工具调用均需确认；可通过 `/permissions` 切换。
-`deny` 在 Normal / Ask When Need 下优先，`allow` 仅在 Ask When Need 下生效；
-Never Ask 自动放行全部工具。具体行为见[工具权限](#工具权限)。
+工具权限默认使用 **Ask When Need**，自动执行只读调查和辅助工具，修改及无法判断的操作需确认；可通过 `/permissions` 切换。
+`deny` 在所有档位下优先，`allow` 在 Ask When Need / Auto Edit 下生效；
+Never Ask 自动放行未被 `deny` 禁止的工具。具体行为见[工具权限](#工具权限)。
 完整的 Agent 参数、权限规则和 hooks 示例见 [config.example.toml](config.example.toml)。
 
 ## 记忆
 
-- **Agent 私有记忆**：`agent.memory_file`（默认 `<config dir>/koala/memory.json`），保存精炼的可复用结论。`remember` 按稳定键更新或删除，`recall` 检索或按键读取详情；默认只注入有预算的索引。
+- **Agent 私有记忆**：`agent.memory_file`（默认 `~/.koala/memory.json`），保存精炼的可复用结论。`remember` 按稳定键更新或删除，`recall` 检索或按键读取详情；默认只注入有预算的索引。
 
 ### 私有记忆的作用域与维护
 
@@ -167,18 +175,48 @@ koala memory forget reply-language --scope global
 |---|---|
 | `/sessions` | 展示历史会话，↑↓ 选择、Enter 恢复并继续对话、Esc 取消 |
 | `/new` | 中断当前前台工作并开新会话，同步清空对话视图 |
+| `/btw [问题]` | 打开临时对话，可连续追问；Esc 关闭并返回主线 |
 | `/plan` | 开关 plan mode |
 | `/compact` | 手动压缩上下文 |
 | `/model` | 打开模型列表，↑↓ 选择、Enter 确认、Esc 取消；也支持 `/model 模型名` |
 | `/permissions` | 选择四级权限；也支持 `/permissions normal`、`/permissions ask_when_need`、`/permissions auto_edit`、`/permissions never_ask` |
 | `/effort` | 打开思考档位列表，↑↓ 选择、Enter 确认、Esc 取消；也支持 `/effort high` |
 | `/tasks` | 查看后台任务 |
+| `/tree` | 浏览会话树、切换分支、重新问话，执行期间可浏览 |
 | `/todos` | 打开完整 Todo 列表 |
 | `/help` | 打开快捷键与命令帮助 |
 | `/skills` | 列出已加载 skills |
 | `/theme` | 弹窗选择主题；`/theme auto`、`/theme light`、`/theme dark` 切换并保存主题 |
 | `/lang` | 切换界面语言（中文 / English），也支持 `/lang en`、`/lang zh`；可在执行中使用 |
 | `/quit` 或 `/q` | 退出（可在执行中使用） |
+
+## 临时对话
+
+输入 `/btw` 打开临时对话，或用 `/btw 问题` 直接提问。主线正在执行时也可打开；
+已有草稿时按 `Alt+B`，返回后草稿、光标和主线视图保持原样。
+
+临时对话使用打开时的主线上下文快照；主线执行期间包含已完成的对话和当前问题，
+不包含尚未完成的流式回答。主线继续执行，临时对话中的追问只在本次临时对话内生效。
+这里仅进行问答，不调用工具、记忆写入或扩展 hooks；沿用当前模型和思考档位。
+
+`Enter` 发送，`Ctrl+C` 中断临时请求，`Esc` 关闭临时对话并返回主线；关闭会取消尚未结束的临时请求。
+临时问答及 `/btw` 携带的问题不保存到会话文件或输入历史，也不合并回主线。再次打开会创建新的临时对话。
+
+## 会话树
+
+输入 `/tree` 打开当前会话的对话分支树。树中显示问题、回答摘要、状态和当前继续位置。
+同一会话中的所有分支都保留在原 `.work` 文件中；切换路径不再创建新的 session。
+
+- ↑↓ 选择轮次，Enter 切换到该轮之后继续提问；`r` 回到该轮之前，并将原问题填回输入框供修改。
+- 新问题从当前选中路径继续，旧的后续对话作为另一条分支保留。切换和重启恢复只加载当前路径的上下文。
+- 默认隐藏模型与工具执行细节；→ 展开，← 收起。折叠细节不会隐藏后续对话分支。
+- `d` 查看完整节点记录；`/` 搜索问题、回答、参数和结果；Esc 返回。生成期间可以浏览，切换路径前需先中断。
+- 当前有输入草稿时先处理草稿，避免切换位置覆盖内容。
+
+导航只改变对话上下文和待办快照，不回滚文件、命令或外部操作，也不重启后台任务。
+本实现以一轮问答为导航单位，暂不提供 Pi 的逐消息导航、标签和分支摘要生成。
+旧的执行日志按线性对话读取；日志中没有记录的历史节点不会凭空补造。
+完整执行数据仍保存在节点详情中，包括模型请求、工具参数、结果和权限决策。
 
 ## 会话恢复
 
@@ -187,11 +225,15 @@ koala memory forget reply-language --scope global
 显示首条用户消息、更新时间、会话 ID，并标记当前会话。Enter 恢复历史对话到界面和模型上下文，
 后续消息继续追加到原文件。前台执行期间需先中断，再切换会话。
 
-恢复时权限回到 **Normal**、退出 Plan 模式，保留当前模型设置。新会话在原 `.jsonl` 问答转录之外，
+恢复时继承该会话最后保存的权限模式（包括 NeverAsk）；没有权限记录的旧会话默认使用 **Normal**。
+同时恢复最后保存的 Normal / Plan 工作模式，保留当前模型设置；旧日志没有工作模式记录时使用 Normal。
+权限和工作模式切换立即保存，保存失败时保持原状态并报错。新会话在原 `.jsonl` 问答转录之外，
 使用同名 `.work` 日志保存工具参数、完整显示输出、调用状态与耗时、模型工具消息、Todo 和后台任务状态。
 恢复后工具详情和 Todo 回到界面，模型也能接续工具上下文；旧版仅含 `.jsonl` 的会话仍可恢复聊天。
 同一进程内切回会话会重新关联仍在运行的后台任务；应用重启后保留已保存的任务结果，原运行中任务显示为已停止，
-并注明执行中断、结果未知，不会自动重跑命令。同一进程中，离开会话期间完成的任务通知会在切回时显示一次。首轮尚未完成的会话也可从工作日志恢复。
+并注明执行中断、结果未知，不会自动重跑命令。模型通过 `background_tasks` 使用的会话内任务编号保持稳定，
+载入其他历史会话或再次重启不会使旧编号失效；`/tasks` 的跨会话界面编号独立分配，用于界面中的停止操作。
+同一进程中，离开会话期间完成的任务通知会在切回时显示一次。首轮尚未完成的会话也可从工作日志恢复。
 `.work` 使用首个完整上下文加后续增量记录，旧版完整快照仍可读取，日志按行恢复。
 流式文本合并后写盘：累计 4KB，或下一片段到来时距上次刷新超过 250ms 即刷新；
 工具/上下文边界和中断恢复会强制刷新。进程被强制杀死时，可能丢失末尾不足 4KB 的文本；
@@ -200,32 +242,35 @@ koala memory forget reply-language --scope global
 
 ## 工具权限
 
-权限等级与 Normal / Plan 工作模式独立，底栏始终显示当前权限。默认 **Normal**：
+权限等级与 Normal / Plan 工作模式独立，底栏始终显示当前权限。新配置默认 **Ask When Need**；已有显式配置及会话中保存的模式保持不变：
 
 | 等级 | 行为 |
 |---|---|
 | Normal | 所有工具调用都需审批，包括读取、Todo 和记忆操作 |
-| Ask When Need | 自动执行 read、Todo、Agent 私有记忆追加、加载 skill、派生任务及扩展声明的只读工具；edit、write 和危险或无法判定的操作需审批 |
+| Ask When Need | 自动执行 read/glob/grep、Todo、Agent 私有记忆维护、加载 skill、派生任务及扩展声明的只读工具；edit、write 和危险或无法判定的操作需审批 |
 | Auto Edit | 在 Ask When Need 基础上，自动执行当前工作区内的 edit/write；工作区外路径及指向外部的符号链接仍需审批，Shell 和扩展写操作规则不变 |
-| Never Ask | 所有工具调用自动执行，不再请求审批 |
+| Never Ask | 未被 deny 禁止的工具自动执行，不再请求审批 |
 
-Ask When Need 仅自动放行简单的 `pwd`、`ls`、`cat`、`head`、`tail`、`wc` shell 命令。
-重定向、管道、命令组合、变量展开、脚本执行、网络请求及其他无法确认安全的命令都会请求审批。
+Ask When Need / Auto Edit 自动放行简单的 `pwd`、`ls`、`cat`、`head`、`tail`、`wc`、`du`、`stat`、`basename`、`dirname` Shell 命令，支持引号、转义空格及中文路径。
+重定向、管道、命令组合、变量或命令展开、通配符、脚本执行、网络请求及其他无法确认安全的命令都会请求审批；引号内出现这些特殊字符也保守审批。
+文件发现和内容搜索优先使用原生 `glob` / `grep`。
+生成回答期间也可使用 `/permissions` 切换权限，后续工具调用立即使用新设置；已经弹出的单次审批仍需处理。若希望未被禁止的工具调用自动执行，可选择 Never Ask。
+
 Auto Edit 的工作区为启动目录，路径按真实目标解析（包括符号链接）；支持在工作区内新建子目录和文件。
 显式 `allow` 仍可授权整个工具（如 `write`），包括工作区外操作；`deny` 优先。
 子 Agent 的后续工具调用仍逐次检查相同权限；没有交互通道时，需要审批的操作会被拒绝。
 
-`/permissions` 在前台空闲时切换，影响主 Agent 和已启动子 Agent 的后续工具调用；
+`/permissions` 可在执行期间切换，影响主 Agent 和已启动子 Agent 的后续工具调用；
 已启动的操作不会因此停止。切换在 `/new` 后保留，重启后使用配置值：
 
 ```toml
 [permissions]
-mode = "normal" # normal / ask_when_need / auto_edit / never_ask
+mode = "ask_when_need" # normal / ask_when_need / auto_edit / never_ask
 allow = []      # Ask When Need / Auto Edit：明确授权可自动执行的工具
-deny = []      # Normal / Ask When Need / Auto Edit：直接禁止的工具，优先于 allow
+deny = []      # 所有模式：直接禁止的工具，优先于 allow 和自动放行
 ```
 
-Never Ask 忽略 `allow` / `deny`；Plan 模式限制和 hook 阻断仍然有效。
+Never Ask 跳过审批，但仍执行 `deny`、Plan 模式限制和 hook 阻断。升级后，原先被 Never Ask 忽略的 `deny` 将生效。
 旧配置的 `permissions.default` 已由 `permissions.mode` 替代，需要删除 `default` 并选择新等级；
 旧字段或拼写错误会报配置错误，避免静默改变权限。
 
@@ -269,7 +314,7 @@ Enter 发送，Shift+Enter、Ctrl+J 或 `\` 后接 Enter 换行。启用终端�
 - `Esc`：中断当前响应、工具或压缩操作；权限确认区打开时，拒绝本次操作。
 - `Ctrl+C`：执行中中断整轮；空闲时清空输入。
 - `Ctrl+D`：输入为空时退出；有草稿时交给输入框处理，不直接退出。
-- `PageUp` / `PageDown`：翻阅历史。上翻后新内容不会抢走阅读位置，翻到底部后恢复跟随。
+- 鼠标滚轮或 `PageUp` / `PageDown`：滚动对话内容，不召回输入历史。上翻后新内容不会抢走阅读位置，翻到底部后恢复跟随。
 - `Ctrl+End`：回到底部并恢复跟随。
 - `/`：显示带说明的命令菜单，继续输入可筛选；上下键选择、Tab 补全、Enter 执行、Esc 收起。
   未知命令会显示提示并保留输入。
@@ -306,6 +351,10 @@ Enter 发送，Shift+Enter、Ctrl+J 或 `\` 后接 Enter 换行。启用终端�
 思考档位及上下文用量，仅在启用 Plan 或存在后台任务时显示对应状态；快捷键说明集中在 `?` 帮助面板。`/plan` 的实际切换结果
 由后端同步到状态栏；用量来自流式响应的 `usage`，不会累加历次请求。首次请求前、压缩或恢复会话后、切换模型后，以及接口未返回用量时显示 `--%`；未配置容量时隐藏百分比。
 
+底栏同时显示最近一次前台请求的输入和输出 token：`Token: ↑ 12.3K ↓ 1.2K`。
+`↑` 为输入（包含缓存输入），`↓` 为输出；按 1,000 / 1,000,000 使用 `K` / `M`，
+最多保留一位小数，整数省略小数。未返回用量时显示 `Token: ↑ -- ↓ --`，无需配置上下文容量。
+
 助手消息支持 Markdown 标题、强调、列表、任务列表、引用、链接、代码块和表格。
 代码块支持 Rust、Python、JS/TS、JSON、Shell 的基础词法着色，其他语言保留原文。
 表格在窄窗口中改为带字段名的逐项展示；中文和 emoji 按显示宽度换行。
@@ -327,10 +376,10 @@ Enter 发送，Shift+Enter、Ctrl+J 或 `\` 后接 Enter 换行。启用终端�
 | 权限控制 | `src/agent/permissions.rs`：三级可切换审批策略；审批区显示操作与参数 |
 | System prompt | `src/agent/prompt.rs`：每次模型请求前组装角色、当前工具及规则、项目指令、skills 目录、实时记忆与 Todo、模式约束和 cwd；支持自定义前缀与追加指令 |
 | Plan mode | `/plan` 切换；仅向模型提供 read / recall / todo_write / skill / task / background_tasks 及扩展声明的只读工具；bash、edit、write、remember 的执行仍会被后端拒绝，子 Agent 继承此限制 |
-| Skills | `./skills/*/SKILL.md` 或 `<config dir>/koala/skills/*/SKILL.md`，清单进 prompt，`skill` 工具按需加载全文 |
+| Skills | `./skills/*/SKILL.md` 或 `~/.koala/skills/*/SKILL.md`，清单进 prompt，`skill` 工具按需加载全文 |
 | Context compact | 每次主/子 Agent 请求前检查预算，超限压缩历史；也可 `/compact` 手动 |
 | Sub agents | `task` 工具派生子 Agent（独立上下文，不能再派孙 Agent），支持后台运行 |
-| Agent 私有记忆 | `agent.memory_file`（默认 `<config dir>/koala/memory.json`），精炼索引注入 prompt；`remember` 更新/遗忘，`recall` 按需读取 |
+| Agent 私有记忆 | `agent.memory_file`（默认 `~/.koala/memory.json`），精炼索引注入 prompt；`remember` 更新/遗忘，`recall` 按需读取 |
 | 异常与重试 | LLM 建连失败（429/5xx/网络）指数退避重试 5 次；工具错误作为结果回喂不中断循环 |
 | 后台任务 | `bash` / `task` 加 `background=true`，`/tasks` 查看状态，完成自动通知 |
 
@@ -347,14 +396,22 @@ Enter 发送，Shift+Enter、Ctrl+J 或 `\` 后接 Enter 换行。启用终端�
 
 ## 文件工具与系统提示词
 
-默认提供四个文件与命令工具，主 Agent 和子 Agent 共用相同实现：
+默认提供六个文件与命令工具，主 Agent 和子 Agent 共用相同实现：
 
 | 工具 | 参数和行为 |
 |---|---|
 | `read` | `path`，可选 `offset`（从 1 开始）和 `limit`；读取 UTF-8 文本，每页最多 2,000 行 / 32 KiB，返回继续读取的 offset；不支持图片或二进制文件 |
-| `bash` | `command`，可选 `timeout` 和 `background`；执行命令、搜索文件和运行测试，保留后台任务支持 |
+| `glob` | `pattern`，可选 `path`、`limit`、`hidden`；按相对搜索根目录的路径模式找文件，支持 `*`、`**`、`?`、`[]`，例如 `**/*.rs` |
+| `grep` | `pattern`，可选 `path`、`glob`、`literal`、`ignore_case`、`limit`、`hidden`；逐行搜索 UTF-8 文本，默认 Rust 正则，返回绝对路径、从 1 开始的行号和文本 |
+| `bash` | `command`，可选 `timeout` 和 `background`；运行程序、构建、测试或文件工具不支持的操作，保留后台任务支持 |
 | `edit` | `path` 与 `edits: [{oldText, newText}]`；所有匹配都基于原文件，必须非空、唯一且互不重叠；全部验证通过才写入 |
 | `write` | `path` 与 `content`；创建或完整覆盖文件，自动创建缺失的父目录 |
+
+`glob` / `grep` 直接在 Rust 内执行，不依赖 Bash、rg 或 find；主/子 Agent 的 Plan 模式均可使用。
+搜索默认跳过隐藏项（`hidden=true` 可包含）、符号链接及 `.git`、`node_modules`、`target` 目录，暂不解析 `.gitignore`。
+显式传入普通文件时直接搜索该文件；显式路径不能是符号链接。默认返回 200 项，最多 1,000 项 / 32 KiB 结果正文，
+最多遍历 20,000 项、64 层目录；内容搜索最多扫描约 64 MiB，跳过超过 2 MiB、二进制或非 UTF-8 文件。
+返回 JSON 的 `truncated`、`skipped_files`、`warnings` 表明不完整结果；截断后缩小 `path` / `pattern` / `glob`，不能据此断言全库无匹配。
 
 文件工具支持绝对路径、相对启动工作目录的路径及 `~/`。edit / write 通过临时文件替换目标，
 避免写入失败时留下截断文件；保留已有文件的权限，并跟随已有符号链接修改目标文件。
@@ -367,7 +424,7 @@ Enter 发送，Shift+Enter、Ctrl+J 或 `\` 后接 Enter 换行。启用终端�
 子 Agent 不包含 task。每次模型请求前刷新记忆与 Todo，工具产生的新状态在下一轮立即可见。
 技能只注入名称、描述和文件位置，通过 skill 工具按需获取正文。
 
-可在当前项目下创建以下文件（全局回退位置为 `<config dir>/koala/`）：
+可在当前项目下创建以下文件（全局回退位置为 `~/.koala/`）：
 
 | 文件 | 用途 |
 |---|---|
@@ -443,13 +500,13 @@ MCP 工具沿用现有 hooks、四级权限和 Plan 模式。默认视作非只�
 koala extension-install examples/extensions/context
 ```
 
-命令复制目录至 `.koala/extensions/<name>`，拒绝覆盖已有安装、符号链接和特殊文件。
-可用 `--directory path/to/extensions` 指定安装目录；默认安装位置固定为 `.koala/extensions`，
+命令复制目录至 `~/.koala/extensions/<name>`，拒绝覆盖已有安装、符号链接和特殊文件。
+可用 `--directory path/to/extensions` 指定安装目录；默认安装位置固定为 `~/.koala/extensions`，
 不随 `KOALA_WORKSPACE` 改变。随后把命令输出的 manifest 路径加入配置（重启生效）：
 
 ```toml
 [extensions]
-manifests = [".koala/extensions/context-example/extension.toml"]
+manifests = ["/absolute/path/to/.koala/extensions/context-example/extension.toml"]
 timeout_secs = 30
 ```
 

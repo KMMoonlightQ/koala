@@ -7,6 +7,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error("cannot determine home directory for ~/.koala/config.toml")]
+    HomeDirectoryUnavailable,
     #[error("failed to read config file {0}: {1}")]
     Read(String, #[source] std::io::Error),
     #[error("failed to parse config file {0}: {1}")]
@@ -65,11 +67,11 @@ impl Theme {
 }
 
 /// Approval level, independent of the agent's Normal / Plan execution mode.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
-    #[default]
     Normal,
+    #[default]
     AskWhenNeed,
     AutoEdit,
     NeverAsk,
@@ -124,7 +126,7 @@ pub struct PermissionsConfig {
 impl Default for PermissionsConfig {
     fn default() -> Self {
         Self {
-            mode: PermissionMode::Normal,
+            mode: PermissionMode::default(),
             allow: Vec::new(),
             deny: Vec::new(),
         }
@@ -294,21 +296,25 @@ where
     }
 }
 
+/// Shared location for user configuration and global resources.
+pub fn koala_dir() -> Result<PathBuf, ConfigError> {
+    dirs::home_dir()
+        .map(|home| home.join(".koala"))
+        .ok_or(ConfigError::HomeDirectoryUnavailable)
+}
+
 fn default_memory_file() -> PathBuf {
-    dirs::config_dir()
-        .map(|d| d.join("koala").join("memory.json"))
-        .unwrap_or_else(|| PathBuf::from("memory.json"))
+    koala_dir()
+        .expect("a home directory is required for Koala's global resources")
+        .join("memory.json")
 }
 
 impl Config {
-    /// First existing file wins: ./config.toml, then ~/.config/koala/config.toml.
+    /// Read ~/.koala/config.toml independently of the current working directory.
     /// Saved workspace appearance overrides the file; KOALA_* env vars win last.
     pub fn load() -> Result<Self, ConfigError> {
-        let mut candidates = vec![PathBuf::from("config.toml")];
-        if let Some(dir) = dirs::config_dir() {
-            candidates.push(dir.join("koala").join("config.toml"));
-        }
-        let mut cfg = Self::load_files(&candidates, PathBuf::from(".koala/language.toml"))?;
+        let path = koala_dir()?.join("config.toml");
+        let mut cfg = Self::load_files(&[path], PathBuf::from(".koala/language.toml"))?;
         cfg.apply_env();
         Ok(cfg)
     }
@@ -523,7 +529,7 @@ max_tool_rounds = 2
         assert_eq!(cfg.agent.subagent_max_rounds, None);
         assert_eq!(cfg.agent.max_retries, 5);
         assert_eq!(cfg.agent.compact_threshold, 40_000);
-        assert_eq!(cfg.permissions.mode, PermissionMode::Normal);
+        assert_eq!(cfg.permissions.mode, PermissionMode::AskWhenNeed);
         assert!(cfg.permissions.allow.is_empty());
         // English is the default interface language.
         assert_eq!(cfg.lang, Lang::En);

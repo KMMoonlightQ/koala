@@ -23,8 +23,8 @@ enum Command {
     /// Install a local extension directory (contains extension.toml)
     ExtensionInstall {
         source: PathBuf,
-        #[arg(long, default_value = ".koala/extensions")]
-        directory: PathBuf,
+        #[arg(long)]
+        directory: Option<PathBuf>,
     },
 }
 
@@ -120,10 +120,14 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Chat) {
         Command::ExtensionInstall { source, directory } => {
+            let directory = match directory {
+                Some(directory) => directory,
+                None => config::koala_dir()?.join("extensions"),
+            };
             let manifest =
                 koala::extensions::install(&source, &directory).map_err(anyhow::Error::msg)?;
             println!(
-                "Installed. Add to [extensions].manifests in config.toml:\n{}",
+                "Installed. Add to [extensions].manifests in ~/.koala/config.toml:\n{}",
                 serde_json::to_string(&manifest)?
             );
         }

@@ -7,7 +7,7 @@ impl Tool for BackgroundTasks {
         "background_tasks"
     }
     fn description(&self) -> &str {
-        "List this session's background tasks (newest first), or read a task's output by id. Results are paginated; pass next_offset to continue. Output offsets are UTF-8 bytes."
+        "List this session's background tasks (newest first), or read a task's output by its stable session-local id (UI task ids may differ after restore). Results are paginated; pass next_offset to continue. Output offsets are UTF-8 bytes."
     }
     fn schema(&self) -> serde_json::Value {
         serde_json::json!({"type":"object","properties":{"id":{"type":"integer","minimum":1},"offset":{"type":"integer","minimum":0}}})

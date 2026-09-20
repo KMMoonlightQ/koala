@@ -36,11 +36,12 @@ impl Permissions {
     /// Called after argument-rewriting hooks. Unknown tools require approval.
     pub fn check(&self, tool: &str, automatically_allowed: bool) -> Policy {
         let mode = self.mode();
-        if mode == PermissionMode::NeverAsk {
-            return Policy::Allow;
-        }
+        // A mode controls prompting, never overrides an explicit prohibition.
         if self.deny.contains(tool) {
             return Policy::Deny;
+        }
+        if mode == PermissionMode::NeverAsk {
+            return Policy::Allow;
         }
         if mode == PermissionMode::Normal {
             return Policy::Ask;
@@ -59,7 +60,10 @@ mod tests {
 
     #[test]
     fn levels_apply_to_safe_and_unknown_tools() {
-        let p = Permissions::new(&PermissionsConfig::default());
+        let p = Permissions::new(&PermissionsConfig {
+            mode: PermissionMode::Normal,
+            ..Default::default()
+        });
         for safe in [true, false] {
             assert_eq!(p.check("tool", safe), Policy::Ask);
         }
@@ -73,7 +77,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_ignores_allow_and_never_ask_overrides_all_rules() {
+    fn explicit_deny_wins_in_every_mode_and_normal_still_requires_approval() {
         let p = Permissions::new(&PermissionsConfig {
             allow: vec!["bash".into()],
             deny: vec!["bash".into()],
@@ -82,9 +86,13 @@ mod tests {
         assert_eq!(p.check("bash", false), Policy::Deny);
         p.set_mode(PermissionMode::AskWhenNeed);
         assert_eq!(p.check("bash", false), Policy::Deny);
-        p.set_mode(PermissionMode::NeverAsk);
-        assert_eq!(p.check("bash", false), Policy::Allow);
+        for mode in PermissionMode::ALL {
+            p.set_mode(mode);
+            assert_eq!(p.check("bash", false), Policy::Deny, "{mode:?}");
+            assert_eq!(p.check("bash", true), Policy::Deny, "{mode:?}");
+        }
         let trusted = Permissions::new(&PermissionsConfig {
+            mode: PermissionMode::Normal,
             allow: vec!["bash".into()],
             ..Default::default()
         });

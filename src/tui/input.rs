@@ -22,6 +22,8 @@ pub(super) const COMMANDS: &[(&str, Key)] = &[
     ("theme", Key::CmdTheme),
     ("quit", Key::CmdQuit),
     ("memory", Key::CmdMemory),
+    ("tree", Key::CmdGraph),
+    ("btw", Key::CmdBtw),
 ];
 
 /// Name and translated description of the command at `index` in [`COMMANDS`].

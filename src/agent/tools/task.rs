@@ -66,7 +66,29 @@ impl Tool for TaskTool {
 
             if background {
                 let id = ctx.background.register("task", &description);
-                let seed = ctx.subagent_seed();
+                let mut seed = ctx.subagent_seed();
+                let mut span = match ctx
+                    .graph
+                    .as_ref()
+                    .map(|r| {
+                        r.start(
+                            super::super::graph::Kind::Background,
+                            format!("task #{id}: {description}"),
+                            serde_json::json!({"task_id": id, "prompt": prompt}),
+                            vec![],
+                        )
+                    })
+                    .transpose()
+                {
+                    Ok(span) => span,
+                    Err(e) => {
+                        ctx.background.finish(id, false, e.to_string());
+                        return ToolResult::err(e.to_string());
+                    }
+                };
+                if let Some(span) = &span {
+                    seed.graph = Some(span.recorder());
+                }
                 let bg = ctx.background.clone();
                 let mem = ctx.agent_memory.clone();
                 let handle = tokio::spawn(async move {
@@ -77,6 +99,22 @@ impl Tool for TaskTool {
                         subagent::run(&mut sub_ctx, &prompt).await
                     }
                     .await;
+                    if let Some(span) = &mut span
+                        && let Err(e) = span.finish(
+                            if outcome.is_ok() {
+                                super::super::graph::Status::Succeeded
+                            } else {
+                                super::super::graph::Status::Failed
+                            },
+                            match &outcome {
+                                Ok(text) => serde_json::json!({"output": text}),
+                                Err(e) => serde_json::json!({"error": e.to_string()}),
+                            },
+                        )
+                    {
+                        bg.finish(id, false, format!("graph write failed: {e}"));
+                        return;
+                    }
                     match outcome {
                         Ok(text) => {
                             bg.finish(id, true, text);

@@ -31,6 +31,9 @@ pub enum Trace {
 
 #[derive(Serialize, Deserialize)]
 enum Entry {
+    PlanMode(bool),
+    PermissionMode(crate::config::PermissionMode),
+    Graph(super::graph::Event),
     Trace(Trace),
     Context {
         messages: Vec<Message>,
@@ -42,10 +45,21 @@ enum Entry {
         todos: Vec<TodoItem>,
     },
     Tasks(Vec<TaskView>),
+    Navigate {
+        current: Option<String>,
+        messages: Vec<Message>,
+        todos: Vec<TodoItem>,
+        trace: Vec<Trace>,
+    },
 }
 
 #[derive(Debug, Default)]
 pub struct State {
+    pub plan_mode: Option<bool>,
+    pub permission_mode: Option<crate::config::PermissionMode>,
+    pub has_conversation: bool,
+    pub navigated: bool,
+    pub graph: super::graph::Graph,
     pub messages: Vec<Message>,
     pub todos: Vec<TodoItem>,
     pub trace: Vec<Trace>,
@@ -60,6 +74,10 @@ pub struct Journal {
 
 #[derive(Debug)]
 struct Writer {
+    permission_mode_saved: bool,
+    graph: super::graph::Graph,
+    active: std::collections::HashSet<String>,
+    has_trace: bool,
     context: Option<Vec<serde_json::Value>>,
     disk_len: u64,
     text: String,
@@ -68,6 +86,10 @@ struct Writer {
 impl Default for Writer {
     fn default() -> Self {
         Self {
+            permission_mode_saved: false,
+            graph: super::graph::Graph::default(),
+            active: Default::default(),
+            has_trace: false,
             context: None,
             disk_len: 0,
             text: String::new(),
@@ -85,6 +107,14 @@ impl Journal {
     }
 
     pub fn load(&self) -> Result<Option<State>, String> {
+        self.load_at(None, false)
+    }
+
+    pub fn load_before(&self, turn: Option<&str>) -> Result<Option<State>, String> {
+        self.load_at(turn, false)
+    }
+
+    pub fn load_at(&self, turn: Option<&str>, after: bool) -> Result<Option<State>, String> {
         let mut writer = self.lock.lock().unwrap();
         self.flush_text(&mut writer).map_err(|e| e.to_string())?;
         let metadata = match fs::symlink_metadata(&self.path) {
@@ -102,6 +132,7 @@ impl Journal {
         let mut partial_text = String::new();
         let mut value = Vec::new();
         let mut line = 0;
+        let mut found = turn.is_none();
         loop {
             value.clear();
             if reader
@@ -118,8 +149,27 @@ impl Journal {
             line += 1;
             let entry: Entry = serde_json::from_slice(&value)
                 .map_err(|e| format!("work journal line {line}: {e}"))?;
+            if let Entry::Graph(event) = &entry
+                && turn == Some(event.node.id.as_str())
+                && event.node.kind == super::graph::Kind::Turn
+                && !after
+            {
+                found = true;
+                break;
+            }
+            let stop_after = after
+                && matches!(&entry, Entry::Graph(event) if turn == Some(event.node.id.as_str()) && event.node.kind == super::graph::Kind::Turn && event.node.status != super::graph::Status::Running);
             match entry {
+                Entry::PlanMode(mode) => state.plan_mode = Some(mode),
+                Entry::PermissionMode(mode) => state.permission_mode = Some(mode),
+                Entry::Graph(event) => {
+                    if event.version != 1 {
+                        return Err(format!("unsupported graph version {}", event.version));
+                    }
+                    state.graph.apply(event.node);
+                }
                 Entry::Trace(trace) => {
+                    state.has_conversation |= matches!(trace, Trace::User(_) | Trace::Text(_));
                     if let Trace::User(text) = &trace {
                         if !partial_text.is_empty() {
                             state
@@ -137,6 +187,7 @@ impl Journal {
                     state.trace.push(trace);
                 }
                 Entry::Context { messages, todos } => {
+                    state.has_conversation = true;
                     state.messages = messages;
                     state.todos = todos;
                     partial_text.clear();
@@ -146,6 +197,7 @@ impl Journal {
                     messages,
                     todos,
                 } => {
+                    state.has_conversation = true;
                     if keep > state.messages.len() {
                         return Err(format!("invalid context delta at line {line}"));
                     }
@@ -155,6 +207,24 @@ impl Journal {
                     partial_text.clear();
                 }
                 Entry::Tasks(tasks) => state.tasks = tasks,
+                Entry::Navigate {
+                    current,
+                    messages,
+                    todos,
+                    trace,
+                } => {
+                    state.has_conversation = true;
+                    state.navigated = true;
+                    state.graph.current_turn = current;
+                    state.messages = messages;
+                    state.todos = todos;
+                    state.trace = trace;
+                    partial_text.clear();
+                }
+            }
+            if stop_after {
+                found = true;
+                break;
             }
         }
         // Never replay an unfinished tool invocation. Complete its protocol with
@@ -176,6 +246,19 @@ impl Journal {
         }
         if !partial_text.is_empty() {
             state.messages.push(Message::assistant(partial_text));
+        }
+        for node in &mut state.graph.nodes {
+            if node.status == super::graph::Status::Running && !writer.active.contains(&node.id) {
+                Arc::make_mut(node).status = super::graph::Status::Unknown;
+            }
+        }
+        if !found {
+            return Err("Turn not found in session journal".into());
+        }
+        if turn.is_none() {
+            writer.permission_mode_saved = state.permission_mode.is_some();
+            writer.graph = state.graph.clone();
+            writer.has_trace = !state.trace.is_empty();
         }
         Ok(Some(state))
     }
@@ -241,7 +324,9 @@ impl Journal {
             file.set_len(len)?;
             return Err(error);
         }
+        writer.permission_mode_saved |= matches!(entry, Entry::PermissionMode(_));
         writer.disk_len = len + bytes.len() as u64;
+        writer.has_trace |= matches!(entry, Entry::Trace(_));
         if let Some(context) = next_context {
             writer.context = Some(context);
         }
@@ -279,6 +364,27 @@ impl Journal {
             self.append(Entry::Trace(trace))
         }
     }
+    /// Persist the initial mode once; never overwrite a concurrent mode switch.
+    pub fn initialize_permission_mode(
+        &self,
+        mode: crate::config::PermissionMode,
+    ) -> std::io::Result<()> {
+        let mut writer = self.lock.lock().unwrap();
+        if !writer.permission_mode_saved {
+            self.flush_text(&mut writer)?;
+            self.append_locked(&mut writer, Entry::PermissionMode(mode))?;
+        }
+        Ok(())
+    }
+
+    pub fn plan_mode(&self, mode: bool) -> std::io::Result<()> {
+        self.append(Entry::PlanMode(mode))
+    }
+
+    pub fn permission_mode(&self, mode: crate::config::PermissionMode) -> std::io::Result<()> {
+        self.append(Entry::PermissionMode(mode))
+    }
+
     pub fn context(&self, messages: &[Message], todos: &[TodoItem]) -> std::io::Result<()> {
         self.append(Entry::Context {
             messages: messages
@@ -289,6 +395,56 @@ impl Journal {
             todos: todos.to_vec(),
         })
     }
+    pub fn navigate(&self, current: Option<String>, state: &State) -> std::io::Result<()> {
+        let mut writer = self.lock.lock().unwrap();
+        self.flush_text(&mut writer)?;
+        self.append_locked(
+            &mut writer,
+            Entry::Navigate {
+                current: current.clone(),
+                messages: state.messages.clone(),
+                todos: state.todos.clone(),
+                trace: state.trace.clone(),
+            },
+        )?;
+        writer.context = None;
+        writer.has_trace = !state.trace.is_empty();
+        writer.graph.current_turn = current;
+        Ok(())
+    }
+
+    pub fn graph_node(&self, node: super::graph::Node) -> std::io::Result<()> {
+        let mut writer = self.lock.lock().unwrap();
+        self.flush_text(&mut writer)?;
+        self.append_locked(
+            &mut writer,
+            Entry::Graph(super::graph::Event {
+                version: 1,
+                id: uuid::Uuid::new_v4().to_string(),
+                node: node.clone(),
+            }),
+        )?;
+        if node.status == super::graph::Status::Running {
+            writer.active.insert(node.id.clone());
+        } else {
+            writer.active.remove(&node.id);
+        }
+        writer.graph.apply(node);
+        Ok(())
+    }
+
+    pub fn graph_get(&self, id: &str) -> Option<super::graph::Node> {
+        self.lock.lock().unwrap().graph.get(id).cloned()
+    }
+
+    pub fn has_trace(&self) -> bool {
+        self.lock.lock().unwrap().has_trace
+    }
+
+    pub fn graph_snapshot(&self) -> super::graph::Graph {
+        self.lock.lock().unwrap().graph.clone()
+    }
+
     pub fn tasks(&self, tasks: Vec<TaskView>) -> std::io::Result<()> {
         self.append(Entry::Tasks(tasks))
     }

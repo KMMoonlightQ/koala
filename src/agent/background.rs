@@ -6,6 +6,8 @@ use tokio::task::JoinHandle;
 #[derive(Debug)]
 struct ManagedTask {
     view: BgTask,
+    // Durable id used by model history; view.id is unique across the live UI.
+    session_id: usize,
     scope: uuid::Uuid,
     started: Instant,
     handle: Option<JoinHandle<()>>,
@@ -45,6 +47,7 @@ impl BackgroundManager {
         let journal = existing.and_then(|t| t.journal.clone()).unwrap_or(journal);
         if existing.is_none() {
             for mut view in saved {
+                let session_id = view.id;
                 if matches!(view.status, BgStatus::Running | BgStatus::Stopping) {
                     view.status = BgStatus::Stopped;
                     view.output.push_str("\nExecution interrupted by application restart; outcome unknown. Inspect state before retrying.");
@@ -54,6 +57,7 @@ impl BackgroundManager {
                 }
                 tasks.push(ManagedTask {
                     view,
+                    session_id,
                     scope,
                     started: Instant::now(),
                     handle: None,
@@ -91,7 +95,7 @@ impl BackgroundManager {
             .skip(offset)
             .take(limit.min(12))
             .map(|t| {
-                serde_json::json!({"id": t.view.id, "status": t.view.status,
+                serde_json::json!({"id": t.session_id, "status": t.view.status,
                 "description": t.view.description.chars().take(80).collect::<String>(),
                 "output_bytes": t.view.output.len()})
             })
@@ -104,7 +108,7 @@ impl BackgroundManager {
         let tasks = self.inner.lock().unwrap();
         let task = tasks
             .iter()
-            .find(|t| t.scope == self.scope && t.view.id == id)
+            .find(|t| t.scope == self.scope && t.session_id == id)
             .ok_or_else(|| "task not found in this session".to_string())?;
         let output = &task.view.output;
         if offset > output.len() || !output.is_char_boundary(offset) {
@@ -127,7 +131,11 @@ impl BackgroundManager {
                     tasks
                         .iter()
                         .filter(|t| t.scope == task.scope)
-                        .map(|t| t.view.clone())
+                        .map(|t| {
+                            let mut view = t.view.clone();
+                            view.id = t.session_id;
+                            view
+                        })
                         .collect(),
                 )
             {
@@ -149,6 +157,7 @@ impl BackgroundManager {
         let mut tasks = self.inner.lock().unwrap();
         let id = tasks.iter().map(|t| t.view.id).max().unwrap_or(0) + 1;
         tasks.push(ManagedTask {
+            session_id: id,
             scope: self.scope,
             view: BgTask {
                 id,
@@ -284,6 +293,34 @@ impl BackgroundManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_task_references_survive_collisions_and_another_restart() {
+        let root = std::env::temp_dir().join(format!("koala-task-ids-{}", uuid::Uuid::new_v4()));
+        let a = super::super::work::Journal::new(root.join("a.work"));
+        let b = super::super::work::Journal::new(root.join("b.work"));
+        for (journal, output) in [(&a, "result A"), (&b, "result B")] {
+            let manager = BackgroundManager::default().for_session(journal.clone(), vec![]);
+            assert_eq!(manager.register("bash", "old task"), 1);
+            manager.finish(1, true, output.into());
+        }
+        let manager =
+            BackgroundManager::default().for_session(a.clone(), a.load().unwrap().unwrap().tasks);
+        let other = manager.for_session(b.clone(), b.load().unwrap().unwrap().tasks);
+        assert_eq!(other.read_output(1, 0).unwrap()["output"], "result B");
+        assert_eq!(manager.read_output(1, 0).unwrap()["output"], "result A");
+        assert_eq!(other.task_page(0, 12)["tasks"][0]["id"], 1);
+        let new = other.register("bash", "new task");
+        other.finish(new, true, "new result".into());
+        let restored =
+            BackgroundManager::default().for_session(b.clone(), b.load().unwrap().unwrap().tasks);
+        assert_eq!(restored.read_output(1, 0).unwrap()["output"], "result B");
+        assert_eq!(
+            restored.read_output(new, 0).unwrap()["output"],
+            "new result"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn restore_reconnects_live_tasks_and_restart_marks_orphans_stopped() {

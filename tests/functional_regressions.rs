@@ -276,3 +276,133 @@ async fn failed_automatic_summary_stops_requests_and_preserves_tool_progress() {
             .contains("[早前对话摘要]")
     }));
 }
+
+#[tokio::test]
+async fn deepseek_compacted_and_legacy_assistants_have_reasoning_on_wire() {
+    let mut mock = MockLlm::respond(|request| {
+        let invalid = request["messages"].as_array().unwrap().iter().any(|m| {
+            m["role"] == "assistant" && !m["reasoning_content"].is_string()
+        });
+        if invalid {
+            return (400, json!({"error":{"message":"The `reasoning_content` in the thinking mode must be passed back to the API."}}).to_string());
+        }
+        if request["stream"] == true {
+            stream(json!({"content":"ok", "reasoning_content":"new reasoning"}))
+        } else {
+            reply(Message::assistant("summary"))
+        }
+    }).await;
+    mock.client
+        .select_model("deepseek-v4-flash".into(), Some("high".into()));
+    let call: Message = serde_json::from_value(json!({"role":"assistant","reasoning_content":"original reasoning","tool_calls":[{"id":"c","type":"function","function":{"name":"read","arguments":"{}"}}]})).unwrap();
+    let mut history = vec![
+        Message::user("old"),
+        Message::assistant("old answer"),
+        Message::user("current"),
+        call,
+        Message::tool("c", "result"),
+        Message::user("continue"),
+    ];
+    koala::agent::compact::compact(&mock.client, &mut history)
+        .await
+        .unwrap();
+    mock.request().await;
+    let tools = [koala::llm::Tool::function(
+        "read",
+        "read a file",
+        json!({"type":"object"}),
+    )];
+    let mut events = mock
+        .client
+        .chat_stream(&history, Some(&tools))
+        .await
+        .unwrap();
+    use futures_util::StreamExt;
+    while let Some(delta) = events.next().await {
+        delta.unwrap();
+    }
+    let request = mock.request().await;
+    assert_eq!(request["messages"][1]["reasoning_content"], "");
+    let call = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["tool_calls"].is_array())
+        .unwrap();
+    assert_eq!(call["reasoning_content"], "original reasoning");
+    // Legacy/missing fields and interruption messages use the same send boundary.
+    let legacy: Vec<Message> = serde_json::from_value(json!([
+        {"role":"user","content":"old question"},
+        {"role":"assistant","content":"interrupted"},
+        {"role":"assistant","tool_calls":[{"id":"old","type":"function","function":{"name":"read","arguments":"{}"}}]},
+        {"role":"tool","tool_call_id":"old","content":"result"}
+    ])).unwrap();
+    mock.client.chat(&legacy, Some(&tools)).await.unwrap();
+    let request = mock.request().await;
+    assert_eq!(request["messages"][1]["reasoning_content"], "");
+    assert_eq!(request["messages"][2]["reasoning_content"], "");
+    assert!(request["messages"][0].get("reasoning_content").is_none());
+    assert!(request["messages"][3].get("reasoning_content").is_none());
+    assert!(legacy[1].reasoning_content.is_none());
+}
+
+#[tokio::test]
+async fn plan_mode_executes_native_search_through_the_model_tool_loop() {
+    let root = Temp::new();
+    let path = root.0.join("source.txt");
+    std::fs::write(&path, "first\nneedle\n").unwrap();
+    let mut mock = MockLlm::start(vec![
+        tool_call("glob", "discover", json!({"path":root.0,"pattern":"*.txt"})),
+        tool_call(
+            "grep",
+            "search",
+            json!({"path":root.0,"pattern":"needle","glob":"*.txt"}),
+        ),
+        tool_call("read", "inspect", json!({"path":path,"offset":2})),
+        stream(json!({"content":"done"})),
+    ])
+    .await;
+    let mut cfg = config(&root, &mock.url);
+    cfg.permissions = Default::default();
+    let mut agent = Agent::new(&cfg).await.unwrap();
+    agent.toggle_plan_mode().unwrap();
+    agent
+        .run_turn("Investigate needle", event::null_events())
+        .await
+        .unwrap();
+    let first = mock.request().await;
+    let names: Vec<_> = first["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["function"]["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"glob") && names.contains(&"grep"));
+    assert!(!names.contains(&"bash") && !names.contains(&"write"));
+    let discover = mock.request().await;
+    let results: serde_json::Value = serde_json::from_str(
+        discover["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(results["results"], json!([path]));
+    let search = mock.request().await;
+    let results: serde_json::Value = serde_json::from_str(
+        search["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        results["results"],
+        json!([{"path":path,"line":2,"text":"needle"}])
+    );
+    let read = mock.request().await;
+    assert!(
+        read["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("needle")
+    );
+}

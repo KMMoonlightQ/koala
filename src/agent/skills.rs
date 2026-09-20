@@ -15,11 +15,11 @@ pub struct Skills {
 }
 
 impl Skills {
-    /// Scan `./skills/*/SKILL.md` and `<config dir>/koala/skills/*/SKILL.md`.
+    /// Scan `./skills/*/SKILL.md` and `~/.koala/skills/*/SKILL.md`.
     pub fn load() -> Self {
         let mut roots = vec![PathBuf::from("skills")];
-        if let Some(dir) = dirs::config_dir() {
-            roots.push(dir.join("koala").join("skills"));
+        if let Ok(dir) = crate::config::koala_dir() {
+            roots.push(dir.join("skills"));
         }
         Self::load_from(&roots)
     }

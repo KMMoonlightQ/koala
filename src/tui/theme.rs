@@ -108,15 +108,35 @@ pub(super) fn apply(buffer: &mut ratatui::buffer::Buffer, theme: crate::config::
 
 pub(super) fn background(theme: crate::config::Theme) -> Color {
     use crate::config::Theme;
+    if let Some(palette) = palette(theme) {
+        return palette[0];
+    }
     match theme {
         Theme::Auto => Color::Reset,
         Theme::Light => Color::Rgb(0xFA, 0xFA, 0xF7),
         Theme::Dark => INVERSE,
+        _ => unreachable!(),
     }
 }
 
 pub(super) fn foreground(theme: crate::config::Theme, color: Color) -> Color {
     use crate::config::Theme;
+    if let Some(p) = palette(theme) {
+        return match color {
+            Color::Reset | TEXT => p[1],
+            ACCENT => p[2],
+            SUGGESTION => p[3],
+            MUTED => p[4],
+            SUBTLE | PROMPT_BORDER => p[5],
+            SUCCESS | PLAN => p[6],
+            ERROR => p[7],
+            WARNING | USER => p[8],
+            // These light palettes have bright amber badges; use charcoal ink.
+            INVERSE if matches!(theme, Theme::CatppuccinLatte | Theme::SolarizedLight) => INVERSE,
+            INVERSE => p[0],
+            _ => color,
+        };
+    }
     match theme {
         Theme::Dark => match color {
             Color::Reset => TEXT,
@@ -148,5 +168,43 @@ pub(super) fn foreground(theme: crate::config::Theme, color: Color) -> Color {
             INVERSE => Color::Black,
             _ => color,
         },
+        _ => unreachable!(),
     }
+}
+
+// Official palettes: catppuccin.com/palette, nordtheme.com/docs/colors-and-palettes,
+// draculatheme.com/spec. Roles: background, text, accent, focus, muted, border,
+// success, error, warning. `catppuccin` keeps the original Mocha flavor.
+// Light palettes: catppuccin.com/palette, ethanschoonover.com/solarized,
+// github.com/primer/primitives (base/color/light).
+fn palette(theme: crate::config::Theme) -> Option<[Color; 9]> {
+    use crate::config::Theme;
+    let colors = match theme {
+        Theme::Catppuccin => [
+            0x1e1e2e, 0xcdd6f4, 0x89b4fa, 0xcba6f7, 0xa6adc8, 0x6c7086, 0xa6e3a1, 0xf38ba8,
+            0xf9e2af,
+        ],
+        Theme::Nord => [
+            0x2e3440, 0xeceff4, 0x88c0d0, 0x81a1c1, 0xd8dee9, 0x4c566a, 0xa3be8c, 0xbf616a,
+            0xebcb8b,
+        ],
+        Theme::Dracula => [
+            0x282a36, 0xf8f8f2, 0xbd93f9, 0x8be9fd, 0x6272a4, 0x6272a4, 0x50fa7b, 0xff5555,
+            0xf1fa8c,
+        ],
+        Theme::CatppuccinLatte => [
+            0xeff1f5, 0x4c4f69, 0x1e66f5, 0x8839ef, 0x5c5f77, 0x6c6f85, 0x40a02b, 0xd20f39,
+            0xdf8e1d,
+        ],
+        Theme::SolarizedLight => [
+            0xfdf6e3, 0x657b83, 0x268bd2, 0x6c71c4, 0x657b83, 0x839496, 0x859900, 0xdc322f,
+            0xb58900,
+        ],
+        Theme::GithubLight => [
+            0xffffff, 0x1f2328, 0x0969da, 0x8250df, 0x59636e, 0x59636e, 0x1a7f37, 0xcf222e,
+            0x9a6700,
+        ],
+        _ => return None,
+    };
+    Some(colors.map(|c| Color::Rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)))
 }

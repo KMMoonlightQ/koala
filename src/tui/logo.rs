@@ -60,16 +60,44 @@ fn render_pixels(pixels: &[&str]) -> Vec<Line<'static>> {
         .collect()
 }
 
-// A single text-row koala with a fixed-width moving trail. Terminal font
-// rendering keeps the character the same height as the adjacent status text.
-pub(super) fn running(elapsed_ms: u128, paused: bool) -> Line<'static> {
-    let trail = if paused {
-        "  "
+// Four consecutive squares travel around an empty center. Half-blocks make
+// a true 3x3 pixel grid in three columns and two terminal rows.
+pub(super) fn running(elapsed_ms: u128, paused: bool) -> Vec<Line<'static>> {
+    let ring = [
+        (0, 0),
+        (1, 0),
+        (2, 0),
+        (2, 1),
+        (2, 2),
+        (1, 2),
+        (0, 2),
+        (0, 1),
+    ];
+    let phase = if paused {
+        0
     } else {
-        ["· ", "˙ ", " ·", " ˙"][(elapsed_ms / 150 % 4) as usize]
+        (elapsed_ms / 120 % 8) as usize
     };
-    Line::from(vec![
-        Span::styled(trail, super::theme::accent()),
-        Span::raw("🐨 "),
-    ])
+    let mut pixels = [[false; 3]; 4];
+    for offset in 0..4 {
+        let (x, y) = ring[(phase + offset) % 8];
+        pixels[y][x] = true;
+    }
+    (0..2)
+        .map(|row| {
+            Line::from(
+                (0..3)
+                    .map(|x| {
+                        let symbol = match (pixels[row * 2][x], pixels[row * 2 + 1][x]) {
+                            (true, true) => "█",
+                            (true, false) => "▀",
+                            (false, true) => "▄",
+                            (false, false) => " ",
+                        };
+                        Span::styled(symbol, super::theme::accent())
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
 }

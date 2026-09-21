@@ -95,12 +95,10 @@ pub async fn run(
         if ctx.depth == 0 {
             let _ = ctx.events.send(UiEvent::ContextUsage(None));
         }
-        // Count the actual serialized request components, including dynamic
-        // extension/background context and tool definitions. This is a byte
-        // budget, not a provider-specific token-window claim.
-        let used = serde_json::to_vec(&request)
-            .expect("serializable messages")
-            .len()
+        // Budget text and dynamic/tool context by serialized bytes; images use
+        // a dimension-based allowance instead of counting Base64 transport data.
+        // This is an estimate, not a provider-specific token-window claim.
+        let used = crate::llm::context_size(&request)
             + serde_json::to_vec(&tool_defs)
                 .expect("serializable tools")
                 .len()

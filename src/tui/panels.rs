@@ -137,9 +137,15 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                 .take(capacity)
                 .map(|(index, value)| {
                     let description = match value {
-                        super::Theme::Auto => Key::ThemeAuto,
-                        super::Theme::Light => Key::ThemeLight,
-                        super::Theme::Dark => Key::ThemeDark,
+                        super::Theme::Auto => i18n::text(app.lang, Key::ThemeAuto),
+                        super::Theme::Light => i18n::text(app.lang, Key::ThemeLight),
+                        super::Theme::Dark => i18n::text(app.lang, Key::ThemeDark),
+                        super::Theme::Catppuccin => "Catppuccin Mocha",
+                        super::Theme::Nord => "Nord",
+                        super::Theme::Dracula => "Dracula",
+                        super::Theme::CatppuccinLatte => "Catppuccin Latte",
+                        super::Theme::SolarizedLight => "Solarized Light",
+                        super::Theme::GithubLight => "GitHub Light",
                     };
                     Line::styled(
                         format!(
@@ -151,7 +157,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App, area: Rect) {
                             } else {
                                 ""
                             },
-                            i18n::text(app.lang, description),
+                            description,
                         ),
                         if index == *selected {
                             theme::selected()
@@ -455,11 +461,19 @@ pub(super) fn menu_matches(app: &App) -> Vec<usize> {
 
 /// Rows the command menu occupies: at most five entries inside a rounded box.
 pub(super) fn menu_height(app: &App) -> u16 {
-    let matches = menu_matches(app).len().min(5) as u16;
+    let matches = menu_matches(app)
+        .len()
+        .max(super::mentions::candidates(app).len())
+        .min(5) as u16;
     if matches == 0 { 0 } else { matches + 2 }
 }
 
 pub(super) fn draw_menu(f: &mut Frame, app: &App, area: Rect) {
+    let paths = super::mentions::candidates(app);
+    if !paths.is_empty() {
+        super::mentions::draw(f, app, area, &paths);
+        return;
+    }
     let matches = menu_matches(app);
     if area.height == 0 || matches.is_empty() {
         return;

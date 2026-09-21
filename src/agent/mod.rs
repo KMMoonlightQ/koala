@@ -3,6 +3,7 @@ pub mod background;
 mod btw;
 pub mod compact;
 pub mod event;
+pub mod extension_ui;
 mod file_io;
 pub mod graph;
 pub mod hooks;
@@ -21,7 +22,7 @@ pub mod work;
 
 use crate::config::{Config, HooksConfig};
 use crate::i18n::{self, Key, Lang, LangCell};
-use crate::llm::{LlmClient, LlmError, Message};
+use crate::llm::{ImageAttachment, LlmClient, LlmError, Message};
 use agentmem::AgentMemory;
 use background::BackgroundManager;
 use event::{EventSender, UiEvent};
@@ -36,7 +37,7 @@ use tools::ToolContext;
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error(
-        "request context exceeds configured budget ({used} > {limit} bytes including response reserve); reduce input, extension context, or tools, or raise agent.compact_threshold"
+        "request context exceeds configured budget ({used} > {limit} estimated units including response reserve); reduce input, images, extension context, or tools, or raise agent.compact_threshold"
     )]
     ContextBudget { used: usize, limit: usize },
     #[error("extension: {0}")]
@@ -51,6 +52,8 @@ pub enum AgentError {
     },
     #[error("llm.model is not configured")]
     MissingModel,
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
     #[error("invalid model settings: {0}")]
     InvalidModelSettings(String),
     #[error("tool round limit reached ({0}); completed operations were not rolled back")]
@@ -85,6 +88,7 @@ pub struct Agent {
     history: Vec<Message>,
     plan_mode: bool,
     pending_input: Option<String>,
+    pending_images: Vec<ImageAttachment>,
 }
 
 impl Agent {
@@ -156,6 +160,7 @@ impl Agent {
             history: Vec::new(),
             plan_mode: false,
             pending_input: None,
+            pending_images: Vec::new(),
         })
     }
 
@@ -247,7 +252,7 @@ impl Agent {
             .iter()
             .map(|r| {
                 if r.role == "user" {
-                    Message::user(&r.content)
+                    Message::user_with_images(&r.content, r.images.clone())
                 } else {
                     Message::assistant(&r.content)
                 }
@@ -266,6 +271,7 @@ impl Agent {
         };
         self.background = self.background.for_session(journal, tasks);
         self.pending_input = None;
+        self.pending_images.clear();
         self.plan_mode = plan_mode;
         self.shared.permissions.set_mode(permission_mode);
         Ok(records)
@@ -309,6 +315,7 @@ impl Agent {
         self.history = state.messages;
         self.todos.replace(state.todos);
         self.pending_input = None;
+        self.pending_images.clear();
         Ok(draft)
     }
 
@@ -323,6 +330,7 @@ impl Agent {
         self.history.clear();
         self.todos = TodoList::default();
         self.pending_input = None;
+        self.pending_images.clear();
     }
 
     pub fn toggle_plan_mode(&mut self) -> std::io::Result<bool> {
@@ -366,7 +374,7 @@ impl Agent {
             .into_iter()
             .map(|record| {
                 if record.role == "user" {
-                    Message::user(record.content)
+                    Message::user_with_images(record.content, record.images)
                 } else {
                     Message::assistant(record.content)
                 }
@@ -376,7 +384,7 @@ impl Agent {
             self.history.clone()
         };
         for message in messages {
-            let content = message.content.unwrap_or_default();
+            let content = message.display_content();
             journal.trace(if message.role == "user" {
                 work::Trace::User(content)
             } else {
@@ -438,6 +446,16 @@ impl Agent {
         input: &str,
         events: EventSender,
     ) -> Result<String, AgentError> {
+        self.run_turn_with_images(input, Vec::new(), events).await
+    }
+
+    pub async fn run_turn_with_images(
+        &mut self,
+        input: &str,
+        images: Vec<ImageAttachment>,
+        events: EventSender,
+    ) -> Result<String, AgentError> {
+        crate::images::validate(&images).map_err(AgentError::InvalidInput)?;
         self.initialize_work_trace()?;
         if let Some(journal) = &self.background.journal {
             journal.initialize_permission_mode(self.shared.permissions.mode())?;
@@ -452,13 +470,15 @@ impl Agent {
                 r.start(
                     graph::Kind::Turn,
                     input.lines().next().unwrap_or("Turn"),
-                    serde_json::json!({"input": input, "conversation_parent": self.background.journal.as_ref().and_then(|j| j.graph_snapshot().current_turn)}),
+                    serde_json::json!({"input": input, "images": images, "conversation_parent": self.background.journal.as_ref().and_then(|j| j.graph_snapshot().current_turn)}),
                     vec![],
                 )
             })
             .transpose()?;
         let recorder = span.as_ref().map(graph::Span::recorder);
-        let result = self.run_turn_recorded(input, events, recorder).await;
+        let result = self
+            .run_turn_recorded(input, &images, events, recorder)
+            .await;
         if let Some(span) = &mut span {
             span.finish(
                 if result.is_ok() {
@@ -478,17 +498,21 @@ impl Agent {
     async fn run_turn_recorded(
         &mut self,
         input: &str,
+        images: &[ImageAttachment],
         events: EventSender,
         graph: Option<graph::Recorder>,
     ) -> Result<String, AgentError> {
         self.initialize_work_trace()?;
         if let Some(journal) = &self.background.journal {
-            journal.trace(work::Trace::User(input.to_owned()))?;
+            journal.trace(work::Trace::User(
+                Message::user_with_images(input, images.to_vec()).display_content(),
+            ))?;
             let mut messages = self.history.clone();
-            messages.push(Message::user(input));
+            messages.push(Message::user_with_images(input, images.to_vec()));
             journal.context(&messages, &self.todos.items)?;
         }
         self.pending_input = Some(input.to_owned());
+        self.pending_images = images.to_vec();
         if let hooks::HookOutcome::Failed(reason) = hooks::run_all(
             &self.shared.hooks.turn_start,
             &serde_json::json!({"hook": "turn_start", "session": self.transcript.id()}),
@@ -502,7 +526,7 @@ impl Agent {
             serde_json::json!({"session": self.transcript.id(), "input": input, "plan_mode": self.plan_mode, "depth": 0})).await.map_err(AgentError::Extension)?;
         let mut messages = Vec::with_capacity(self.history.len() + 2);
         messages.extend(self.history.iter().cloned());
-        messages.push(Message::user(input));
+        messages.push(Message::user_with_images(input, images.to_vec()));
 
         let reply = {
             let mut ctx = ToolContext {
@@ -540,7 +564,9 @@ impl Agent {
             .filter(|m| m.role != "system")
             .collect();
         self.pending_input = None;
-        self.transcript.append_turn(input, &reply)?;
+        self.pending_images.clear();
+        self.transcript
+            .append_turn_with_images(input, images, &reply)?;
 
         if let hooks::HookOutcome::Failed(reason) = hooks::run_all(
             &self.shared.hooks.turn_end,
@@ -561,6 +587,7 @@ impl Agent {
     /// plain conversation text, not an unfinished tool-call protocol exchange.
     pub(super) fn record_interruption(&mut self, progress: &str) -> Result<(), AgentError> {
         if let Some(input) = self.pending_input.take() {
+            let images = std::mem::take(&mut self.pending_images);
             let reply = format!(
                 "{}\n{}",
                 progress,
@@ -571,7 +598,8 @@ impl Agent {
                 if let Ok(Some(saved)) = &saved {
                     self.history = saved.messages.clone();
                 } else {
-                    self.history.push(Message::user(&input));
+                    self.history
+                        .push(Message::user_with_images(&input, images.clone()));
                 }
                 self.history.push(Message::assistant(&reply));
                 saved.map_err(std::io::Error::other)?;
@@ -579,27 +607,151 @@ impl Agent {
                     i18n::text(self.lang(), Key::InterruptNotice).into(),
                 ))?;
                 journal.context(&self.history, &self.todos.items)?;
-                self.transcript.append_turn(&input, &reply)?;
+                self.transcript
+                    .append_turn_with_images(&input, &images, &reply)?;
             } else {
-                self.record_turn(&input, &reply)?;
+                self.record_turn(&input, &images, &reply)?;
             }
         }
         Ok(())
     }
 
-    fn record_turn(&mut self, input: &str, reply: &str) -> Result<(), AgentError> {
+    fn record_turn(
+        &mut self,
+        input: &str,
+        images: &[ImageAttachment],
+        reply: &str,
+    ) -> Result<(), AgentError> {
         // A completed reply stays in memory even if persistence fails. Clear
         // pending first so session completion cannot save it again as interrupted.
-        self.history.push(Message::user(input));
+        self.history
+            .push(Message::user_with_images(input, images.to_vec()));
         self.history.push(Message::assistant(reply));
         self.pending_input = None;
-        self.transcript.append_turn(input, reply)
+        self.pending_images.clear();
+        self.transcript
+            .append_turn_with_images(input, images, reply)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn image_turn_survives_tools_restart_and_tree_navigation() {
+        use crate::test_support::{MockLlm, stream};
+        use serde_json::json;
+        let mut mock = MockLlm::start(vec![
+            stream(json!({"tool_calls":[{"index":0,"id":"img-tool","function":{"name":"read","arguments":"{\"path\":\"missing-image-test-file\"}"}}]})),
+            stream(json!({"content":"a red pixel"})),
+            stream(json!({"content":"still red"})),
+        ]).await;
+        let (mut agent, root) = mock_agent(&mock.url).await;
+        let image = crate::images::from_rgba(1, 1, &[255, 0, 0, 255]).unwrap();
+        agent
+            .run_turn_with_images("", vec![image.clone()], event::null_events())
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let request = mock.request().await;
+            assert!(
+                request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["content"][0]["image_url"]["url"] == image.data_url)
+            );
+        }
+        let id = agent.transcript.id().to_owned();
+        let records =
+            transcripts::read(agent.transcript.path().parent().unwrap(), &id, agent.lang())
+                .unwrap();
+        assert_eq!(records[0].images, vec![image.clone()]);
+        let turn = agent
+            .background
+            .journal
+            .as_ref()
+            .unwrap()
+            .graph_snapshot()
+            .nodes
+            .iter()
+            .find(|n| n.kind == graph::Kind::Turn)
+            .unwrap()
+            .id
+            .clone();
+        agent.new_session();
+        agent.restore_session(&id).unwrap();
+        assert_eq!(agent.history[0].images, vec![image.clone()]);
+        agent.navigate_turn(&turn, false).unwrap();
+        assert!(agent.history.is_empty());
+        agent.navigate_turn(&turn, true).unwrap();
+        assert_eq!(agent.history[0].images, vec![image.clone()]);
+        agent
+            .run_turn("what color was it?", event::null_events())
+            .await
+            .unwrap();
+        let request = mock.request().await;
+        assert!(
+            request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["content"][0]["image_url"]["url"] == image.data_url)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn image_failure_is_preserved_for_retry_and_invalid_input_is_not_recorded() {
+        use crate::test_support::MockLlm;
+        let mock = MockLlm::start(vec![(400, "model does not support images".into())]).await;
+        let (mut agent, root) = mock_agent(&mock.url).await;
+        let image = crate::images::from_rgba(1, 1, &[0, 0, 0, 255]).unwrap();
+        let error = agent
+            .run_turn_with_images("explain", vec![image.clone()], event::null_events())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("does not support images"));
+        agent.record_interruption("").unwrap();
+        let id = agent.transcript.id().to_owned();
+        agent.restore_session(&id).unwrap();
+        assert_eq!(agent.history[0].images, vec![image.clone()]);
+        let history = serde_json::to_value(&agent.history).unwrap();
+        assert!(
+            agent
+                .run_turn_with_images("too many", vec![image; 5], event::null_events())
+                .await
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&agent.history).unwrap(), history);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restored_image_transcript_reaches_provider() {
+        use crate::test_support::{MockLlm, stream};
+        let mut mock = MockLlm::start(vec![stream(serde_json::json!({"content":"yes"}))]).await;
+        let (mut agent, root) = mock_agent(&mock.url).await;
+        let dir = agent.transcript.path().parent().unwrap().to_owned();
+        std::fs::create_dir_all(&dir).unwrap();
+        let record = serde_json::json!({"ts":"now", "role":"user", "content":"look", "images":[{"data_url":"data:image/png;base64,AQID", "width":1, "height":1}]});
+        std::fs::write(dir.join("image-test.jsonl"), format!("{record}\n")).unwrap();
+        agent.restore_session("image-test").unwrap();
+        agent
+            .run_turn("describe", event::null_events())
+            .await
+            .unwrap();
+        let request = mock.request().await;
+        assert!(
+            request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["content"][1]["image_url"]["url"] == "data:image/png;base64,AQID")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn graph_records_nested_runs_and_consumed_tool_results_after_restart() {
@@ -1154,7 +1306,11 @@ mod tests {
         cfg.agent.session_dir = blocked;
         let mut agent = Agent::new(&cfg).await.unwrap();
         agent.pending_input = Some("question".into());
-        assert!(agent.record_turn("question", "completed answer").is_err());
+        assert!(
+            agent
+                .record_turn("question", &[], "completed answer")
+                .is_err()
+        );
         agent.record_interruption("completed answer").unwrap();
         assert_eq!(agent.history.len(), 2);
         assert_eq!(

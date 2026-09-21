@@ -4,27 +4,6 @@ use crate::llm::{LlmClient, LlmError, Message};
 pub const KEEP_RECENT: usize = 4;
 const MAX_SUMMARY_INPUT_BYTES: usize = 20_000;
 
-/// Rough size estimate (chars ≈ tokens × 4 for mixed CJK/English).
-pub fn estimate_chars(history: &[Message]) -> usize {
-    history
-        .iter()
-        .map(|m| {
-            m.content.as_deref().unwrap_or("").len()
-                + m.tool_calls.as_ref().map_or(0, |calls| {
-                    calls
-                        .iter()
-                        .map(|c| c.function.arguments.len())
-                        .sum::<usize>()
-                })
-        })
-        .sum()
-}
-
-/// Where old history ends and the kept tail begins.
-pub fn split_point(len: usize) -> Option<usize> {
-    (len > KEEP_RECENT + 1).then(|| len - KEEP_RECENT)
-}
-
 /// Replace all but the last KEEP_RECENT messages with an LLM summary.
 /// Returns true when compaction happened. Failure keeps history untouched.
 pub async fn compact(llm: &LlmClient, history: &mut Vec<Message>) -> Result<bool, LlmError> {
@@ -57,13 +36,13 @@ pub async fn compact_keeping(
                 ));
             }
         }
-        let content = m.content.as_deref().unwrap_or("");
+        let content = m.display_content();
         if content.is_empty() {
             continue;
         }
         transcript.push_str(&m.role);
         transcript.push_str(": ");
-        transcript.push_str(content);
+        transcript.push_str(&content);
         transcript.push_str("\n\n");
     }
     // Summarize every byte before replacing any history. A single long message
@@ -113,6 +92,14 @@ pub async fn compact_keeping(
         Message::user(format!("[早前对话摘要]\n{summary}")),
         Message::assistant("了解，我会基于这些背景继续。"),
     ];
+    // Text summaries cannot substitute for visual evidence. Retain the original
+    // image questions so future turns still see their pixels and associations.
+    compacted.extend(
+        history[..split]
+            .iter()
+            .filter(|m| !m.images.is_empty())
+            .cloned(),
+    );
     compacted.extend_from_slice(&history[split..]);
     *history = compacted;
     Ok(true)
@@ -121,6 +108,29 @@ pub async fn compact_keeping(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn compaction_retains_old_images_with_their_original_question() {
+        let mock = crate::test_support::MockLlm::start(vec![crate::test_support::reply(
+            Message::assistant("summary"),
+        )])
+        .await;
+        let image: Message = serde_json::from_value(serde_json::json!({"role":"user", "content":"what is this?", "images":[{"data_url":"data:image/png;base64,AQID", "width":1, "height":1}]})).unwrap();
+        let mut history = vec![
+            image,
+            Message::assistant("a diagram"),
+            Message::user("2"),
+            Message::assistant("ok"),
+            Message::user("3"),
+            Message::assistant("ok"),
+        ];
+        assert!(compact(&mock.client, &mut history).await.unwrap());
+        assert!(
+            history
+                .iter()
+                .any(|m| !m.images.is_empty() && m.content.as_deref() == Some("what is this?"))
+        );
+    }
 
     #[tokio::test]
     async fn compaction_keeps_tool_calls_with_their_results() {
@@ -236,21 +246,5 @@ mod tests {
             assert!(!compact(&mock.client, &mut history).await.unwrap_or(false));
             assert_eq!(serde_json::to_value(&history).unwrap(), original);
         }
-    }
-
-    #[test]
-    fn split_point_keeps_recent_four() {
-        assert_eq!(split_point(0), None);
-        assert_eq!(split_point(2), None);
-        assert_eq!(split_point(4), None);
-        assert_eq!(split_point(5), None);
-        assert_eq!(split_point(6), Some(2));
-        assert_eq!(split_point(10), Some(6));
-    }
-
-    #[test]
-    fn estimate_counts_content() {
-        let history = vec![Message::user("abcd"), Message::assistant("ef")];
-        assert_eq!(estimate_chars(&history), 6);
     }
 }

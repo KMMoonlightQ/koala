@@ -37,6 +37,13 @@ impl SessionHandle {
 /// for its mutex: cancellation first drops and joins the operation. Each new
 /// session gets a fresh event channel so old background output cannot leak in.
 pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) {
+    spawn_inner(agent, false)
+}
+pub fn spawn_tui(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) {
+    spawn_inner(agent, true)
+}
+fn spawn_inner(agent: Agent, has_ui: bool) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) {
+    let ui_session = agent.transcript.id().to_owned();
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
     let (ev_tx, ev_rx) = mpsc::unbounded_channel();
     let (mut work_tx, mut work_rx) = mpsc::unbounded_channel();
@@ -53,6 +60,13 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
     let mut snapshot = agent.history.clone();
     let agent = Arc::new(Mutex::new(agent));
     tokio::spawn(async move {
+        let mut ui_host = has_ui.then(|| {
+            super::extension_ui::Host::start(
+                ui_session,
+                shared.extensions.ui_extensions(),
+                ev_tx.clone(),
+            )
+        });
         let mut active: Option<JoinHandle<()>> = None;
         let mut progress = String::new();
         let mut watch_tasks = false;
@@ -79,7 +93,14 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                         stop(&mut active, &agent, &mut work_rx, &ev_tx, &mut progress, shared.lang.get()).await;
                         break;
                     };
+                    let (cmd, images) = match cmd {
+                        SessionCommand::SubmitWithImages { text, images } => (SessionCommand::Submit(text), images),
+                        other => (other, Vec::new()),
+                    };
                     match cmd {
+                        SessionCommand::ExtensionUi(action) => {
+                            if let Some(host) = &ui_host { host.action(action); }
+                        }
                         SessionCommand::OpenBtw { commands, events } => {
                             // The foreground task may be scheduled but not yet holding
                             // the mutex. Its saved snapshot already includes its input.
@@ -112,9 +133,11 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                         }
                         SessionCommand::SetLang(value) => shared.lang.set(value),
                         SessionCommand::Cancel => {
-                            if stop(&mut active, &agent, &mut work_rx, &ev_tx, &mut progress, shared.lang.get()).await {
-                                let _ = ev_tx.send(UiEvent::Cancelled);
-                            }
+                            if let Some(host) = &ui_host { host.cancel().await; }
+                            stop(&mut active, &agent, &mut work_rx, &ev_tx, &mut progress, shared.lang.get()).await;
+                            // A completion may win the select before this command.
+                            // Always acknowledge so the composer can submit its next turn.
+                            let _ = ev_tx.send(UiEvent::Cancelled);
                         }
                         SessionCommand::Shutdown => {
                             stop(&mut active, &agent, &mut work_rx, &ev_tx, &mut progress, shared.lang.get()).await;
@@ -129,18 +152,20 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                             }
                             (work_tx, work_rx) = mpsc::unbounded_channel();
                             progress.clear();
+                            restart_ui(&mut ui_host, &shared, agent.lock().await.transcript.id().to_owned(), &ev_tx).await;
                             let _ = ev_tx.send(UiEvent::SessionReset);
                             let _ = ev_tx.send(UiEvent::PlanMode(agent.lock().await.plan_mode()));
                         }
                         SessionCommand::Submit(text) if active.is_none() => {
                             snapshot = agent.lock().await.history.clone();
-                            snapshot.push(crate::llm::Message::user(&text));
+                            snapshot.push(crate::llm::Message::user_with_images(&text, images.clone()));
                             progress.clear();
+                            let ui_context = ui_host.as_ref().map(|h| h.context()).unwrap_or_default();
                             let agent = agent.clone();
                             let events = work_tx.clone();
                             active = Some(tokio::spawn(async move {
                                 let mut guard = agent.lock().await;
-                                if let Err(e) = guard.run_turn(&text, events.clone()).await {
+                                if let Err(e) = crate::extensions::ui::scope(ui_context, guard.run_turn_with_images(&text, images, events.clone())).await {
                                     let _ = events.send(UiEvent::Error(e.to_string()));
                                 }
                             }));
@@ -148,6 +173,7 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                         SessionCommand::Compact if active.is_none() => {
                             snapshot = agent.lock().await.history.clone();
                             progress.clear();
+                            let ui_context = ui_host.as_ref().map(|h| h.context()).unwrap_or_default();
                             let agent = agent.clone();
                             let events = work_tx.clone();
                             // Read the language before the closure takes the
@@ -157,7 +183,7 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                                 let _ = events.send(UiEvent::Status(
                                     i18n::text(lang, Key::StatusCompacting).into(),
                                 ));
-                                let ev = match agent.lock().await.compact_now().await {
+                                let ev = match crate::extensions::ui::scope(ui_context, agent.lock().await.compact_now()).await {
                                     Ok(true) => {
                                         let _ = events.send(UiEvent::ContextUsage(None));
                                         UiEvent::Note(i18n::text(lang, Key::InfoContextCompacted).into())
@@ -215,15 +241,21 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                                     current_background = guard.background.clone();
                                     (work_tx, work_rx) = mpsc::unbounded_channel();
                                     progress.clear();
+                                    restart_ui(&mut ui_host, &shared, guard.transcript.id().to_owned(), &ev_tx).await;
                                     let _ = ev_tx.send(UiEvent::SessionReset);
-                                    if let Some(journal) = &guard.background.journal {
-                                        if let Ok(Some(saved)) = journal.load() {
-                                            let _ = ev_tx.send(UiEvent::WorkRestored(saved.trace));
-                                        }
+                                    if let Some(journal) = &guard.background.journal
+                                        && let Ok(Some(saved)) = journal.load()
+                                    {
+                                        let _ = ev_tx.send(UiEvent::WorkRestored(saved.trace));
                                     }
                                     let _ = ev_tx.send(UiEvent::Todos(guard.todos.items.iter().map(super::event::TodoView::from).collect()));
                                     let _ = ev_tx.send(UiEvent::Tasks(background.list()));
+                                    let images = if after { Vec::new() } else {
+                                        guard.background.journal.as_ref().and_then(|j| j.graph_snapshot().get(&id).map(|n| n.data["images"].clone()))
+                                            .and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default()
+                                    };
                                     let _ = ev_tx.send(UiEvent::Draft(draft));
+                                    let _ = ev_tx.send(UiEvent::DraftImages(images));
                                 }
                                 Err(error) => { let _ = ev_tx.send(UiEvent::Error(error)); }
                             }
@@ -258,6 +290,7 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                                     (work_tx, work_rx) = mpsc::unbounded_channel();
                                     progress.clear();
                                     watch_tasks = false;
+                                    restart_ui(&mut ui_host, &shared, id.clone(), &ev_tx).await;
                                     let _ = ev_tx.send(UiEvent::SessionRestored { id, records });
                                     let guard = agent.lock().await;
                                     current_background = guard.background.clone();
@@ -332,8 +365,28 @@ pub fn spawn(agent: Agent) -> (SessionHandle, mpsc::UnboundedReceiver<UiEvent>) 
                 Some(ev) = work_rx.recv() => forward(ev, &ev_tx, &mut progress, shared.lang.get()),
             }
         }
+        if let Some(host) = &ui_host {
+            host.shutdown().await;
+        }
     });
     (SessionHandle { tx: cmd_tx }, ev_rx)
+}
+
+async fn restart_ui(
+    host: &mut Option<super::extension_ui::Host>,
+    shared: &Arc<super::SharedState>,
+    session: String,
+    events: &EventSender,
+) {
+    if let Some(old) = host.take() {
+        old.shutdown().await;
+        let _ = events.send(UiEvent::ExtensionUi(Default::default()));
+        *host = Some(super::extension_ui::Host::start(
+            session,
+            shared.extensions.ui_extensions(),
+            events.clone(),
+        ));
+    }
 }
 
 /// `progress` becomes the visible record of an interrupted turn, so it is
@@ -394,6 +447,81 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn image_commands_reach_main_and_btw_and_branch_restores_attachments() {
+        use crate::test_support::{MockLlm, stream};
+        let mut mock = MockLlm::respond(|_| stream(serde_json::json!({"content":"answer"}))).await;
+        let root =
+            std::env::temp_dir().join(format!("koala-image-session-{}", uuid::Uuid::new_v4()));
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.llm.base_url = mock.url.clone();
+        cfg.agent.session_dir = root.join("sessions");
+        cfg.agent.memory_file = root.join("memory.md");
+        let red = crate::images::from_rgba(1, 1, &[255, 0, 0, 255]).unwrap();
+        let green = crate::images::from_rgba(1, 1, &[0, 255, 0, 255]).unwrap();
+        let (main, mut events) = spawn(Agent::new(&cfg).await.unwrap());
+        main.send(SessionCommand::SubmitWithImages {
+            text: "main".into(),
+            images: vec![red.clone()],
+        });
+        let (aside, mut side_events) = main.open_btw();
+        aside.send(SessionCommand::SubmitWithImages {
+            text: "side".into(),
+            images: vec![green.clone()],
+        });
+        receive_until(&mut side_events, |e| matches!(e, UiEvent::Done)).await;
+        receive_until(&mut events, |e| matches!(e, UiEvent::Done)).await;
+        for _ in 0..2 {
+            let request = mock.request().await;
+            let messages = request["messages"].as_array().unwrap();
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| m["content"][1]["image_url"]["url"] == red.data_url)
+            );
+            if messages.last().unwrap()["content"][0]["text"] == "side" {
+                assert_eq!(
+                    messages.last().unwrap()["content"][1]["image_url"]["url"],
+                    green.data_url
+                );
+            } else {
+                assert!(!request.to_string().contains(&green.data_url));
+            }
+        }
+        main.send(SessionCommand::ShowGraph);
+        let turn = timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(UiEvent::Graph(graph)) = events.recv().await {
+                    break graph
+                        .nodes
+                        .iter()
+                        .find(|n| n.kind == super::super::graph::Kind::Turn)
+                        .unwrap()
+                        .id
+                        .clone();
+                }
+            }
+        })
+        .await
+        .unwrap();
+        main.send(SessionCommand::BranchBeforeTurn(turn));
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(UiEvent::DraftImages(images)) = events.recv().await {
+                    assert_eq!(images, vec![red]);
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        aside.send(SessionCommand::Shutdown);
+        main.send(SessionCommand::Shutdown);
+        while events.recv().await.is_some() {}
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn btw_opened_immediately_after_submit_includes_current_main_question() {
@@ -1233,6 +1361,26 @@ mod tests {
         .expect("session did not respond");
     }
 
+    #[tokio::test]
+    async fn cancellation_acknowledges_even_after_turn_completed() {
+        use crate::test_support::{MockLlm, stream};
+        let _mock = MockLlm::start(vec![stream(serde_json::json!({"content": "done"}))]).await;
+        let root = std::env::temp_dir().join(format!("koala-cancel-ack-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.llm.base_url = _mock.url.clone();
+        cfg.agent.session_dir = root.join("sessions");
+        cfg.agent.memory_file = root.join("memory.md");
+        let (handle, mut events) = spawn(Agent::new(&cfg).await.unwrap());
+        handle.send(SessionCommand::Submit("finish first".into()));
+        receive_until(&mut events, |ev| matches!(ev, UiEvent::Done)).await;
+        handle.send(SessionCommand::Cancel);
+        receive_until(&mut events, |ev| matches!(ev, UiEvent::Cancelled)).await;
+        handle.send(SessionCommand::Shutdown);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     async fn interrupted_stream(reset: bool) {
         let root =
             std::env::temp_dir().join(format!("koala-session-test-{}", uuid::Uuid::new_v4()));
@@ -1335,6 +1483,104 @@ mod tests {
         receive_until(&mut events, |ev| matches!(ev, UiEvent::Tasks(tasks) if tasks.iter().any(|t| t.id == id && t.status == super::super::event::TaskState::Stopped))).await;
         handle.send(SessionCommand::Cancel);
         receive_until(&mut events, |ev| matches!(ev, UiEvent::Cancelled)).await;
+        handle.send(SessionCommand::Shutdown);
+        timeout(Duration::from_secs(3), async {
+            while events.recv().await.is_some() {}
+        })
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod ui_tests {
+    use super::super::extension_ui::{Snapshot, UiAction};
+    use super::*;
+    use crate::{config::Config, extensions::*};
+    use tokio::time::{Duration, timeout};
+    async fn ui(
+        rx: &mut mpsc::UnboundedReceiver<UiEvent>,
+        check: impl Fn(&Snapshot) -> bool,
+    ) -> Snapshot {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(UiEvent::ExtensionUi(s)) = rx.recv().await
+                    && check(&s)
+                {
+                    return s;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn ui_callbacks_work_while_agent_busy_and_remount_on_new_session() {
+        let root = std::env::temp_dir().join(format!("koala-session-ui-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("started");
+        let mut cfg = Config::default();
+        cfg.llm.model = "test".into();
+        cfg.agent.session_dir = root.join("sessions");
+        cfg.agent.memory_file = root.join("memory.md");
+        cfg.hooks.turn_start = vec![format!("touch '{}'; sleep 30", marker.display())];
+        cfg.extensions.manifests = vec![
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/extensions/interactive/extension.toml"),
+        ];
+        let (handle, mut events) = spawn_tui(Agent::new(&cfg).await.unwrap());
+        let mounted = ui(&mut events, |s| !s.surfaces.is_empty()).await;
+        let surface = &mounted.surfaces[0];
+        let old = UiAction {
+            extension: surface.extension.clone(),
+            event: UiInputEvent {
+                kind: UiEventType::Select,
+                event_id: String::new(),
+                surface: Some(surface.kind),
+                surface_id: Some(surface.id.clone()),
+                revision: surface.revision,
+                control_id: Some("document".into()),
+                value: serde_json::json!("develop"),
+            },
+        };
+        handle.send(SessionCommand::Submit("hold the agent mutex".into()));
+        timeout(Duration::from_secs(3), async {
+            while !marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        handle.send(SessionCommand::ExtensionUi(old.clone()));
+        ui(&mut events, |s| {
+            s.surfaces.iter().any(|s| {
+                s.blocks
+                    .iter()
+                    .any(|b| matches!(b, UiBlock::Markdown { text } if text.contains("JSON")))
+            })
+        })
+        .await;
+        handle.send(SessionCommand::NewSession);
+        timeout(Duration::from_secs(3), async {
+            while !matches!(events.recv().await, Some(UiEvent::SessionReset)) {}
+        })
+        .await
+        .unwrap();
+        let fresh = ui(&mut events, |s| !s.surfaces.is_empty()).await;
+        assert_ne!(fresh.surfaces[0].revision, old.event.revision);
+        handle.send(SessionCommand::ExtensionUi(old));
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(UiEvent::Note(note)) = events.recv().await
+                    && note.contains("stale")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
         handle.send(SessionCommand::Shutdown);
         timeout(Duration::from_secs(3), async {
             while events.recv().await.is_some() {}

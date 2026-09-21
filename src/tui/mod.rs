@@ -1,11 +1,18 @@
 use crate::config::{PermissionMode, Theme};
+mod attachments;
 mod btw;
+mod clipboard;
 mod controls;
+mod extension_ui;
 mod graph;
 mod input;
 mod logo;
 mod markdown;
+mod mentions;
 mod panels;
+mod queue;
+#[cfg(test)]
+mod queue_tests;
 mod text;
 mod theme;
 mod transcript;
@@ -32,7 +39,7 @@ use tui_textarea::TextArea;
 use view::draw;
 
 enum Panel {
-    Graph(graph::View),
+    Graph(Box<graph::View>),
     Theme {
         selected: usize,
     },
@@ -75,6 +82,7 @@ struct PermissionPrompt {
 
 /// UI state only; all agent operations go through SessionCommand / UiEvent.
 struct App {
+    extension_ui: extension_ui::View,
     session: SessionHandle,
     btw: Option<btw::Conversation>,
     temporary: bool,
@@ -97,6 +105,7 @@ struct App {
     directory: String,
     plan_mode: bool,
     permission_mode: PermissionMode,
+    pending_permission_mode: Option<PermissionMode>,
     /// Interface language; drives every label and the system prompt.
     lang: Lang,
     language_path: Option<std::path::PathBuf>,
@@ -105,11 +114,15 @@ struct App {
     background_count: usize,
     transcript: Transcript,
     input: TextArea<'static>,
+    images: attachments::DraftImages,
+    clipboard_pending: Option<clipboard::Pending>,
     permission: Option<PermissionPrompt>,
     busy: bool,
+    queue: queue::Queue,
     restarting: bool,
     status: String,
     started: Option<Instant>,
+    last_elapsed: Option<Duration>,
     hint: Option<String>,
     quit: bool,
 }
@@ -128,6 +141,7 @@ impl App {
             session,
             btw: None,
             temporary: false,
+            extension_ui: extension_ui::View::default(),
             history: input::History::default(),
             menu_selected: 0,
             menu_dismissed: false,
@@ -147,6 +161,7 @@ impl App {
             directory: String::new(),
             plan_mode: false,
             permission_mode: PermissionMode::Normal,
+            pending_permission_mode: None,
             lang: Lang::default(),
             language_path: None,
             theme: Theme::default(),
@@ -154,11 +169,15 @@ impl App {
             background_count: 0,
             transcript: Transcript::default(),
             input: new_input(Lang::default()),
+            images: attachments::DraftImages::default(),
+            clipboard_pending: None,
             permission: None,
             busy: false,
+            queue: queue::Queue::default(),
             restarting: false,
             status: String::new(),
             started: None,
+            last_elapsed: None,
             hint: None,
             quit: false,
         }
@@ -183,6 +202,7 @@ impl App {
     fn start(&mut self, status: &str) {
         self.busy = true;
         self.started = Some(Instant::now());
+        self.last_elapsed = None;
         self.status = status.into();
         self.hint = None;
     }
@@ -192,7 +212,9 @@ impl App {
         self.transcript.finish();
         if !self.restarting {
             self.busy = false;
-            self.started = None;
+            if let Some(started) = self.started.take() {
+                self.last_elapsed = Some(started.elapsed());
+            }
             self.status.clear();
         }
     }
@@ -210,7 +232,8 @@ impl App {
     }
 
     fn cancel(&mut self) {
-        if self.busy && !self.restarting {
+        if self.busy && !self.restarting && !self.queue.cancelling {
+            self.queue.cancelling = !self.temporary;
             self.session.send(SessionCommand::Cancel);
             self.status = i18n::text(self.lang, Key::StatusInterrupting).into();
             self.permission = None;
@@ -219,7 +242,7 @@ impl App {
 }
 
 pub async fn run(cfg: &Config) -> anyhow::Result<()> {
-    let (handle, events) = session::spawn(Agent::new(cfg).await?);
+    let (handle, events) = session::spawn_tui(Agent::new(cfg).await?);
     let mut app = App::new(handle);
     app.configure_appearance(cfg);
     app.model = cfg.llm.model.clone();
@@ -239,13 +262,17 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     let result = match crossterm::execute!(
         std::io::stdout(),
         crossterm::event::EnableBracketedPaste,
-        crossterm::event::EnableMouseCapture
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
     ) {
         Ok(()) => event_loop(&mut terminal, &mut app, events).await,
         Err(e) => Err(e.into()),
     };
     let _ = crossterm::execute!(
         std::io::stdout(),
+        crossterm::event::PopKeyboardEnhancementFlags,
         crossterm::event::DisableMouseCapture,
         crossterm::event::DisableBracketedPaste
     );
@@ -270,10 +297,12 @@ async fn event_loop(
                 Some(Err(e)) => return Err(e.into()),
                 None => app.quit = true,
             },
+            result = clipboard::next(&mut app.clipboard_pending) => clipboard::apply(app, result),
             ev = btw::next_event(&mut app.btw) => {
                 if let Some(side) = &mut app.btw {
                     match ev {
-                        Some(ev) => handle_ui_event(&mut side.app, ev),
+                        Some(btw::SideEvent::Agent(ev)) => handle_ui_event(&mut side.app, ev),
+                        Some(btw::SideEvent::Clipboard(result)) => clipboard::apply(&mut side.app, result),
                         None => {
                             side.app.finish();
                             side.app.hint = Some(i18n::text(side.app.lang, Key::BtwClosed).into());
@@ -322,6 +351,7 @@ fn handle_terminal_event(app: &mut App, event: Event) {
 
 fn handle_ui_event(app: &mut App, ev: UiEvent) {
     match ev {
+        UiEvent::ExtensionUi(snapshot) => app.extension_ui.update(snapshot),
         UiEvent::Graph(graph) => {
             app.graph = graph;
             app.graph_received = Instant::now();
@@ -342,7 +372,12 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
                 *selected = app.tasks.first().map(|t| t.id);
             }
         }
-        UiEvent::PermissionMode(mode) => app.permission_mode = mode,
+        UiEvent::PermissionMode(mode) => {
+            app.permission_mode = mode;
+            if app.pending_permission_mode == Some(mode) {
+                app.pending_permission_mode = None;
+            }
+        }
         UiEvent::PlanMode(on) => app.plan_mode = on,
         UiEvent::ModelSettings {
             model,
@@ -395,7 +430,7 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
                 scroll: 0,
             });
         }
-        UiEvent::Done => app.finish(),
+        UiEvent::Done => queue::completed(app),
         UiEvent::Cancelled => {
             app.transcript.stop_tools(
                 ToolState::Cancelled,
@@ -405,8 +440,12 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
             app.push(EntryKind::Note(
                 i18n::text(app.lang, Key::InfoCancelled).into(),
             ));
+            queue::cancelled(app);
         }
+        UiEvent::DraftImages(images) => app.images.restore(&mut app.input, images),
         UiEvent::Draft(draft) => {
+            app.images.clear();
+            app.clipboard_pending = None;
             controls::close_panel(app);
             app.input = input::editor(&draft, app.lang);
             app.menu_dismissed = true;
@@ -420,6 +459,11 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
             }
         }
         UiEvent::SessionRestored { id, records } => {
+            app.queue = queue::Queue::default();
+            let text = app.images.text(&app.input.lines().join("\n"));
+            app.input = input::editor(&text, app.lang);
+            app.images.clear();
+            app.clipboard_pending = None;
             app.graph = Default::default();
             app.transcript.restore(records);
             app.context_used = None;
@@ -427,6 +471,7 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
             controls::close_panel(app);
             app.restarting = false;
             app.finish();
+            app.last_elapsed = None;
             app.hint = None;
             app.push(EntryKind::Info(i18n::fill(
                 app.lang,
@@ -477,6 +522,11 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
             app.push(EntryKind::Error(error));
         }
         UiEvent::SessionReset => {
+            app.queue = queue::Queue::default();
+            let text = app.images.text(&app.input.lines().join("\n"));
+            app.input = input::editor(&text, app.lang);
+            app.images.clear();
+            app.clipboard_pending = None;
             app.graph = Default::default();
             app.transcript.reset();
             app.context_used = None;
@@ -484,12 +534,14 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
             controls::close_panel(app);
             app.restarting = false;
             app.finish();
+            app.last_elapsed = None;
             app.hint = None;
             app.push(EntryKind::Info(
                 i18n::text(app.lang, Key::InfoNewSession).into(),
             ));
         }
         UiEvent::Error(err) => {
+            app.pending_permission_mode = None;
             app.transcript.stop_tools(ToolState::Failed, &err);
             app.permission = None;
             app.push(EntryKind::Error(err));
@@ -497,12 +549,31 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
     }
 }
 
+fn sync_images(app: &mut App) {
+    app.images.sync(&app.input);
+    if let Some(side) = &mut app.btw {
+        side.app.images.sync(&side.app.input);
+    }
+}
+
 fn handle_paste(app: &mut App, pasted: &str) {
+    handle_paste_inner(app, pasted);
+    sync_images(app);
+}
+
+fn handle_paste_inner(app: &mut App, pasted: &str) {
     if let Some(side) = &mut app.btw {
         handle_paste(&mut side.app, pasted);
         return;
     }
-    if app.permission.is_some() || app.transcript.detailed() {
+    if app.permission.is_some() {
+        return;
+    }
+    if app.panel.is_none() && app.extension_ui.active() {
+        app.extension_ui.paste(pasted);
+        return;
+    }
+    if app.transcript.detailed() {
         return;
     }
     let pasted = text::clean(&pasted.replace("\r\n", "\n").replace('\r', "\n"));
@@ -522,11 +593,19 @@ fn handle_paste(app: &mut App, pasted: &str) {
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
+    sync_images(app);
+    handle_key_inner(app, key);
+    sync_images(app);
+}
+
+fn handle_key_inner(app: &mut App, key: KeyEvent) {
     if let Some(side) = &mut app.btw {
         if key.code == KeyCode::Esc
             || (key.code == KeyCode::Char('d')
                 && key.modifiers.contains(KeyModifiers::CONTROL)
-                && side.app.input.is_empty())
+                && side.app.input.is_empty()
+                && side.app.images.is_empty()
+                && side.app.clipboard_pending.is_none())
         {
             app.btw.take();
         } else {
@@ -537,6 +616,23 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     if !app.temporary && key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::ALT)
     {
         btw::open(app, "");
+        return;
+    }
+    let global = key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('c' | 'd'));
+    if !global && app.permission.is_none() && app.panel.is_none() && app.extension_ui.active() {
+        if let Some(action) = app.extension_ui.key(key) {
+            app.session.send(SessionCommand::ExtensionUi(action));
+        }
+        return;
+    }
+    if global && app.extension_ui.active() && key.code == KeyCode::Char('c') {
+        app.extension_ui.close();
+        if app.busy {
+            app.cancel();
+        } else {
+            app.session.send(SessionCommand::Cancel);
+        }
         return;
     }
     if controls::handle_key(app, key) {
@@ -552,12 +648,21 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 if app.busy {
                     app.cancel();
                 } else {
+                    // UI mount/callback work can exist without an active model turn.
+                    app.session.send(SessionCommand::Cancel);
                     app.input = new_input(app.lang);
+                    app.images.clear();
+                    app.clipboard_pending = None;
                     app.history.reset_navigation();
                 }
                 return;
             }
-            KeyCode::Char('d') if app.input.is_empty() && app.permission.is_none() => {
+            KeyCode::Char('d')
+                if app.input.is_empty()
+                    && app.images.is_empty()
+                    && app.clipboard_pending.is_none()
+                    && app.permission.is_none() =>
+            {
                 app.quit = true;
                 return;
             }
@@ -617,7 +722,13 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
     match key.code {
+        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            clipboard::start(app)
+        }
         KeyCode::Esc => app.cancel(),
+        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SUPER) => {
+            submit_with_priority(app, true);
+        }
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
             app.input.insert_newline();
         }
@@ -638,6 +749,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         _ => {
             app.hint = None;
             let before = app.input.lines().to_vec();
+            if key.modifiers.is_empty() && matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
+            {
+                app.images
+                    .select_for_delete(&mut app.input, key.code == KeyCode::Backspace);
+            }
             app.input.input(key);
             if app.input.lines() != before {
                 app.history.reset_navigation();
@@ -649,7 +765,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 }
 
 fn consume_input(app: &mut App, text: &str) {
-    if let Err(e) = app.history.record(text) {
+    if let Err(e) = app.history.record(&app.images.text(text)) {
         app.push(EntryKind::Note(i18n::fill(
             app.lang,
             Key::NoteHistorySaveFailed,
@@ -662,8 +778,17 @@ fn consume_input(app: &mut App, text: &str) {
 }
 
 fn submit(app: &mut App) {
+    submit_with_priority(app, false);
+}
+
+fn submit_with_priority(app: &mut App, immediate: bool) {
+    app.images.sync(&app.input);
     let text = app.input.lines().join("\n").trim().to_string();
-    if text.is_empty() {
+    if app.clipboard_pending.is_some() {
+        app.hint = Some(i18n::text(app.lang, Key::ClipboardLoading).into());
+        return;
+    }
+    if text.is_empty() && app.images.is_empty() {
         return;
     }
     if !app.temporary && !app.restarting && text.split_whitespace().next() == Some("/btw") {
@@ -671,7 +796,14 @@ fn submit(app: &mut App) {
         app.input = new_input(app.lang);
         app.menu_selected = 0;
         app.menu_dismissed = false;
-        btw::open(app, question);
+        let images = std::mem::take(&mut app.images);
+        btw::open(app, "");
+        if let Some(side) = &mut app.btw {
+            side.app.images = images;
+            if !question.is_empty() || !side.app.images.is_empty() {
+                btw::submit(&mut side.app, question.to_owned());
+            }
+        }
         return;
     }
     if app.temporary {
@@ -684,6 +816,7 @@ fn submit(app: &mut App) {
         return;
     }
     if text == "/new" && !app.restarting {
+        app.queue = queue::Queue::default();
         consume_input(app, &text);
         app.restarting = true;
         app.start(i18n::text(app.lang, Key::StatusNewSession));
@@ -691,8 +824,10 @@ fn submit(app: &mut App) {
         return;
     }
     // Live settings and panels also work during an active turn.
-    if matches!(text.as_str(), "/help" | "/tasks" | "/todos" | "/tree")
-        || text == "/lang"
+    if matches!(
+        text.as_str(),
+        "/help" | "/tasks" | "/todos" | "/tree" | "/extensions"
+    ) || text == "/lang"
         || text.starts_with("/lang ")
         || text == "/permissions"
         || text.starts_with("/permissions ")
@@ -705,7 +840,7 @@ fn submit(app: &mut App) {
         }
         return;
     }
-    if app.busy {
+    if app.restarting || (app.busy && text.starts_with('/')) {
         app.hint = Some(i18n::text(app.lang, Key::NoteBusyDraftKept).into());
         return;
     }
@@ -716,15 +851,30 @@ fn submit(app: &mut App) {
         return;
     }
     consume_input(app, &text);
-    app.transcript.scroll(Scroll::End);
-    app.push(EntryKind::User(text.clone()));
+    queue::submit(app, text, immediate);
+}
+
+fn send_draft(app: &mut App, text: String) {
+    let (text, images) = app.images.take_message(&text);
+    app.push(EntryKind::User(
+        crate::llm::Message::user_with_images(&text, images.clone()).display_content(),
+    ));
     app.start(i18n::text(app.lang, Key::StatusGenerating));
-    app.session.send(SessionCommand::Submit(text));
+    app.session.send(if images.is_empty() {
+        SessionCommand::Submit(text)
+    } else {
+        SessionCommand::SubmitWithImages { text, images }
+    });
 }
 
 fn handle_command(app: &mut App, cmd: &str) -> bool {
     let mut words = cmd.split_whitespace();
     let command = words.next();
+    if command == Some("extensions") {
+        controls::close_panel(app);
+        app.extension_ui.open();
+        return true;
+    }
     if command == Some("memory") {
         let args: Vec<_> = words.collect();
         let control = match args.as_slice() {
@@ -874,7 +1024,7 @@ fn handle_command(app: &mut App, cmd: &str) -> bool {
         "todos" => app.panel = Some(Panel::Todos { scroll: 0 }),
         "tree" => {
             controls::close_panel(app);
-            app.panel = Some(Panel::Graph(graph::View::default()));
+            app.panel = Some(Panel::Graph(Box::default()));
             app.session.send(SessionCommand::ShowGraph);
         }
         "tasks" => controls::open_tasks(app),
@@ -1088,6 +1238,7 @@ mod tests {
                 records: vec![crate::agent::transcripts::Record {
                     ts: "then".into(),
                     role: "user".into(),
+                    images: Vec::new(),
                     content: "restored conversation".into(),
                 }],
             },
@@ -1472,12 +1623,12 @@ mod tests {
     }
 
     #[test]
-    fn enter_while_busy_keeps_draft() {
+    fn enter_while_busy_consumes_draft() {
         let mut app = app();
         app.busy = true;
         app.input.insert_str("下一步检查测试");
         submit(&mut app);
-        assert_eq!(app.input.lines().join("\n"), "下一步检查测试");
+        assert!(app.input.is_empty());
     }
 
     #[test]
@@ -1531,7 +1682,7 @@ mod tests {
         app.configure_appearance(&load());
         assert_eq!(app.theme, Theme::Dark);
         app.busy = true;
-        for theme in [Theme::Light, Theme::Dark, Theme::Auto] {
+        for theme in Theme::ALL.into_iter().skip(1).chain([Theme::Auto]) {
             app.input = input::editor(&format!("/theme {}", theme.code()), app.lang);
             submit(&mut app);
             assert_eq!(app.theme, theme);
@@ -1562,7 +1713,6 @@ mod tests {
         assert_eq!(load().theme, Theme::Auto);
         assert_eq!(app.input.lines(), ["未发送草稿"]);
         handle_command(&mut app, "theme");
-        handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert!(matches!(app.panel, Some(Panel::Theme { selected: 2 })));
@@ -1606,7 +1756,7 @@ mod tests {
         app.push(EntryKind::Assistant("Cached answer".into()));
         app.input.insert_str("unsent draft");
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        for theme in [Theme::Dark, Theme::Light, Theme::Auto, Theme::Dark] {
+        for theme in Theme::ALL {
             app.theme = theme;
             terminal.draw(|f| draw(f, &mut app)).unwrap();
             let buffer = terminal.backend().buffer();
@@ -1810,7 +1960,15 @@ mod tests {
         app.input = input::editor("/la", Lang::Zh);
         assert!(!input::matches(&app.input).is_empty());
         app.panel = Some(Panel::Help { scroll: 0 });
-        assert!(render(&mut app, 100, 40).contains("/lang"));
+        let mut found = render(&mut app, 100, 40).contains("/lang");
+        for _ in 0..5 {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+            );
+            found |= render(&mut app, 100, 40).contains("/lang");
+        }
+        assert!(found);
     }
 
     #[test]
@@ -2304,35 +2462,80 @@ mod tests {
         handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.input.lines(), ["first", "second"]);
         handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.input.lines(), ["old input"]);
+        assert_eq!(app.input.lines(), ["first", "second"]);
         handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.input.lines(), ["first", "second"]);
     }
 
     #[test]
-    fn mode_shortcut_waits_for_backend_and_busy_mode_is_unchanged() {
+    fn permission_shortcut_cycles_while_busy_and_preserves_draft() {
         let (session, mut commands) = SessionHandle::test_channel();
         let mut app = test_app(session);
         app.input.insert_str("draft");
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
-        );
-        assert!(matches!(
-            commands.try_recv(),
-            Ok(SessionCommand::TogglePlanMode)
-        ));
-        assert!(!app.plan_mode);
-        handle_ui_event(&mut app, UiEvent::PlanMode(true));
-        assert!(app.plan_mode);
         app.busy = true;
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
-        );
-        assert!(commands.try_recv().is_err());
-        assert!(app.plan_mode);
+        for expected in [
+            PermissionMode::AskWhenNeed,
+            PermissionMode::AutoEdit,
+            PermissionMode::NeverAsk,
+            PermissionMode::Normal,
+        ] {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            );
+            assert!(
+                matches!(commands.try_recv(), Ok(SessionCommand::SetPermissionMode(mode)) if mode == expected)
+            );
+            handle_ui_event(&mut app, UiEvent::PermissionMode(expected));
+        }
+        assert!(!app.plan_mode);
         assert_eq!(app.input.lines(), ["draft"]);
+    }
+
+    #[test]
+    fn rapid_permission_shortcuts_do_not_repeat_the_same_mode() {
+        let (session, mut commands) = SessionHandle::test_channel();
+        let mut app = test_app(session);
+        for expected in [
+            PermissionMode::AskWhenNeed,
+            PermissionMode::AutoEdit,
+            PermissionMode::NeverAsk,
+        ] {
+            handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+            assert!(
+                matches!(commands.try_recv(), Ok(SessionCommand::SetPermissionMode(mode)) if mode == expected)
+            );
+        }
+        assert_eq!(app.permission_mode, PermissionMode::Normal);
+    }
+
+    #[test]
+    fn completed_turn_keeps_elapsed_time_visible() {
+        let mut app = app();
+        app.start("a very long running tool status that must not hide the timer");
+        app.started = Some(Instant::now() - Duration::from_secs(65));
+        assert!(render(&mut app, 22, 12).contains("1m 05s"));
+        assert!(render(&mut app, 90, 24).contains("1m 05s"));
+        app.finish();
+        assert!(render(&mut app, 90, 24).contains("1m 05s"));
+        app.start("next");
+        assert!(!render(&mut app, 90, 24).contains("1m 05s"));
+    }
+
+    #[test]
+    fn file_completion_preserves_surrounding_text_and_does_not_submit() {
+        let root = std::env::temp_dir().join(format!("koala-mention-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("测试 file.rs"), "hello").unwrap();
+        let (session, mut commands) = SessionHandle::test_channel();
+        let mut app = test_app(session);
+        app.directory = root.display().to_string();
+        app.input = input::editor("look @测试 please", app.lang);
+        app.input.move_cursor(tui_textarea::CursorMove::Jump(0, 8));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.input.lines(), ["look @\"测试 file.rs\"  please"]);
+        assert!(commands.try_recv().is_err());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -2465,5 +2668,266 @@ mod tests {
         for (width, height) in [(90, 24), (20, 8), (1, 1)] {
             render(&mut app, width, height);
         }
+    }
+}
+
+#[cfg(test)]
+mod extension_integration_tests {
+    use super::*;
+    use crate::agent::extension_ui::{Snapshot, Surface};
+    use crate::extensions::{Dialog, Placement, SurfaceKind};
+    #[test]
+    fn cancel_reaches_extension_host_even_without_focused_ui_or_model_turn() {
+        let (session, mut commands) = SessionHandle::test_channel();
+        let mut app = App::new(session);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(commands.try_recv(), Ok(SessionCommand::Cancel)));
+    }
+    #[test]
+    fn extension_dialog_keeps_chat_draft_and_yields_to_permissions() {
+        let (session, mut commands) = SessionHandle::test_channel();
+        let mut app = App::new(session);
+        app.set_lang(Lang::Zh);
+        app.input.insert_str("keep my draft");
+        handle_ui_event(
+            &mut app,
+            UiEvent::ExtensionUi(Snapshot {
+                statuses: vec![],
+                surfaces: vec![Surface {
+                    extension: "demo".into(),
+                    id: "confirm".into(),
+                    kind: SurfaceKind::Dialog,
+                    revision: 7,
+                    content_revision: 7,
+                    pending: false,
+                    placement: Placement::AboveEditor,
+                    blocks: vec![],
+                    dialog: Some(Dialog::Confirm {
+                        title: "demo confirmation".into(),
+                        text: "Confirm?".into(),
+                    }),
+                }],
+            }),
+        );
+        let (tx, mut answer) = oneshot::channel();
+        handle_ui_event(
+            &mut app,
+            UiEvent::PermissionRequest {
+                text: "permission first".into(),
+                respond: tx,
+            },
+        );
+        handle_paste(&mut app, "must not enter anything");
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!answer.try_recv().unwrap());
+        assert!(commands.try_recv().is_err());
+        assert_eq!(app.input.lines()[0], "keep my draft");
+        for (w, h) in [(100, 30), (20, 8), (1, 1)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| draw(f, &mut app)).unwrap();
+            if w == 100 {
+                let content = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                assert!(content.contains("demo confirmation"));
+            }
+        }
+        handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let SessionCommand::ExtensionUi(action) = commands.try_recv().unwrap() else {
+            panic!("UI event expected")
+        };
+        assert_eq!(
+            action.event.value, false,
+            "confirmation must default to cancel"
+        );
+        assert_eq!(app.input.lines()[0], "keep my draft");
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    fn image() -> crate::llm::ImageAttachment {
+        crate::images::from_rgba(1, 1, &[255, 0, 0, 255]).unwrap()
+    }
+
+    #[test]
+    fn image_draft_renders_metadata_without_base64_and_loading_blocks_submit() {
+        let (session, mut rx) = SessionHandle::test_channel();
+        let mut app = App::new(session);
+        let attachment = image();
+        app.images.insert(&mut app.input, attachment.clone());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("[image 1]"));
+        assert!(!rendered.contains("base64"));
+        let (_send, receive) = oneshot::channel();
+        app.clipboard_pending = Some(receive);
+        submit(&mut app);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.images.len(), 1);
+    }
+
+    #[test]
+    fn image_only_draft_is_sent_and_cleared() {
+        let (session, mut rx) = SessionHandle::test_channel();
+        let mut app = App::new(session);
+        app.images.insert(&mut app.input, image());
+        submit(&mut app);
+        let SessionCommand::SubmitWithImages { text, images } =
+            rx.try_recv().expect("image-only message must send")
+        else {
+            panic!("image submission")
+        };
+        assert!(text.is_empty());
+        assert_eq!(images.len(), 1);
+        assert!(app.images.is_empty());
+        assert!(app.busy);
+    }
+
+    #[test]
+    fn temporary_image_draft_uses_its_own_session() {
+        let (session, mut rx) = SessionHandle::test_channel();
+        let mut app = App::new(session);
+        app.temporary = true;
+        app.images.insert(&mut app.input, image());
+        submit(&mut app);
+        assert!(
+            matches!(rx.try_recv(), Ok(SessionCommand::SubmitWithImages { images, .. }) if images.len() == 1)
+        );
+        assert!(app.images.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod image_marker_tests {
+    use super::*;
+
+    fn paste(app: &mut App, red: u8) {
+        let image = crate::images::from_rgba(1, 1, &[red, 0, 0, 255]).unwrap();
+        clipboard::apply(app, Ok(clipboard::Paste::Image(image)));
+    }
+
+    #[test]
+    fn pasted_images_are_editable_markers_and_deleted_images_are_not_sent() {
+        let (session, mut commands) = SessionHandle::test_channel();
+        let mut app = App::new(session);
+        paste(&mut app, 255);
+        paste(&mut app, 0);
+        assert_eq!(app.input.lines().join("\n").trim(), "[image 1] [image 2]");
+        // Selecting and deleting the first marker keeps image 2's identity.
+        app.input.move_cursor(tui_textarea::CursorMove::Head);
+        app.input.start_selection();
+        app.input.move_cursor(tui_textarea::CursorMove::Jump(0, 9));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert_eq!(app.images.len(), 1);
+        submit(&mut app);
+        let SessionCommand::SubmitWithImages { text, images } = commands.try_recv().unwrap() else {
+            panic!("image send")
+        };
+        assert!(text.trim().is_empty());
+        assert_eq!(
+            images,
+            vec![crate::images::from_rgba(1, 1, &[0, 0, 0, 255]).unwrap()]
+        );
+    }
+
+    #[test]
+    fn deleting_all_markers_sends_no_images_and_undo_restores_them() {
+        let (session, mut commands) = SessionHandle::test_channel();
+        let mut app = App::new(session);
+        paste(&mut app, 255);
+        app.input.select_all();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert!(app.images.is_empty());
+        submit(&mut app);
+        assert!(commands.try_recv().is_err());
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        );
+        assert!(app.input.lines().join("\n").contains("[image 1]"));
+        submit(&mut app);
+        assert!(
+            matches!(commands.try_recv(), Ok(SessionCommand::SubmitWithImages { images, .. }) if images.len() == 1)
+        );
+    }
+
+    #[test]
+    fn restored_markers_can_be_deleted_and_do_not_send_the_wrong_image() {
+        let (session, mut commands) = SessionHandle::test_channel();
+        let mut app = App::new(session);
+        let first = crate::images::from_rgba(1, 1, &[255, 0, 0, 255]).unwrap();
+        let second = crate::images::from_rgba(1, 1, &[0, 0, 0, 255]).unwrap();
+        handle_ui_event(&mut app, UiEvent::Draft(String::new()));
+        handle_ui_event(&mut app, UiEvent::DraftImages(vec![first, second.clone()]));
+        assert_eq!(app.input.lines(), ["[image 1] [image 2]"]);
+        app.input.move_cursor(tui_textarea::CursorMove::Head);
+        handle_key(&mut app, KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        submit(&mut app);
+        assert!(
+            matches!(commands.try_recv(), Ok(SessionCommand::SubmitWithImages { images, .. }) if images == vec![second])
+        );
+    }
+
+    #[test]
+    fn removing_a_recalled_queue_marker_removes_the_queued_attachment() {
+        let (session, mut commands) = SessionHandle::test_channel();
+        let mut app = App::new(session);
+        app.busy = true;
+        paste(&mut app, 255);
+        submit(&mut app);
+        assert!(app.input.is_empty());
+        handle_key(&mut app, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input.lines(), ["[image 1]"]);
+        app.input.select_all();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        handle_paste(&mut app, "text only now");
+        submit(&mut app);
+        handle_ui_event(&mut app, UiEvent::Done);
+        assert!(
+            matches!(commands.try_recv(), Ok(SessionCommand::Submit(text)) if text == "text only now")
+        );
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn ordinary_backspace_at_marker_end_removes_the_whole_image() {
+        let (session, _) = SessionHandle::test_channel();
+        let mut app = App::new(session);
+        paste(&mut app, 255);
+        app.input.move_cursor(tui_textarea::CursorMove::Jump(0, 9));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert!(app.images.is_empty());
+        assert!(app.input.lines().join("\n").trim().is_empty());
     }
 }

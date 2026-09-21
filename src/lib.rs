@@ -2,6 +2,7 @@ pub mod agent;
 pub mod config;
 pub mod extensions;
 pub mod i18n;
+pub mod images;
 pub mod llm;
 pub mod markdown;
 pub mod mcp;

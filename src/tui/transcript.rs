@@ -234,7 +234,10 @@ impl Transcript {
         self.reset();
         for record in records {
             self.push(if record.role == "user" {
-                EntryKind::User(record.content)
+                EntryKind::User(
+                    crate::llm::Message::user_with_images(record.content, record.images)
+                        .display_content(),
+                )
             } else {
                 EntryKind::Assistant(record.content)
             });

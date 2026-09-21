@@ -8,6 +8,9 @@ members = ["crates/*"]
 resolver = "3"
 
 [dependencies]
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+base64 = "0.22.1"
 koala-extensions = { path = "crates/extensions" }
 koala-llm = { path = "crates/llm" }
 koala-markdown = { path = "crates/markdown" }

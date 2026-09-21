@@ -86,7 +86,7 @@ model = "your-model-name"
 | `KOALA_API_KEY` | `llm.api_key` | 空 |
 | `KOALA_MODEL` | `llm.model` | 空，调用模型前需配置 |
 | `KOALA_LANG` | 顶层 `lang`（`en` / `zh`） | `en` |
-| `KOALA_THEME` | 顶层 `theme`（`auto` / `light` / `dark`） | `auto` |
+| `KOALA_THEME` | 顶层 `theme`（`auto` / `light` / `dark` / `catppuccin` / `nord` / `dracula` / `catppuccin-latte` / `solarized-light` / `github-light`） | `auto` |
 
 会话转录目录由 `agent.session_dir` 单独控制，
 默认仍为 `.koala/session`；相对路径均相对于启动时的工作目录。
@@ -165,6 +165,10 @@ koala memory forget reply-language --scope global
 无需重启。`light` 使用固定浅色配色，`dark` 使用固定深色配色。
 
 输入 `/theme auto`、`/theme light` 或 `/theme dark` 立即切换，执行任务期间也可使用。
+另内置 [Catppuccin Mocha](https://catppuccin.com/palette/)、[Nord](https://www.nordtheme.com/docs/colors-and-palettes) 和 [Dracula](https://draculatheme.com/spec) 配色：
+使用 `/theme catppuccin`、`/theme nord`、`/theme dracula` 切换。
+浅色预设包括 [Catppuccin Latte](https://catppuccin.com/palette/)、[Solarized Light](https://ethanschoonover.com/solarized/) 和基于 [GitHub Primer](https://github.com/primer/primitives) 的 GitHub Light：
+使用 `/theme catppuccin-latte`、`/theme solarized-light`、`/theme github-light` 切换。
 单独输入 `/theme` 弹出主题选择窗，默认选中当前主题；方向键选择、Enter 确认并保存、Esc 取消。选择保存到当前目录的 `.koala/theme.toml`，重启后保留。
 也可在 `config.toml` 顶层设置 `theme = "auto"`，或使用环境变量 `KOALA_THEME`。
 优先级：`KOALA_THEME` > 已保存的主题 > `config.toml` > `auto`。
@@ -308,8 +312,28 @@ context_window = 128000
 
 ## 快捷键与输入
 
-Enter 发送，Shift+Enter、Ctrl+J 或 `\` 后接 Enter 换行。启用终端的 bracketed paste，
-整段粘贴只插入草稿，不会自动发送。执行中按 Enter 会保留草稿并显示提示，不会丢弃输入。
+Enter 在空闲时发送、执行中加入队列；Cmd+Enter 中断当前任务并立即执行新输入。Shift+Enter、Ctrl+J 或 `\` 后接 Enter 换行。启用终端的 bracketed paste，
+整段粘贴只插入草稿，不会自动发送。排队后输入框清空，输入框上方显示待执行消息；当前任务结束后按提交顺序逐条执行。
+Cmd+Enter 不清空原队列，新任务结束后继续队列。Ctrl+C / Esc 单独中断时暂停队列，
+待执行消息仍可取回编辑；发送下一条消息后恢复接续。新建或切换会话会清空队列。
+Cmd+Enter 需要终端支持 Kitty 键盘协议并将 Command 修饰键传给程序；若被终端快捷键拦截，需调整终端映射。
+
+`Ctrl+V` 从系统剪贴板粘贴图片（无图片时粘贴文本）。图片会在输入框光标处显示为 `[image 1]`、`[image 2]` 等可编辑标记；
+可连续粘贴多张，再按 Enter 一起发送，也可以不输入文字直接发送图片。
+删除图片标记即移除对应附件；在标记处按 Backspace/Delete 可整块删除，撤销编辑可恢复图片。
+编号在当前草稿内保持稳定，发送时只携带仍有标记的图片。空闲时 `Ctrl+C` 清空文字及附件。
+每条消息最多 4 张图片；每张最多 16 Mi 像素，编码为 PNG 后不超过 5 MiB。编码在后台进行，完成前不会发送草稿。
+
+图片随会话保存在本地，恢复会话、会话树重试、后续工具调用和 `/btw` 均支持图片上下文；
+临时对话中新粘贴的图片不写入主会话。上下文压缩保留原图及其原始问题，图片占用按尺寸估算，
+不会把 Base64 长度当成文本预算；仍可能因累计图片过多达到上下文预算。
+输入历史只记录文字，重新编辑带图问题请使用会话树重试。
+
+需要支持图片输入的模型和 OpenAI 兼容 Chat Completions 接口（`image_url` 数据块）。
+模型或服务拒绝图片时会显示错误，不会静默改成纯文本发送。
+剪贴板读取发生在运行 Koala 的电脑上；SSH/headless 环境未提供剪贴板时会提示失败。
+若终端拦截了 Ctrl+V，需要将该快捷键传给程序。普通 bracketed paste 仍只处理文字。
+
 
 - `Esc`：中断当前响应、工具或压缩操作；权限确认区打开时，拒绝本次操作。
 - `Ctrl+C`：执行中中断整轮；空闲时清空输入。
@@ -318,10 +342,12 @@ Enter 发送，Shift+Enter、Ctrl+J 或 `\` 后接 Enter 换行。启用终端�
 - `Ctrl+End`：回到底部并恢复跟随。
 - `/`：显示带说明的命令菜单，继续输入可筛选；上下键选择、Tab 补全、Enter 执行、Esc 收起。
   未知命令会显示提示并保留输入。
-- `↑` / `↓`：多行输入中先移动光标，到首行或末行后召回历史；向下越过最新历史会恢复原草稿。
+- `↑`：只有输入框为空（无文字、附件或待完成粘贴）时，取回并移除队尾消息供编辑；队列为空则填入最近的历史提示词。已有内容时只移动光标。`↓` 保留历史导航的返回功能；更早的历史可通过 Ctrl+R 搜索。
 - `Ctrl+R`：搜索当前工作目录的输入历史，输入关键词筛选，上下键或 Ctrl+R 选择，
   Enter / Tab 只回填输入框，Esc 取消并保留原草稿。
-- `Shift+Tab`：空闲时切换 Normal / Plan，保留草稿；执行中提示先中断，模式不会悄悄改变。
+- `Shift+Tab`：轮换 Normal → Ask When Need → Auto Edit → Never Ask → Normal 权限模式，保留草稿；执行中也可切换。Plan 模式使用 `/plan`。
+- `@`：在输入框中引用文件，按当前目录逐级补全；方向键选择、Tab/Enter 插入，Esc 收起。支持中文和空格路径（自动加引号），目录以 `/` 结尾，继续输入可浏览子目录。只插入路径，agent 按需读取；不自动上传整个文件。
+- 执行状态旁显示 3×3 方块旋转动画，右侧以低对比度显示本轮耗时；结束后保留耗时至下一轮开始。
 - `Ctrl+T`：打开或关闭完整 Todo 列表，优先展示进行中的项目；↑↓ / PageUp / PageDown 滚动，Esc 返回。`Ctrl+O` 用于详细记录和工具调用展开。
 - 空输入时 `?` 或 `/help`：打开帮助，支持滚动，Esc 返回。
 - `Ctrl+O`：切换详细记录，展开工具完整参数与返回内容。详情中用上下键、PageUp / PageDown
@@ -360,8 +386,10 @@ Enter 发送，Shift+Enter、Ctrl+J 或 `\` 后接 Enter 换行。启用终端�
 表格在窄窗口中改为带字段名的逐项展示；中文和 emoji 按显示宽度换行。
 
 工具调用使用独立标记区分进行中、成功、失败与中断，并显示耗时和参数摘要。
-默认显示最多三行输出，`Ctrl+O` 可查看完整工具返回和参数。前台 shell 输出会完整传给
-界面，模型上下文仍接收最多约 8,000 字节的摘录；后台完成通知使用摘要，完整结果可在 `/tasks` 中查看。
+默认显示最多三行输出，`Ctrl+O` 可查看工具返回和参数。shell 的 stdout、stderr 各保留前 1 MiB，
+超出时标注截断，并继续读取丢弃后续输出，避免管道堵塞；需要完整日志时请在命令中重定向至文件。
+保留的输出传给界面，模型上下文接收最多约 8,000 字节的摘录；后台完成通知使用摘要，
+保留的结果可在 `/tasks` 中查看。shell 默认超时为前台 30 秒、后台 3600 秒，显式 `timeout` 对两者均生效。
 
 ## Agent 架构
 
@@ -383,7 +411,7 @@ Enter 发送，Shift+Enter、Ctrl+J 或 `\` 后接 Enter 换行。启用终端�
 | 异常与重试 | LLM 建连失败（429/5xx/网络）指数退避重试 5 次；工具错误作为结果回喂不中断循环 |
 | 后台任务 | `bash` / `task` 加 `background=true`，`/tasks` 查看状态，完成自动通知 |
 
-`agent.compact_threshold` 是序列化请求的字节预算（默认 40,000），计入系统提示词、工具定义、
+`agent.compact_threshold` 是请求预算（默认 40,000）；文字按序列化字节计，图片按尺寸估算等效占用，计入系统提示词、工具定义、
 扩展/后台上下文，并预留 4,096 字节给回复；它不是模型精确的 token 容量。
 自动压缩首先保留最近 4 条消息，仍超限时尝试保留最后一个完整消息组；工具调用与结果始终一起保留。
 压缩后重新生成动态上下文并检查预算。输入或固定上下文过大、摘要仍过大时明确报错，不发送超预算的请求。
@@ -531,7 +559,7 @@ parameters = { type = "object", properties = { query = { type = "string" } }, re
 
 每次调用启动独立进程，工作目录为 manifest 所在目录；跨调用状态须自行持久化。
 `command` 为 argv，不经过 shell 展开。通用环境变量 `KOALA_EXTENSION_CWD` 提供 Agent 启动目录。stdin 接收一个 JSON 对象，stdout 必须返回一个
-JSON 对象（无修改时 `{}`）；日志写 stderr。协议版本当前为 1。
+JSON 对象（无修改时 `{}`）；日志写 stderr。基础协议版本为 1；UI 扩展使用下述 v2 协议。
 
 - Hook 请求：`{"api_version":1,"kind":"hook","stage":"pre_tool_use","payload":{"tool":"bash","arguments":{"command":"pwd"},"depth":0,"plan_mode":false}}`。
 - 工具请求：`{"api_version":1,"kind":"tool","name":"lookup_example","arguments":{"query":"rust"}}`。
@@ -560,6 +588,98 @@ post_tool_use / turn_end 失败只显示诊断，不抹掉已完成的结果。�
 不提供主会话转录路径。不要在子 Agent 的 turn_end 中假设 session_path 一定存在。
 
 Rust 扩展也可实现 `extensions::Extension` 并通过 `Extensions::register` 接入同一协议。
+
+### UI 与交互扩展（v2）
+
+v1 扩展无需修改。需要 UI 的扩展在 manifest 中使用 `api_version = 2` 和 `ui = true`。
+宿主继续按次启动进程；每个请求通过 stdin 传入一个 JSON，stdout 返回一个 JSON。
+
+```toml
+api_version = 2
+name = "interactive-example"
+ui = true
+command = ["python3", "main.py"]
+```
+
+安装仓库内的交互示例（需要 Python 3，无第三方 Python 依赖）：
+
+```bash
+koala extension-install examples/extensions/interactive
+```
+
+将安装命令输出的绝对路径追加到 `~/.koala/config.toml` 的 `[extensions].manifests`，
+重启后输入 `/extensions`。示例展示文档选择、输入提交、按钮、确认/取消弹窗和状态更新。
+
+v2 请求增加 `session_id` 与 `capabilities: {"ui": true|false}`。
+主 TUI 会话启动、切换或恢复后向声明 UI 的扩展发送 `kind: "ui_event"`、
+`event.type: "mount"`；普通 hook 与工具响应也可以附带 `ui` 数组。
+子 Agent、临时 `/btw` 对话及没有启用 UI 的调用不会 mount；扩展应检查能力并返回普通文本结果。
+
+```json
+{
+  "ui": [{
+    "type": "set_widget",
+    "id": "search",
+    "placement": "above_editor",
+    "blocks": [
+      {"type": "text", "text": "搜索文档"},
+      {"type": "input", "id": "query", "label": "关键词", "value": ""},
+      {"type": "button", "id": "refresh", "label": "刷新"}
+    ]
+  }]
+}
+```
+
+| UI 指令 | 字段 |
+| --- | --- |
+| `notify` | `level`: info/warning/error；`text` |
+| `set_status` / `remove_status` | `id`；设置时附 `text` |
+| `set_widget` / `remove_widget` | `id`；设置时附 `placement`: above_editor/below_editor 和 `blocks` |
+| `open_dialog` / `close_dialog` | `id`；打开时附 `dialog` |
+
+block 支持 `text`、`markdown`（均使用 `text` 字段）、`button`（`id`、`label`）、
+`input`（`id`、`label`、可选 `value`）、`select`（`id`、`label`、`options: [{"id":"a","label":"A"}]`）。
+`dialog` 可以是 `{"kind":"confirm","title":"确认","text":"是否继续？"}`，
+也可以是 `{"kind":"form","title":"选择","blocks":[...]}`。form 内每个控件独立提交，不是多字段一次提交的表单。
+组件以扩展名称隔离，同 ID 设置会整体替换组件。状态项在独立状态行显示，长组件可在 `/extensions` 面板内滚动。
+
+用户操作会再次调用同一进程：
+
+```json
+{
+  "api_version": 2,
+  "kind": "ui_event",
+  "session_id": "session-id",
+  "capabilities": {"ui": true},
+  "event": {
+    "type": "submit",
+    "event_id": "host-generated-id",
+    "surface": "widget",
+    "surface_id": "search",
+    "revision": 42,
+    "control_id": "query",
+    "value": "Rust"
+  }
+}
+```
+
+事件 `click` 的 value 为 null，`select` 为选项 ID，`submit` 为输入字符串，
+`confirm` 为布尔值，`cancel` 为 null。确认与取消事件没有 `control_id`；mount 没有 surface 字段。
+`ui_event` 响应只允许 UI 更新；普通工具响应仍必须包含 `content`。
+UI 内容不自动加入模型上下文，也不会自动触发新的模型请求。
+
+操作方式：`/extensions` 选择组件；Tab/Shift+Tab 切换控件；方向键选择；Enter 提交；
+PageUp/PageDown 滚动；Esc 离开组件或取消弹窗。确认弹窗默认取消。权限提示优先接收输入。
+Ctrl+C 会取消 UI 回调；切换会话或退出会清理组件和回调，旧事件不能操作新会话。
+
+交互回调独立于模型轮次：弹窗不会暂停模型。需要确认后执行的扩展动作应放在 confirm 回调中。
+每扩展一次执行一个 UI 回调，最多排队 16 个；回调可能与该扩展的普通 hook 并发，
+持久化状态的扩展需自行协调访问。调用超时沿用 `timeout_secs`，不自动重试有副作用的回调。
+
+单批最多 64 条 UI 指令、256 KiB；每扩展最多 32 个 widget、16 个状态项、8 个弹窗；
+每组件最多 64 blocks，单选 1–256 项；ID 最长 128 字节，单文本和输入值最长 16 KiB。
+非法 UI 批次整体拒绝。宿主清理终端控制字符，并为组件分配版本号来拒绝过期、重复或无效操作。
+
 
 ## 开发
 

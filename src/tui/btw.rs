@@ -12,17 +12,27 @@ impl Drop for Conversation {
     }
 }
 
-pub(super) async fn next_event(side: &mut Option<Conversation>) -> Option<UiEvent> {
-    if let Some(side) = side
-        && let Some(events) = &mut side.events
-    {
-        let event = events.recv().await;
-        if event.is_none() {
-            side.events = None;
+pub(super) enum SideEvent {
+    Agent(UiEvent),
+    Clipboard(Result<clipboard::Paste, String>),
+}
+
+pub(super) async fn next_event(side: &mut Option<Conversation>) -> Option<SideEvent> {
+    let Some(side) = side else {
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        event = async {
+            match &mut side.events {
+                Some(events) => events.recv().await,
+                None => std::future::pending().await,
+            }
+        } => {
+            if event.is_none() { side.events = None; }
+            event.map(SideEvent::Agent)
         }
-        return event;
+        result = clipboard::next(&mut side.app.clipboard_pending) => Some(SideEvent::Clipboard(result))
     }
-    std::future::pending().await
 }
 
 pub(super) fn open(app: &mut App, question: &str) {
@@ -59,9 +69,7 @@ pub(super) fn submit(app: &mut App, text: String) {
     // Temporary input never enters the persistent input history, including /btw args.
     app.input = new_input(app.lang);
     app.transcript.scroll(Scroll::End);
-    app.push(EntryKind::User(text.clone()));
-    app.start(i18n::text(app.lang, Key::StatusGenerating));
-    app.session.send(SessionCommand::Submit(text));
+    send_draft(app, text);
 }
 
 #[cfg(test)]

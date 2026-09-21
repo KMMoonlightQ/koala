@@ -56,7 +56,7 @@ fn rows(graph: &Graph, view: &View) -> Vec<(String, usize)> {
         }
         let node = graph.get(&id).unwrap();
         if view.query.is_empty()
-            || format!("{} {}", node.label, node.data)
+            || format!("{} {}", node.label, display_value(&node.data))
                 .to_lowercase()
                 .contains(&view.query.to_lowercase())
         {
@@ -296,7 +296,7 @@ pub(super) fn draw(f: &mut Frame, graph: &Graph, view: &mut View, area: Rect, la
         let Some(node) = view.selected.as_deref().and_then(|id| graph.get(id)) else {
             return;
         };
-        let content = serde_json::to_string_pretty(node).unwrap_or_default();
+        let content = serde_json::to_string_pretty(&display_value(node)).unwrap_or_default();
         let lines = transcript::literal(&text::clean(&content), area.width as usize, theme::text());
         view.scroll = view
             .scroll
@@ -481,6 +481,31 @@ pub(super) fn draw(f: &mut Frame, graph: &Graph, view: &mut View, area: Rect, la
     f.render_widget(Paragraph::new(Text::from(lines)), body);
 }
 
+/// Attachment bytes are kept on disk and in model requests, not rendered as
+/// megabytes of Base64 in the conversation tree or included in its text search.
+fn display_value(value: &impl serde::Serialize) -> serde_json::Value {
+    fn hide(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    if key == "data_url"
+                        && value.as_str().is_some_and(|s| s.starts_with("data:image/"))
+                    {
+                        *value = serde_json::Value::String("[image data]".into());
+                    } else {
+                        hide(value);
+                    }
+                }
+            }
+            serde_json::Value::Array(values) => values.iter_mut().for_each(hide),
+            _ => {}
+        }
+    }
+    let mut value = serde_json::to_value(value).unwrap_or_default();
+    hide(&mut value);
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,6 +561,34 @@ mod tests {
         assert!(!handle_key(&mut view, &graph, key(KeyCode::Esc)));
         assert!(!view.detail);
         assert!(handle_key(&mut view, &graph, key(KeyCode::Esc)));
+    }
+
+    #[test]
+    fn image_payloads_do_not_fill_graph_details_or_search_results() {
+        let mut graph = fixture();
+        let mut turn = graph.get("turn").unwrap().clone();
+        turn.data = json!({"images":[{"width":1,"height":1,"data_url":"data:image/png;base64,SECRETPIXELS"}]});
+        graph.apply(turn);
+        let mut view = View {
+            selected: Some("turn".into()),
+            detail: true,
+            initialized: true,
+            ..Default::default()
+        };
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal
+            .draw(|f| draw(f, &graph, &mut view, f.area(), Lang::En))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(!rendered.contains("SECRETPIXELS"));
+        assert!(rendered.contains("width"));
     }
 
     #[test]

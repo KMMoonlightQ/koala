@@ -1,5 +1,6 @@
 //! Generic extension host. No Agent or knowledge-base dependencies.
 pub use koala_extension_api::*;
+pub mod ui;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
@@ -32,9 +33,17 @@ impl Extensions {
                 return Err(format!("duplicate or empty tool: {}", tool.function.name));
             }
         }
-        self.entries.push(extension);
+        self.entries.push(Arc::new(ui::Hosted(extension)));
         Ok(())
     }
+    pub fn ui_extensions(&self) -> Vec<Arc<dyn Extension>> {
+        self.entries
+            .iter()
+            .filter(|e| e.ui_enabled())
+            .cloned()
+            .collect()
+    }
+
     pub fn tool_entries(&self) -> Vec<(Tool, Arc<dyn Extension>)> {
         self.entries
             .iter()
@@ -58,9 +67,6 @@ impl Extensions {
                 .hook(stage, &payload)
                 .await
                 .map_err(|err| format!("{}: {err}", e.name()))?;
-            if let Some(reason) = r.block {
-                return Err(format!("{} blocked: {reason}", e.name()));
-            }
             if let Some(context) = r.context {
                 combined
                     .context
@@ -68,22 +74,10 @@ impl Extensions {
                     .push_str(&format!("\n[extension {}]\n{context}\n", e.name()));
             }
             if let Some(args) = r.arguments {
-                if stage != Stage::PreToolUse || !args.is_object() {
-                    return Err(format!(
-                        "{}: arguments only allowed as object in pre_tool_use",
-                        e.name()
-                    ));
-                }
                 payload["arguments"] = args.clone();
                 combined.arguments = Some(args);
             }
             if let Some(content) = r.content {
-                if stage != Stage::PostToolUse {
-                    return Err(format!(
-                        "{}: content only allowed in post_tool_use",
-                        e.name()
-                    ));
-                }
                 payload["content"] = json!(content);
                 payload["is_error"] = json!(r.is_error);
                 combined.content = Some(content);
@@ -98,6 +92,8 @@ impl Extensions {
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub api_version: u32,
+    #[serde(default)]
+    pub ui: bool,
     pub name: String,
     pub command: Vec<String>,
     #[serde(default)]
@@ -120,7 +116,13 @@ struct ProcessExtension {
     timeout_secs: u64,
 }
 impl ProcessExtension {
-    async fn request(&self, request: Value) -> Result<Response, String> {
+    async fn request(&self, mut request: Value) -> Result<Response, String> {
+        request["api_version"] = json!(self.manifest.api_version);
+        if self.manifest.api_version == 2 {
+            let ctx = ui::current_context();
+            request["session_id"] = json!(ctx.session_id);
+            request["capabilities"] = json!({"ui": ctx.ui && self.manifest.ui});
+        }
         let mut command = tokio::process::Command::new(&self.manifest.command[0]);
         command
             .args(&self.manifest.command[1..])
@@ -163,6 +165,15 @@ impl ProcessExtension {
 impl Extension for ProcessExtension {
     fn name(&self) -> &str {
         &self.manifest.name
+    }
+    fn ui_enabled(&self) -> bool {
+        self.manifest.api_version == 2 && self.manifest.ui
+    }
+    fn ui_event<'a>(&'a self, event: &'a UiInputEvent) -> ExtensionFuture<'a> {
+        Box::pin(async move {
+            self.request(json!({"kind": "ui_event", "event": event}))
+                .await
+        })
     }
     fn tools(&self) -> Vec<Tool> {
         self.manifest
@@ -208,7 +219,8 @@ pub fn load(
         let manifest: Manifest =
             toml::from_str(&std::fs::read_to_string(&path).map_err(|e| e.to_string())?)
                 .map_err(|e| e.to_string())?;
-        if manifest.api_version != 1
+        if !matches!(manifest.api_version, 1 | 2)
+            || (manifest.ui && manifest.api_version != 2)
             || manifest.name.is_empty()
             || manifest.command.is_empty()
             || manifest.command[0].is_empty()
@@ -290,6 +302,7 @@ mod tests {
     async fn process_protocol_and_ordered_argument_rewrite() {
         let first = ProcessExtension {
             manifest: Manifest {
+                ui: false,
                 api_version: 1,
                 name: "first".into(),
                 command: vec![
@@ -306,6 +319,7 @@ mod tests {
         };
         let second = ProcessExtension {
             manifest: Manifest {
+                ui: false,
                 api_version: 1,
                 name: "second".into(),
                 command: vec![
@@ -351,6 +365,7 @@ mod tests {
         ] {
             let extension = ProcessExtension {
                 manifest: Manifest {
+                    ui: false,
                     api_version: 1,
                     name: "test".into(),
                     command: vec!["bash".into(), "-c".into(), command.into()],
@@ -385,6 +400,7 @@ mod tests {
         let mut extensions = Extensions::new(["bash".to_string()]);
         let conflict = ProcessExtension {
             manifest: Manifest {
+                ui: false,
                 api_version: 1,
                 name: "conflict".into(),
                 command: vec!["true".into()],

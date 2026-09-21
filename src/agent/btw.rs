@@ -20,12 +20,22 @@ pub(super) async fn run(
     ));
     while let Some(command) = commands.recv().await {
         let input = match command {
-            SessionCommand::Submit(text) if !text.trim().is_empty() => text,
+            SessionCommand::Submit(text) if !text.trim().is_empty() => Message::user(text),
+            SessionCommand::SubmitWithImages { text, images }
+                if !text.trim().is_empty() || !images.is_empty() =>
+            {
+                if let Err(error) = crate::images::validate(&images) {
+                    let _ = events.send(UiEvent::Error(error));
+                    let _ = events.send(UiEvent::Done);
+                    continue;
+                }
+                Message::user_with_images(text, images)
+            }
             SessionCommand::Shutdown => break,
             _ => continue,
         };
         let mut request = history.clone();
-        request.push(Message::user(&input));
+        request.push(input.clone());
         let response = reply(&shared, &request, &events);
         tokio::pin!(response);
         loop {
@@ -45,7 +55,7 @@ pub(super) async fn run(
                 result = &mut response => {
                     match result {
                         Ok(answer) => {
-                            history.push(Message::user(input));
+                            history.push(input);
                             history.push(answer);
                         }
                         Err(error) => { let _ = events.send(UiEvent::Error(error.to_string())); }
@@ -63,10 +73,7 @@ async fn reply(
     messages: &[Message],
     events: &EventSender,
 ) -> Result<Message, AgentError> {
-    let used = serde_json::to_vec(messages)
-        .expect("serializable messages")
-        .len()
-        .saturating_add(4096);
+    let used = crate::llm::context_size(messages).saturating_add(4096);
     if used > shared.compact_threshold {
         return Err(AgentError::ContextBudget {
             used,

@@ -27,6 +27,8 @@ pub struct Message {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageAttachment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -37,7 +39,102 @@ pub struct Message {
     pub name: Option<String>,
 }
 
+/// Persisted with the conversation, independently of the clipboard lifetime.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageAttachment {
+    pub data_url: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Convert internal attachments only at the provider boundary. Legacy text
+/// messages keep their original wire shape and journals keep image metadata.
+fn serialize_messages<S: serde::Serializer>(
+    messages: &[Message],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeSeq;
+    let mut seq = serializer.serialize_seq(Some(messages.len()))?;
+    for message in messages {
+        let mut value = serde_json::to_value(message).map_err(serde::ser::Error::custom)?;
+        if !message.images.is_empty() {
+            value.as_object_mut().unwrap().remove("images");
+            let mut parts = Vec::new();
+            if let Some(text) = &message.content
+                && !text.is_empty()
+            {
+                parts.push(serde_json::json!({"type":"text", "text":text}));
+            }
+            parts.extend(message.images.iter().map(|image| {
+                serde_json::json!({
+                    "type":"image_url", "image_url":{"url":image.data_url}
+                })
+            }));
+            value["content"] = serde_json::Value::Array(parts);
+        }
+        seq.serialize_element(&value)?;
+    }
+    seq.end()
+}
+
+/// Text retains the existing serialized-byte budget. Images use a conservative
+/// dimension-based allowance, not their Base64 transport size. Providers' actual
+/// image token accounting varies; usage returned by the provider is authoritative.
+pub fn context_size(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(|message| {
+            let text = Message {
+                images: Vec::new(),
+                role: message.role.clone(),
+                content: message.content.clone(),
+                reasoning_content: message.reasoning_content.clone(),
+                tool_calls: message.tool_calls.clone(),
+                tool_call_id: message.tool_call_id.clone(),
+                name: message.name.clone(),
+            };
+            let bytes = serde_json::to_vec(&text)
+                .expect("serializable message")
+                .len();
+            message.images.iter().fold(bytes + 1, |size, image| {
+                // Estimate a vision input scaled to a 2048px long edge. The
+                // original pixels are sent unchanged; this is only a heuristic.
+                let long_edge = u64::from(image.width.max(image.height)).max(2048);
+                let width = (u64::from(image.width) * 2048).div_ceil(long_edge);
+                let height = (u64::from(image.height) * 2048).div_ceil(long_edge);
+                let tiles = width.div_ceil(512) * height.div_ceil(512);
+                size.saturating_add(
+                    (1024 + tiles.saturating_mul(1024)).min(usize::MAX as u64) as usize
+                )
+            })
+        })
+        .fold(1usize, usize::saturating_add)
+}
+
 impl Message {
+    pub fn user_with_images(content: impl Into<String>, images: Vec<ImageAttachment>) -> Self {
+        Self {
+            images,
+            ..Self::user(content)
+        }
+    }
+
+    pub fn display_content(&self) -> String {
+        let mut text = self.content.clone().unwrap_or_default();
+        for (index, image) in self.images.iter().enumerate() {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str(&format!(
+                "[Image {} · {}×{}]",
+                index + 1,
+                image.width,
+                image.height
+            ));
+        }
+        text
+    }
+
     pub fn system(content: impl Into<String>) -> Self {
         Self {
             role: "system".into(),
@@ -345,6 +442,7 @@ struct ChatRequest<'a> {
     model: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
+    #[serde(serialize_with = "serialize_messages")]
     messages: &'a [Message],
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [Tool]>,
@@ -461,7 +559,14 @@ impl LlmClient {
         let resp = req.json(&request).send().await?;
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let mut body = resp.text().await.unwrap_or_default();
+            if matches!(status.as_u16(), 400 | 415 | 422)
+                && messages.iter().any(|m| !m.images.is_empty())
+            {
+                body = format!(
+                    "Image request rejected; select a vision-capable model or check the provider's image limits. Provider error: {body}"
+                );
+            }
             return Err(LlmError::Api {
                 status: status.as_u16(),
                 body,
@@ -753,5 +858,74 @@ mod tests {
         assert_eq!(json["stream"], false);
         assert!(json.get("stream_options").is_none());
         assert!(json.get("reasoning_effort").is_none());
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn image_budget_accepts_a_4k_screenshot_without_counting_full_resolution_tiles() {
+        let message = Message::user_with_images(
+            "describe",
+            vec![ImageAttachment {
+                data_url: "data:image/png;base64,AQID".into(),
+                width: 3840,
+                height: 2160,
+            }],
+        );
+        assert!(context_size(&[message]) + 4096 < 40_000);
+    }
+
+    #[test]
+    fn image_context_estimate_ignores_base64_transport_length() {
+        let plain = [Message::user("hello")];
+        assert_eq!(
+            context_size(&plain),
+            serde_json::to_vec(&plain).unwrap().len()
+        );
+        let mut message = Message::user_with_images(
+            "look",
+            vec![ImageAttachment {
+                data_url: "data:image/png;base64,AQID".into(),
+                width: 1920,
+                height: 1080,
+            }],
+        );
+        let before = context_size(&[message.clone()]);
+        message.images[0].data_url.push_str(&"A".repeat(1_000_000));
+        assert_eq!(context_size(&[message]), before);
+        assert!(before < 40_000);
+    }
+
+    #[test]
+    fn image_request_sends_content_parts_and_preserves_text_requests() {
+        let image_message: Message = serde_json::from_value(serde_json::json!({
+            "role": "user", "content": "Describe this",
+            "images": [{"data_url": "data:image/png;base64,AQID", "width": 2, "height": 3}]
+        }))
+        .unwrap();
+        let messages = [Message::user("hello"), image_message];
+        let request = ChatRequest {
+            model: "vision",
+            reasoning_effort: None,
+            messages: &messages,
+            tools: None,
+            stream: true,
+            stream_options: None,
+        };
+        let json = serde_json::to_value(request).unwrap();
+        assert_eq!(json["messages"][0]["content"], "hello");
+        assert_eq!(
+            json["messages"][1]["content"],
+            serde_json::json!([
+                {"type":"text", "text":"Describe this"},
+                {"type":"image_url", "image_url":{"url":"data:image/png;base64,AQID"}}
+            ])
+        );
+        assert!(json["messages"][1].get("images").is_none());
+        let saved = serde_json::to_value(&messages[1]).unwrap();
+        assert_eq!(saved["images"][0]["width"], 2);
     }
 }

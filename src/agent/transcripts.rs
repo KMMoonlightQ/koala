@@ -11,6 +11,8 @@ pub struct Record {
     pub ts: String,
     pub role: String,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<crate::llm::ImageAttachment>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,13 +63,33 @@ impl TranscriptStore {
     /// Encode the whole turn before touching disk. A normal write failure rolls
     /// back to the original length; this is not a crash-durability guarantee.
     pub fn append_turn(&self, input: &str, reply: &str) -> Result<(), super::AgentError> {
-        self.append_turn_with(input, reply, |file, bytes| file.write_all(bytes))
+        self.append_turn_with_images(input, &[], reply)
+    }
+
+    pub fn append_turn_with_images(
+        &self,
+        input: &str,
+        images: &[crate::llm::ImageAttachment],
+        reply: &str,
+    ) -> Result<(), super::AgentError> {
+        self.append_images_with(input, images, reply, |file, bytes| file.write_all(bytes))
     }
 
     // Internal I/O seam for exercising partial-write failures against real files.
+    #[cfg(test)]
     fn append_turn_with(
         &self,
         input: &str,
+        reply: &str,
+        write: impl FnOnce(&mut fs::File, &[u8]) -> std::io::Result<()>,
+    ) -> Result<(), super::AgentError> {
+        self.append_images_with(input, &[], reply, write)
+    }
+
+    fn append_images_with(
+        &self,
+        input: &str,
+        images: &[crate::llm::ImageAttachment],
         reply: &str,
         write: impl FnOnce(&mut fs::File, &[u8]) -> std::io::Result<()>,
     ) -> Result<(), super::AgentError> {
@@ -83,6 +105,11 @@ impl TranscriptStore {
                         ts: ts.clone(),
                         role: role.into(),
                         content: content.into(),
+                        images: if role == "user" {
+                            images.to_vec()
+                        } else {
+                            Vec::new()
+                        },
                     },
                 )?;
                 bytes.push(b'\n');
@@ -159,6 +186,7 @@ pub fn read(directory: &Path, id: &str, lang: Lang) -> Result<Vec<Record>, Strin
                             ts: String::new(),
                             role: role.into(),
                             content,
+                            images: Vec::new(),
                         })
                     })
                     .collect());
@@ -253,6 +281,7 @@ pub fn list(directory: &Path, current: &str, lang: Lang) -> Result<Vec<SessionVi
                             ts: String::new(),
                             role: "user".into(),
                             content,
+                            images: Vec::new(),
                         })
                     } else {
                         None

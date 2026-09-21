@@ -6,8 +6,13 @@ use tokio::sync::oneshot;
 /// This is the entire input surface of the agent core: frontends never touch
 /// `Agent` directly.
 pub enum SessionCommand {
+    ExtensionUi(super::extension_ui::UiAction),
     /// Run one agent turn with the given user input.
     Submit(String),
+    SubmitWithImages {
+        text: String,
+        images: Vec<crate::llm::ImageAttachment>,
+    },
     /// Open an ephemeral conversation on independent command/event channels.
     OpenBtw {
         commands: tokio::sync::mpsc::UnboundedReceiver<SessionCommand>,
@@ -113,6 +118,7 @@ impl From<&TodoItem> for TodoView {
 
 /// Everything the agent core can tell a frontend during a session.
 pub enum UiEvent {
+    ExtensionUi(super::extension_ui::Snapshot),
     /// Latest foreground request input + output tokens; None means unavailable.
     ContextUsage(Option<u64>),
     /// Input/output breakdown for the latest foreground request.
@@ -134,6 +140,7 @@ pub enum UiEvent {
     },
     Graph(super::graph::Graph),
     Draft(String),
+    DraftImages(Vec<crate::llm::ImageAttachment>),
     WorkRestored(Vec<super::work::Trace>),
     SessionRestoreFailed(String),
     PlanMode(bool),
@@ -171,6 +178,7 @@ pub enum UiEvent {
 impl std::fmt::Debug for UiEvent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            UiEvent::ExtensionUi(_) => write!(f, "ExtensionUi"),
             UiEvent::ContextUsage(tokens) => write!(f, "ContextUsage({tokens:?})"),
             UiEvent::TokenUsage(usage) => write!(f, "TokenUsage({usage:?})"),
             UiEvent::ModelSettings {
@@ -186,6 +194,7 @@ impl std::fmt::Debug for UiEvent {
             UiEvent::SessionRestoreFailed(error) => write!(f, "SessionRestoreFailed({error})"),
             UiEvent::Graph(graph) => write!(f, "Graph({} nodes)", graph.nodes.len()),
             UiEvent::WorkRestored(_) => write!(f, "WorkRestored"),
+            UiEvent::DraftImages(images) => write!(f, "DraftImages({})", images.len()),
             UiEvent::SessionReset => write!(f, "SessionReset"),
             UiEvent::PermissionMode(mode) => write!(f, "PermissionMode({mode:?})"),
             UiEvent::PlanMode(on) => write!(f, "PlanMode({on})"),

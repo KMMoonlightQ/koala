@@ -14,7 +14,14 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
         horizontal: u16::from(f.area().width > 4),
         vertical: 0,
     });
-    let input_height = (app.input.lines().len().clamp(1, 5) + 2) as u16;
+    let queue_height = if app.queue.pending.is_empty() || app.transcript.detailed() {
+        0
+    } else {
+        (app.queue.pending.len() + 1)
+            .min(4)
+            .min((area.height / 4) as usize) as u16
+    };
+    let input_height = queue_height + (app.input.lines().len().clamp(1, 5) + 2) as u16;
     let todos = panels::todos(app);
     let todo_height = if todos.is_empty() || app.transcript.detailed() {
         0
@@ -24,17 +31,51 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
             .min((area.height / 4).max(1) as usize) as u16
     };
     let menu_height = panels::menu_height(app);
+    let extension_budget = if app.transcript.detailed() {
+        0
+    } else {
+        area.height.saturating_sub(input_height + 3) / 3
+    };
+    let top_lines = app
+        .extension_ui
+        .inline_lines(
+            crate::extensions::Placement::AboveEditor,
+            area.width,
+            app.lang,
+        )
+        .len();
+    let bottom_lines = app
+        .extension_ui
+        .inline_lines(
+            crate::extensions::Placement::BelowEditor,
+            area.width,
+            app.lang,
+        )
+        .len();
+    let status_height =
+        u16::from(!app.extension_ui.snapshot.statuses.is_empty() && extension_budget > 0);
+    let budget = extension_budget.saturating_sub(status_height);
+    let top_height = (top_lines.min(u16::MAX as usize) as u16).min(if bottom_lines > 0 {
+        budget / 2
+    } else {
+        budget
+    });
+    let bottom_height =
+        (bottom_lines.min(u16::MAX as usize) as u16).min(budget.saturating_sub(top_height));
     let rows = Layout::vertical([
         Constraint::Length(u16::from(app.transcript.detailed())),
         Constraint::Min(1),
         Constraint::Length(todo_height),
         Constraint::Length(menu_height),
-        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Length(top_height),
         Constraint::Length(if app.transcript.detailed() {
             0
         } else {
             input_height
         }),
+        Constraint::Length(bottom_height),
+        Constraint::Length(status_height),
         Constraint::Length(1),
     ])
     .split(area);
@@ -48,10 +89,26 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
     panels::draw_todos(f, app, rows[2]);
     panels::draw_menu(f, app, rows[3]);
     draw_status(f, app, rows[4]);
+    app.extension_ui.draw_inline(
+        f,
+        rows[5],
+        crate::extensions::Placement::AboveEditor,
+        app.lang,
+    );
     if !app.transcript.detailed() {
-        draw_input(f, app, rows[5]);
+        let editor =
+            Layout::vertical([Constraint::Length(queue_height), Constraint::Min(1)]).split(rows[6]);
+        draw_queue(f, app, editor[0]);
+        draw_input(f, app, editor[1]);
     }
-    draw_statusbar(f, app, rows[6]);
+    app.extension_ui.draw_inline(
+        f,
+        rows[7],
+        crate::extensions::Placement::BelowEditor,
+        app.lang,
+    );
+    app.extension_ui.draw_status(f, rows[8]);
+    draw_statusbar(f, app, rows[9]);
     // Modal overlays float over the transcript, dsh-TUI hosted-dialog style;
     // the composer and status bar stay visible underneath.
     if let Some((title, hint)) = panels::dialog_chrome(app) {
@@ -78,6 +135,9 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
         });
         panels::draw(f, app, content);
     }
+    if app.panel.is_none() && app.permission.is_none() {
+        app.extension_ui.draw_overlay(f, rows[1], app.lang);
+    }
     draw_permission(f, app, rows[1]);
     theme::apply(f.buffer_mut(), app.theme);
 }
@@ -93,7 +153,7 @@ fn clear_modal_band(f: &mut Frame, region: Rect, dialog: Rect) {
 
 /// Center a dialog of at most `max_w` x `max_h` inside `area`, clamped so
 /// tiny terminals never produce out-of-bounds or inverted rects.
-fn centered(area: Rect, max_w: u16, max_h: u16) -> Rect {
+pub(super) fn centered(area: Rect, max_w: u16, max_h: u16) -> Rect {
     let width = max_w.min(area.width).max(1);
     let height = max_h.min(area.height).max(1);
     Rect {
@@ -123,10 +183,33 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         } else {
             i18n::text(app.lang, Key::ActionInterrupt)
         };
-        let mut line = logo::running(elapsed.as_millis(), app.permission.is_some());
+        let spinner = Rect::new(area.x, area.y, area.width.min(3), area.height);
+        f.render_widget(
+            Paragraph::new(logo::running(elapsed.as_millis(), app.permission.is_some())),
+            spinner,
+        );
+        let area = Rect::new(
+            area.x.saturating_add(4),
+            area.y,
+            area.width.saturating_sub(4),
+            area.height,
+        );
+        let timer = elapsed_label(elapsed);
+        let columns = Layout::horizontal([
+            Constraint::Min(0),
+            Constraint::Length(timer.len() as u16 + 1),
+        ])
+        .split(area);
+        f.render_widget(
+            Paragraph::new(timer)
+                .style(theme::muted())
+                .alignment(Alignment::Right),
+            columns[1],
+        );
+        let mut line = Line::default();
         line.spans.extend([
             Span::styled(
-                text::clean(&format!("{} · {}s", app.status, elapsed.as_secs())),
+                text::clean(&app.status),
                 if app.permission.is_some() {
                     theme::warning()
                 } else {
@@ -135,8 +218,52 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
             ),
             Span::styled(format!(" · {action}"), theme::key_hint()),
         ]);
-        f.render_widget(Paragraph::new(line), area);
+        f.render_widget(Paragraph::new(line), columns[0]);
+    } else if let Some(elapsed) = app.last_elapsed {
+        f.render_widget(
+            Paragraph::new(format!("  · {}", elapsed_label(elapsed))).style(theme::muted()),
+            area,
+        );
     }
+}
+
+fn elapsed_label(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h {:02}m {:02}s", secs / 3600, secs / 60 % 60, secs % 60)
+    }
+}
+
+fn draw_queue(f: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let mut lines = vec![Line::styled(
+        i18n::fill(
+            app.lang,
+            Key::QueueHeader,
+            &[("n", &app.queue.pending.len().to_string())],
+        ),
+        theme::accent(),
+    )];
+    let visible = area.height.saturating_sub(1) as usize;
+    // Show the newest entries, including the one ↑ will retrieve.
+    let skip = app.queue.pending.len().saturating_sub(visible);
+    for (index, draft) in app.queue.pending.iter().enumerate().skip(skip) {
+        let mut preview = text::clean(&draft.text).replace('\n', " ↵ ");
+        if !draft.images.is_empty() {
+            preview.push_str(&format!(" [Image ×{}]", draft.images.len()));
+        }
+        lines.push(Line::styled(
+            format!("  {}. {preview}", index + 1),
+            theme::muted(),
+        ));
+    }
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 fn draw_input(f: &mut Frame, app: &App, area: Rect) {
@@ -155,6 +282,8 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         .border_style(border_style);
     let block = if app.temporary {
         block.title(i18n::text(app.lang, Key::BtwTitle))
+    } else if app.busy {
+        block.title(i18n::text(app.lang, Key::QueueKeys))
     } else {
         block
     };

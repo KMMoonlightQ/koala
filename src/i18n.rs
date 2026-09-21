@@ -105,6 +105,10 @@ macro_rules! keys {
 
 keys!(
     InputPlaceholder,
+    ClipboardLoading,
+    ClipboardFailed,
+    ImageLimit,
+    ImageKeys,
     Current,
     NoOutput,
     HintSelectConfirmCancel,
@@ -117,6 +121,12 @@ keys!(
     CmdSessions,
     CmdNew,
     CmdBtw,
+    ExtTitle,
+    ExtKeys,
+    ExtEmpty,
+    ExtCancel,
+    ExtConfirm,
+    CmdExtensions,
     BtwTitle,
     BtwKeys,
     BtwIntro,
@@ -155,6 +165,8 @@ keys!(
     NoteHistoryLoadFailed,
     NoteHistorySaveFailed,
     NoteBusyDraftKept,
+    QueueHeader,
+    QueueKeys,
     NoteUnknownCommand,
     NoteNoModels,
     NoteNoReasoningEfforts,
@@ -275,6 +287,16 @@ pub fn text(lang: Lang, key: Key) -> &'static str {
     use Key::*;
     let (en, zh) = match key {
         InputPlaceholder => ("Type a message…", "输入消息…"),
+        ClipboardLoading => (
+            "Reading clipboard… wait before sending",
+            "正在读取剪贴板，请稍后发送",
+        ),
+        ClipboardFailed => ("Could not paste: {error}", "粘贴失败：{error}"),
+        ImageLimit => ("At most 4 images per message", "每条消息最多 4 张图片"),
+        ImageKeys => (
+            "Enter sends · delete an [image N] marker to remove its image",
+            "Enter 发送 · 删除 [image N] 标记即可移除图片",
+        ),
         Current => (" (current)", "（当前）"),
         NoOutput => ("(no output)", "（无输出）"),
         HintSelectConfirmCancel => (
@@ -307,6 +329,15 @@ pub fn text(lang: Lang, key: Key) -> &'static str {
             "List saved sessions; Enter resumes the conversation",
             "查看历史会话，Enter 恢复并继续对话",
         ),
+        ExtTitle => ("Extensions", "扩展组件"),
+        ExtKeys => (
+            "Tab focus · Enter submit · PgUp/PgDn scroll · Esc close",
+            "Tab 切换 · Enter 提交 · 翻页滚动 · Esc 关闭",
+        ),
+        ExtEmpty => ("No extension widgets", "暂无扩展组件"),
+        ExtCancel => ("Cancel", "取消"),
+        ExtConfirm => ("Confirm", "确认"),
+        CmdExtensions => ("Open extension components", "打开扩展交互组件"),
         CmdBtw => (
             "Temporary side conversation: /btw [question] · Alt+B keeps draft",
             "临时对话：/btw [问题] · Alt+B 保留草稿打开",
@@ -355,17 +386,14 @@ pub fn text(lang: Lang, key: Key) -> &'static str {
         CmdSkills => ("List loaded skills", "列出已加载 skills"),
         CmdCompact => ("Compact the conversation context", "压缩对话上下文"),
         CmdTheme => (
-            "Set the theme (auto / light / dark)",
-            "设置主题（auto / light / dark）",
+            "Select a terminal, light or dark theme",
+            "选择跟随终端、浅色或暗色主题",
         ),
         UsageTheme => (
-            "Usage: /theme [auto|light|dark]",
-            "用法：/theme [auto|light|dark]",
+            "Usage: /theme [auto|light|dark|catppuccin|nord|dracula|catppuccin-latte|solarized-light|github-light]",
+            "用法：/theme [auto|light|dark|catppuccin|nord|dracula|catppuccin-latte|solarized-light|github-light]",
         ),
-        InfoThemeSet => (
-            "Theme: {theme} (auto / light / dark)",
-            "主题：{theme}（auto / light / dark）",
-        ),
+        InfoThemeSet => ("Theme: {theme}", "主题：{theme}"),
         NoteThemeSaveFailed => (
             "Theme changed for this session, but could not save the preference: {e}",
             "本次会话的主题已切换，但无法保存主题偏好：{e}",
@@ -386,6 +414,14 @@ pub fn text(lang: Lang, key: Key) -> &'static str {
         StatusRestoringSession => ("Restoring session", "正在恢复会话"),
         NoteHistoryLoadFailed => ("Failed to read input history: {e}", "输入历史读取失败：{e}"),
         NoteHistorySaveFailed => ("Failed to save input history: {e}", "输入历史保存失败：{e}"),
+        QueueHeader => (
+            "Queued {n} · ↑ with empty input to edit latest",
+            "待执行 {n} · 输入框为空时 ↑ 取回最后一条",
+        ),
+        QueueKeys => (
+            " Enter queues · Cmd+Enter interrupts and runs now ",
+            " Enter 排队 · Cmd+Enter 中断并立即执行 ",
+        ),
         NoteBusyDraftKept => (
             "Still running; your draft is kept — press Esc to interrupt and send",
             "正在执行，草稿已保留；Esc 中断后可发送",
@@ -504,14 +540,15 @@ pub fn text(lang: Lang, key: Key) -> &'static str {
         ),
         HelpText => (
             "Input & navigation\n\
-             Enter sends · Shift+Enter / Ctrl+J / \\+Enter adds a newline\n\
-             ↑↓ move within multi-line input, then recall history at the edges\n\
+             Enter sends (queues while running) · Cmd+Enter interrupts and runs now\n\
+             Shift+Enter / Ctrl+J / \\+Enter adds a newline\n\
+             ↑ with empty input recalls the latest queued message, then history\n\
              Ctrl+R searches history; Enter/Tab inserts, Esc keeps your draft\n\
-             Pasting multi-line text becomes one draft and is not sent\n\
+             Ctrl+V pastes images/text; delete an [image N] marker to remove its image\n\
              \n\
              Commands & panels\n\
              / filters commands · ↑↓ select · Tab complete · Enter run\n\
-             Shift+Tab toggles Normal / Plan (when idle)\n\
+             Shift+Tab cycles permission modes · /plan toggles Plan mode\n\
              Ctrl+T opens/closes the full todo list · Ctrl+O shows details\n\
              /tasks shows background tasks: ↑↓ select · Enter output · x stop\n\
              ? (empty input) or /help opens this help\n\
@@ -525,14 +562,15 @@ pub fn text(lang: Lang, key: Key) -> &'static str {
              \n\
              Commands",
             "输入与导航\n\
-             Enter 发送 · Shift+Enter / Ctrl+J / \\+Enter 换行\n\
-             ↑↓ 在多行中移动，到首尾后召回历史\n\
+             Enter 发送（执行中则排队）· Cmd+Enter 中断并立即执行\n\
+             Shift+Enter / Ctrl+J / \\+Enter 换行\n\
+             输入框为空时 ↑ 优先取回队尾消息，否则回填历史\n\
              Ctrl+R 搜索历史，Enter/Tab 回填，Esc 保留原草稿\n\
-             粘贴多行作为一段草稿，不会自动发送\n\
+             Ctrl+V 粘贴图片或文字；删除 [image N] 标记即可移除对应图片\n\
              \n\
              命令与面板\n\
              / 筛选命令 · ↑↓ 选择 · Tab 补全 · Enter 执行\n\
-             Shift+Tab 切换 Normal / Plan（空闲时）\n\
+             Shift+Tab 轮换权限模式 · /plan 切换 Plan 模式\n\
              Ctrl+T 打开/关闭完整 Todo 列表 · Ctrl+O 详细记录\n\
              /tasks 查看后台任务：↑↓ 选择 · Enter 输出 · x 停止\n\
              ?（空输入）或 /help 打开帮助\n\

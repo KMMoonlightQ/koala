@@ -43,7 +43,7 @@ impl ToolResult {
         }
         let content = if end < output.len() {
             format!(
-                "{}\n…(truncated; full output available in transcript)",
+                "{}\n…(truncated; captured output available in transcript)",
                 &output[..end]
             )
         } else {

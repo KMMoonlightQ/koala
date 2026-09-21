@@ -21,7 +21,11 @@ pub async fn run(ctx: &mut ToolContext<'_>, task_prompt: &str) -> Result<String,
     if let Some(span) = &span {
         ctx.graph = Some(span.recorder());
     }
-    let result = run_recorded(ctx, task_prompt).await;
+    let result = crate::extensions::ui::scope(
+        crate::extensions::ui::RequestContext::default(),
+        run_recorded(ctx, task_prompt),
+    )
+    .await;
     ctx.graph = parent;
     if let Some(span) = &mut span {
         span.finish(

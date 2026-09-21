@@ -43,16 +43,41 @@ pub enum Theme {
     Auto,
     Light,
     Dark,
+    Catppuccin,
+    Nord,
+    Dracula,
+    #[serde(rename = "catppuccin-latte")]
+    CatppuccinLatte,
+    #[serde(rename = "solarized-light")]
+    SolarizedLight,
+    #[serde(rename = "github-light")]
+    GithubLight,
 }
 
 impl Theme {
-    pub const ALL: [Self; 3] = [Self::Auto, Self::Light, Self::Dark];
+    pub const ALL: [Self; 9] = [
+        Self::Auto,
+        Self::Light,
+        Self::Dark,
+        Self::Catppuccin,
+        Self::Nord,
+        Self::Dracula,
+        Self::CatppuccinLatte,
+        Self::SolarizedLight,
+        Self::GithubLight,
+    ];
 
     pub fn code(self) -> &'static str {
         match self {
             Self::Auto => "auto",
             Self::Light => "light",
             Self::Dark => "dark",
+            Self::Catppuccin => "catppuccin",
+            Self::Nord => "nord",
+            Self::Dracula => "dracula",
+            Self::CatppuccinLatte => "catppuccin-latte",
+            Self::SolarizedLight => "solarized-light",
+            Self::GithubLight => "github-light",
         }
     }
 
@@ -61,6 +86,12 @@ impl Theme {
             "auto" => Some(Self::Auto),
             "light" => Some(Self::Light),
             "dark" => Some(Self::Dark),
+            "catppuccin" => Some(Self::Catppuccin),
+            "nord" => Some(Self::Nord),
+            "dracula" => Some(Self::Dracula),
+            "catppuccin-latte" => Some(Self::CatppuccinLatte),
+            "solarized-light" => Some(Self::SolarizedLight),
+            "github-light" => Some(Self::GithubLight),
             _ => None,
         }
     }
@@ -114,23 +145,13 @@ impl PermissionMode {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PermissionsConfig {
     pub mode: PermissionMode,
     /// Explicit trusted tools in Ask When Need and Auto Edit.
     pub allow: Vec<String>,
     pub deny: Vec<String>,
-}
-
-impl Default for PermissionsConfig {
-    fn default() -> Self {
-        Self {
-            mode: PermissionMode::default(),
-            allow: Vec::new(),
-            deny: Vec::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -416,6 +437,29 @@ fn save_preference(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classic_themes_parse_and_persist() {
+        for name in [
+            "catppuccin",
+            "nord",
+            "dracula",
+            "catppuccin-latte",
+            "solarized-light",
+            "github-light",
+        ] {
+            let parsed = Theme::parse(name).expect("built-in theme");
+            let cfg: Config = toml::from_str(&format!("theme = \"{name}\"")).unwrap();
+            assert_eq!(cfg.theme, parsed);
+            assert_eq!(parsed.code(), name);
+            let root = std::env::temp_dir().join(format!("koala-palette-{}", uuid::Uuid::new_v4()));
+            let path = root.join("theme.toml");
+            save_theme(&path, parsed).unwrap();
+            let restored: Config = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            assert_eq!(restored.theme, parsed);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     #[test]
     fn theme_defaults_to_auto_and_validates_config() {

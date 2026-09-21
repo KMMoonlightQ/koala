@@ -114,6 +114,22 @@ async fn read_file(args: ReadArgs) -> Result<String, String> {
             ));
         }
         number += 1;
+        if number < start {
+            // Discard skipped lines in bounded chunks, including very long lines.
+            while !line.ends_with(b"\n") {
+                line.clear();
+                if (&mut reader)
+                    .take((MAX_READ_BYTES + 1) as u64)
+                    .read_until(b'\n', &mut line)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    == 0
+                {
+                    break;
+                }
+            }
+            continue;
+        }
         if n > MAX_READ_BYTES {
             if count > 0 {
                 break;
@@ -121,9 +137,6 @@ async fn read_file(args: ReadArgs) -> Result<String, String> {
             return Err(format!(
                 "line {number} exceeds {MAX_READ_BYTES} bytes; use bash for a bounded extraction"
             ));
-        }
-        if number < start {
-            continue;
         }
         if output.len() + n > MAX_READ_BYTES || count == limit {
             break;
@@ -415,6 +428,32 @@ mod tests {
             std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
             1
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_skips_oversized_lines_before_requested_offset() {
+        let root = root();
+        let path = root.join("input.txt");
+        std::fs::write(&path, format!("{}\nsecond\nthird", "x".repeat(100_000))).unwrap();
+        let page = read_file(ReadArgs {
+            path: path.display().to_string(),
+            offset: NonZeroUsize::new(2),
+            limit: NonZeroUsize::new(1),
+        })
+        .await
+        .unwrap();
+        assert!(page.contains("offset=3"));
+        assert!(page.ends_with("second\n"));
+        std::fs::write(&path, "x".repeat(100_000)).unwrap();
+        let error = read_file(ReadArgs {
+            path: path.display().to_string(),
+            offset: NonZeroUsize::new(2),
+            limit: None,
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("beyond end of file (1 lines)"));
         std::fs::remove_dir_all(root).unwrap();
     }
 

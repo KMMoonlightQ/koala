@@ -1,6 +1,8 @@
+pub mod ui;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{future::Future, pin::Pin};
+pub use ui::*;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Tool {
@@ -51,6 +53,8 @@ pub enum Stage {
 #[derive(Default, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Response {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ui: Vec<UiCommand>,
     /// Context appended to the system prompt (turn_start / before_model).
     pub context: Option<String>,
     /// Veto a pre-action hook. Other phases report this as an error.
@@ -64,6 +68,12 @@ pub struct Response {
 
 pub trait Extension: Send + Sync {
     fn name(&self) -> &str;
+    fn ui_enabled(&self) -> bool {
+        false
+    }
+    fn ui_event<'a>(&'a self, _event: &'a UiInputEvent) -> ExtensionFuture<'a> {
+        Box::pin(async { Ok(Response::default()) })
+    }
     fn tools(&self) -> Vec<Tool> {
         Vec::new()
     }

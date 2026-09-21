@@ -35,7 +35,7 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             app.input.insert_newline();
             return true;
         }
-        return false;
+        return super::mentions::handle_key(app, key);
     }
     if app.permission.is_some() {
         return false;
@@ -64,8 +64,19 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             app.menu_dismissed = true;
             return true;
         }
-        KeyCode::BackTab => {
-            toggle_mode(app);
+        KeyCode::BackTab | KeyCode::Tab
+            if key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            let modes = super::PermissionMode::ALL;
+            let index = modes
+                .iter()
+                .position(|mode| {
+                    *mode == app.pending_permission_mode.unwrap_or(app.permission_mode)
+                })
+                .unwrap_or(0);
+            let next = modes[(index + 1) % modes.len()];
+            app.pending_permission_mode = Some(next);
+            app.session.send(SessionCommand::SetPermissionMode(next));
             return true;
         }
         KeyCode::Char('?') if app.input.is_empty() => {
@@ -73,6 +84,9 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             return true;
         }
         _ => {}
+    }
+    if super::mentions::handle_key(app, key) {
+        return true;
     }
     let matches = input::matches(&app.input);
     if !app.menu_dismissed && !matches.is_empty() {
@@ -102,8 +116,16 @@ pub(super) fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         }
     }
     match key.code {
-        KeyCode::Up if app.input.cursor().0 == 0 => {
-            app.history.previous(&mut app.input, app.lang);
+        KeyCode::Up
+            if app.input.is_empty() && app.images.is_empty() && app.clipboard_pending.is_none() =>
+        {
+            if let Some(text) = app.queue.pending.pop_back() {
+                app.history.reset_navigation();
+                app.input = input::editor(&text.text, app.lang);
+                app.images = text.images;
+            } else {
+                app.history.previous(&mut app.input, app.lang);
+            }
             app.menu_dismissed = true;
             true
         }

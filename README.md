@@ -29,15 +29,7 @@ brew install KMMoonlightQ/tools/koala
 koala
 ```
 
-无需安装 Rust。`koala` 默认打开交互界面；使用模型前需配置服务地址、API Key 和模型名。
-可复制安装包附带的示例（不会覆盖已有配置）：
-
-```bash
-mkdir -p ~/.koala
-cp -n "$(brew --prefix koala)/share/koala/config.example.toml" ~/.koala/config.toml
-# 编辑 ~/.koala/config.toml 的 [llm]：base_url / api_key / model
-koala
-```
+无需安装 Rust。首次运行 `koala` 自动创建 `~/.koala/config.toml`，并在界面内引导填写服务地址、API Key 和模型名。填写后按 Ctrl+S 保存并进入对话；已有完整配置会直接打开对话。
 
 输入 `/quit` 退出。更新执行 `brew update` 后再执行 `brew upgrade KMMoonlightQ/tools/koala`。
 已有配置和会话保存在程序安装目录之外，升级会保留。

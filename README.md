@@ -50,12 +50,8 @@ OpenAI 兼容 Chat Completions 端点。
 在项目根目录执行：
 
 ```bash
-mkdir -p ~/.koala
-cp -n config.example.toml ~/.koala/config.toml
-# 编辑 ~/.koala/config.toml：[llm] 段填 base_url / api_key / model
-
 cargo build --release
-./target/release/koala            # 进入对话，等同于 koala chat
+./target/release/koala            # 首次启动在界面内配置模型，然后进入对话
 ```
 
 也可以安装到 Cargo 的可执行文件目录，后续直接使用 `koala`：
@@ -71,8 +67,16 @@ koala --help
 ## 配置
 
 主配置统一读取用户主目录下的 `~/.koala/config.toml`，与安装位置和启动目录无关。
-文件不存在时使用内置默认值；环境变量仍可覆盖文件配置。本文中的 `config.toml`
-均指此文件。程序不再读取项目根目录或系统配置目录中的旧主配置。
+首次运行 `koala`（或 `koala chat`）时自动创建此文件，无需手动复制模板；安装命令本身不写入配置。
+如果模型连接尚未配置，Koala 会先展示设置表单，填写 `base_url`、`api_key` 和 `model`。
+API Key 隐藏显示，免密服务可留空；Tab 或上下方向键切换字段，Enter 进入下一项并在最后一项保存，
+Ctrl-S 可直接保存，Esc / Ctrl-C 退出，下次启动继续配置。保存后直接进入对话，无需重启。
+表单校验 URL 格式和必填模型名，不发送联网验证请求。保存失败时留在表单内，可重试或退出。
+
+已有配置文件不会被初始化覆盖；设置表单保存时保留其他配置项的值，但会重新格式化 TOML（不保留注释）。
+Unix 下新建及保存的主配置仅当前用户可读写（`0600`）。完整高级配置示例见 `config.example.toml`。
+环境变量仍可覆盖文件配置：配置完整时直接进入对话；表单中的环境变量字段只读，其值不会写回配置文件。
+非交互终端中若配置不完整，会提示通过配置文件或环境变量设置。本文中的 `config.toml` 均指此文件。程序不再读取项目根目录或系统配置目录中的旧主配置。
 从旧版本升级时，将原有配置复制到 `~/.koala/config.toml`；已有目标文件时请手动合并。
 
 全局资源统一放在用户主目录下的 `.koala`，不再使用系统配置目录：

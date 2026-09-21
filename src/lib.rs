@@ -6,6 +6,7 @@ pub mod images;
 pub mod llm;
 pub mod markdown;
 pub mod mcp;
+pub mod setup;
 pub mod tui;
 
 #[cfg(test)]

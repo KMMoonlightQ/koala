@@ -13,6 +13,7 @@ mod panels;
 mod queue;
 #[cfg(test)]
 mod queue_tests;
+mod setup;
 mod text;
 mod theme;
 mod transcript;
@@ -242,6 +243,16 @@ impl App {
 }
 
 pub async fn run(cfg: &Config) -> anyhow::Result<()> {
+    let configured;
+    let cfg = if crate::setup::needs_setup(cfg) {
+        if !setup::run(cfg).await? {
+            return Ok(());
+        }
+        configured = Config::load()?;
+        &configured
+    } else {
+        cfg
+    };
     let (handle, events) = session::spawn_tui(Agent::new(cfg).await?);
     let mut app = App::new(handle);
     app.configure_appearance(cfg);

@@ -9,6 +9,8 @@ use thiserror::Error;
 pub enum ConfigError {
     #[error("cannot determine home directory for ~/.koala/config.toml")]
     HomeDirectoryUnavailable,
+    #[error("failed to initialize config: {0}")]
+    Initialize(#[source] anyhow::Error),
     #[error("failed to read config file {0}: {1}")]
     Read(String, #[source] std::io::Error),
     #[error("failed to parse config file {0}: {1}")]
@@ -335,6 +337,7 @@ impl Config {
     /// Saved workspace appearance overrides the file; KOALA_* env vars win last.
     pub fn load() -> Result<Self, ConfigError> {
         let path = koala_dir()?.join("config.toml");
+        crate::setup::ensure_config(&path).map_err(ConfigError::Initialize)?;
         let mut cfg = Self::load_files(&[path], PathBuf::from(".koala/language.toml"))?;
         cfg.apply_env();
         Ok(cfg)

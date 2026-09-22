@@ -107,6 +107,9 @@ keys!(
     InputPlaceholder,
     ClipboardLoading,
     ClipboardFailed,
+    SelectionCopying,
+    SelectionCopied,
+    SelectionCopyFailed,
     ImageLimit,
     ImageKeys,
     Current,
@@ -292,6 +295,9 @@ pub fn text(lang: Lang, key: Key) -> &'static str {
             "正在读取剪贴板，请稍后发送",
         ),
         ClipboardFailed => ("Could not paste: {error}", "粘贴失败：{error}"),
+        SelectionCopying => ("Copying selection…", "正在复制选区…"),
+        SelectionCopied => ("Selection copied", "选区已复制"),
+        SelectionCopyFailed => ("Could not copy: {error}", "复制失败：{error}"),
         ImageLimit => ("At most 4 images per message", "每条消息最多 4 张图片"),
         ImageKeys => (
             "Enter sends · delete an [image N] marker to remove its image",
@@ -555,7 +561,9 @@ pub fn text(lang: Lang, key: Key) -> &'static str {
              \n\
              Running & quitting\n\
              Esc closes a panel; with none open it interrupts the turn\n\
-             Ctrl+C interrupts the turn; clears the input when idle\n\
+             Mouse drag selects text; Ctrl+C copies selection; Esc clears selection\n\
+             Mouse wheel / PageUp / PageDown scroll the conversation\n\
+             Ctrl+C without a selection interrupts the turn; clears input when idle\n\
              Approval prompt: arrows select · Enter confirms · Esc denies\n\
              Ctrl+D (empty input) or /quit exits\n\
              PgUp/PgDn scroll history · Ctrl+End jumps to the bottom\n\
@@ -577,7 +585,9 @@ pub fn text(lang: Lang, key: Key) -> &'static str {
              \n\
              运行与退出\n\
              Esc 关闭面板；无面板时中断前台工作\n\
-             Ctrl+C 中断前台工作；空闲时清空输入\n\
+             鼠标拖选文字；Ctrl+C 复制选区；Esc 取消选区\n\
+             鼠标滚轮 / PageUp / PageDown 滚动对话\n\
+             无选区时 Ctrl+C 中断前台工作；空闲时清空输入\n\
              权限确认：方向键选择 · Enter 确认 · Esc 拒绝\n\
              Ctrl+D（空输入）或 /quit 退出\n\
              PgUp/PgDn 历史 · Ctrl+End 回到底部\n\

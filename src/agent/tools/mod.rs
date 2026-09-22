@@ -225,7 +225,7 @@ mod tests {
             extensions: crate::extensions::Extensions::default(),
             max_tool_rounds: Some(4),
             max_retries: 0,
-            compact_threshold: 40000,
+            compact_threshold: 75,
             subagent_max_rounds: Some(2),
             memory_file: std::path::PathBuf::from("/tmp/koala-ctx-test.md"),
             lang: crate::i18n::LangCell::new(crate::i18n::Lang::En),

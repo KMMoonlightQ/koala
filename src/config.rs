@@ -177,7 +177,7 @@ pub struct LlmConfig {
     pub reasoning_efforts: Vec<String>,
     /// Initial value; defaults to the first configured effort.
     pub reasoning_effort: Option<String>,
-    /// Model capacity in tokens, used as the context usage percentage denominator.
+    /// Fallback capacity in tokens when the model catalog cannot resolve this model.
     pub context_window: Option<std::num::NonZeroU64>,
     /// Extra HTTP headers sent with every request, for endpoints that require
     /// routing headers beyond OpenAI auth (e.g. x-opencode-session).
@@ -267,8 +267,8 @@ pub struct AgentConfig {
     #[serde(deserialize_with = "deserialize_round_limit")]
     pub max_tool_rounds: Option<usize>,
     pub max_retries: usize,
-    /// Compact history when its estimated size (chars) exceeds this.
-    /// Serialized request byte budget including tools and a 4096-byte response reserve.
+    /// Percentage of model capacity at which to compact (1..=100).
+    #[serde(deserialize_with = "deserialize_compact_threshold")]
     pub compact_threshold: usize,
     #[serde(deserialize_with = "deserialize_round_limit")]
     pub subagent_max_rounds: Option<usize>,
@@ -288,7 +288,7 @@ impl Default for AgentConfig {
         Self {
             max_tool_rounds: None,
             max_retries: 5,
-            compact_threshold: 40_000,
+            compact_threshold: 75,
             subagent_max_rounds: None,
             session_dir: PathBuf::from(".koala/session"),
             memory_file: default_memory_file(),
@@ -297,6 +297,18 @@ impl Default for AgentConfig {
             memory_index_bytes: 4000,
         }
     }
+}
+
+fn deserialize_compact_threshold<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<usize, D::Error> {
+    let value = usize::deserialize(deserializer)?;
+    if !(1..=100).contains(&value) {
+        return Err(serde::de::Error::custom(
+            "agent.compact_threshold must be a percentage from 1 to 100 (default 75); replace legacy byte budgets such as 40000 with 75",
+        ));
+    }
+    Ok(value)
 }
 
 /// Accept a nonnegative round budget or the explicit TOML string "unlimited".
@@ -569,13 +581,24 @@ max_tool_rounds = 2
     }
 
     #[test]
+    fn compact_threshold_rejects_legacy_bytes_and_invalid_percentages() {
+        for value in ["40000", "0", "101", "-1", "0.75"] {
+            let error = toml::from_str::<Config>(&format!("[agent]\ncompact_threshold = {value}"))
+                .expect_err("threshold must be a percentage from 1 to 100");
+            assert!(error.to_string().contains("compact_threshold"));
+        }
+        let cfg: Config = toml::from_str("[agent]\ncompact_threshold = 75").unwrap();
+        assert_eq!(cfg.agent.compact_threshold, 75);
+    }
+
+    #[test]
     fn empty_config_uses_defaults() {
         let cfg: Config = toml::from_str("").unwrap();
         assert_eq!(cfg.llm.base_url, "https://api.openai.com/v1");
         assert_eq!(cfg.agent.max_tool_rounds, None);
         assert_eq!(cfg.agent.subagent_max_rounds, None);
         assert_eq!(cfg.agent.max_retries, 5);
-        assert_eq!(cfg.agent.compact_threshold, 40_000);
+        assert_eq!(cfg.agent.compact_threshold, 75);
         assert_eq!(cfg.permissions.mode, PermissionMode::AskWhenNeed);
         assert!(cfg.permissions.allow.is_empty());
         // English is the default interface language.

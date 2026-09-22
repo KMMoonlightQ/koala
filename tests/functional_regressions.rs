@@ -104,12 +104,16 @@ async fn long_tool_loop_compacts_before_sending_and_keeps_protocol_valid() {
             let r = mock.request().await;
             if r["stream"] != true {
                 summaries += 1;
-                assert!(r["messages"].to_string().len() + 4096 <= cfg.agent.compact_threshold);
+                let messages: Vec<Message> = serde_json::from_value(r["messages"].clone()).unwrap();
+                assert!(koala::llm::context_size(&messages) + 4096 <= 12_288);
                 continue;
             }
             streams += 1;
-            let bytes = r["messages"].to_string().len() + r["tools"].to_string().len() + 4096;
-            assert!(bytes <= cfg.agent.compact_threshold, "{bytes}");
+            let messages: Vec<Message> = serde_json::from_value(r["messages"].clone()).unwrap();
+            let tokens = koala::llm::context_size(&messages)
+                + koala::llm::estimate_tokens(&r["tools"].to_string())
+                + 4096;
+            assert!(tokens < 12_288, "{tokens}");
             let mut pending = std::collections::HashSet::new();
             for m in r["messages"].as_array().unwrap() {
                 if let Some(calls) = m["tool_calls"].as_array() {
@@ -405,4 +409,88 @@ async fn plan_mode_executes_native_search_through_the_model_tool_loop() {
             .unwrap()
             .contains("needle")
     );
+}
+
+#[tokio::test]
+async fn model_catalog_overrides_manual_fallback_and_switches_with_model() {
+    let root = Temp::new();
+    let mut cfg = config(&root, "https://api.deepseek.com/v1");
+    cfg.llm.model = "deepseek-v4-flash".into();
+    cfg.llm.context_window = std::num::NonZeroU64::new(128_000);
+    cfg.llm.models = vec![koala::config::ModelConfig {
+        model: "private-deployment".into(),
+        context_window: std::num::NonZeroU64::new(64_000),
+        ..Default::default()
+    }];
+    let mut agent = Agent::new(&cfg).await.unwrap();
+    assert!(matches!(
+        agent.model_settings(),
+        event::UiEvent::ModelSettings {
+            context_window: Some(1_000_000),
+            ..
+        }
+    ));
+    agent.select_model("private-deployment").unwrap();
+    assert!(matches!(
+        agent.model_settings(),
+        event::UiEvent::ModelSettings {
+            context_window: Some(64_000),
+            ..
+        }
+    ));
+    agent.select_model("deepseek-v4-flash").unwrap();
+    assert!(matches!(
+        agent.model_settings(),
+        event::UiEvent::ModelSettings {
+            context_window: Some(1_000_000),
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn percentage_budget_scales_with_the_selected_context_window() {
+    for (window, threshold, allowed) in [
+        (100_000, 75, true),
+        (100_000, 10, false),
+        (10_000, 75, false),
+    ] {
+        let root = Temp::new();
+        let mock = MockLlm::respond(|request| {
+            if request["stream"] == true {
+                stream(json!({"content":"accepted"}))
+            } else {
+                reply(Message::assistant("compact summary"))
+            }
+        })
+        .await;
+        let mut cfg = config(&root, &mock.url);
+        cfg.llm.context_window = std::num::NonZeroU64::new(window);
+        cfg.agent.compact_threshold = threshold;
+        cfg.llm.models.push(koala::config::ModelConfig {
+            model: "small-private-model".into(),
+            context_window: std::num::NonZeroU64::new(10_000),
+            ..Default::default()
+        });
+        let mut agent = Agent::new(&cfg).await.unwrap();
+        let result = agent
+            .run_turn(&"x".repeat(30_000), event::null_events())
+            .await;
+        if allowed {
+            assert_eq!(result.unwrap(), "accepted");
+            agent.select_model("small-private-model").unwrap();
+            let result = agent
+                .run_turn(&"x".repeat(30_000), event::null_events())
+                .await;
+            assert!(matches!(
+                result,
+                Err(koala::agent::AgentError::ContextBudget { .. })
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                Err(koala::agent::AgentError::ContextBudget { .. })
+            ));
+        }
+    }
 }

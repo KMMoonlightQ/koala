@@ -92,9 +92,12 @@ impl Transcript {
     pub(super) fn entries(&self) -> &[EntryKind] {
         &self.entries
     }
-    #[cfg(test)]
     pub(super) fn scroll_offset(&self) -> usize {
         self.scroll
+    }
+
+    pub(super) fn rendered_lines(&self) -> &[Line<'static>] {
+        self.rendered.as_ref().map_or(&[], |cache| &cache.lines)
     }
 
     pub(super) fn todos(&self) -> &[TodoView] {

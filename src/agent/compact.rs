@@ -7,7 +7,7 @@ const MAX_SUMMARY_INPUT_BYTES: usize = 20_000;
 /// Replace all but the last KEEP_RECENT messages with an LLM summary.
 /// Returns true when compaction happened. Failure keeps history untouched.
 pub async fn compact(llm: &LlmClient, history: &mut Vec<Message>) -> Result<bool, LlmError> {
-    compact_keeping(llm, history, KEEP_RECENT, usize::MAX).await
+    compact_keeping(llm, history, KEEP_RECENT, llm.context_budget(100)).await
 }
 
 pub async fn compact_keeping(
@@ -63,12 +63,7 @@ pub async fn compact_keeping(
                 "把以下对话历史片段压缩成一份紧凑的摘要，保留：用户的偏好与约束、做过的决定、\
                  进行中的任务状态、后续要用到的事实。片段可能从一条消息中间开始或结束。直接输出摘要文本，不要解释。\n\n{batch}"
             );
-            if serde_json::to_vec(&[Message::user(&prompt)])
-                .expect("serializable summary")
-                .len()
-                .saturating_add(4096)
-                <= budget
-            {
+            if crate::llm::context_size(&[Message::user(&prompt)]).saturating_add(4096) <= budget {
                 break (rest, prompt);
             }
             end /= 2;

@@ -95,16 +95,15 @@ pub async fn run(
         if ctx.depth == 0 {
             let _ = ctx.events.send(UiEvent::ContextUsage(None));
         }
-        // Budget text and dynamic/tool context by serialized bytes; images use
-        // a dimension-based allowance instead of counting Base64 transport data.
-        // This is an estimate, not a provider-specific token-window claim.
+        // Estimate input tokens, including tools and dynamic context, and reserve
+        // output tokens before applying the selected model's percentage budget.
         let used = crate::llm::context_size(&request)
-            + serde_json::to_vec(&tool_defs)
-                .expect("serializable tools")
-                .len()
+            + crate::llm::estimate_tokens(
+                &serde_json::to_string(&tool_defs).expect("serializable tools"),
+            )
             + 4096; // space reserved for the response
-        let limit = ctx.shared.compact_threshold;
-        if used > limit {
+        let limit = ctx.shared.llm.context_budget(ctx.shared.compact_threshold);
+        if used >= limit {
             if compact_attempts >= 2 {
                 return Err(AgentError::ContextBudget { used, limit });
             }

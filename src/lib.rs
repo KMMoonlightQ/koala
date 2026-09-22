@@ -6,6 +6,7 @@ pub mod images;
 pub mod llm;
 pub mod markdown;
 pub mod mcp;
+pub mod model_catalog;
 pub mod setup;
 pub mod tui;
 

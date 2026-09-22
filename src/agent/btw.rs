@@ -74,11 +74,9 @@ async fn reply(
     events: &EventSender,
 ) -> Result<Message, AgentError> {
     let used = crate::llm::context_size(messages).saturating_add(4096);
-    if used > shared.compact_threshold {
-        return Err(AgentError::ContextBudget {
-            used,
-            limit: shared.compact_threshold,
-        });
+    let limit = shared.llm.context_budget(shared.compact_threshold);
+    if used >= limit {
+        return Err(AgentError::ContextBudget { used, limit });
     }
     let mut delays = retry::backoff_delays(shared.max_retries).into_iter();
     let mut stream = loop {

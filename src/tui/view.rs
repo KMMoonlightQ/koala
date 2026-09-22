@@ -1,4 +1,4 @@
-use super::{App, logo, panels, text, theme};
+use super::{App, logo, mouse, panels, text, theme};
 use crate::i18n::{self, Key};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Margin, Rect};
@@ -10,6 +10,7 @@ pub(super) fn draw(f: &mut Frame, app: &mut App) {
         draw(f, &mut side.app);
         return;
     }
+    mouse::begin_frame(app, f.area());
     let area = f.area().inner(Margin {
         horizontal: u16::from(f.area().width > 4),
         vertical: 0,
@@ -169,6 +170,7 @@ fn draw_transcript(f: &mut Frame, app: &mut App, area: Rect) {
         .transcript
         .visible_lines(area.width, area.height, app.lang, &app.directory);
     f.render_widget(Paragraph::new(Text::from(lines)), area);
+    mouse::draw_output(f, app, area);
 }
 
 fn draw_status(f: &mut Frame, app: &App, area: Rect) {
@@ -183,15 +185,15 @@ fn draw_status(f: &mut Frame, app: &App, area: Rect) {
         } else {
             i18n::text(app.lang, Key::ActionInterrupt)
         };
-        let spinner = Rect::new(area.x, area.y, area.width.min(3), area.height);
+        let spinner = Rect::new(area.x, area.y, area.width.min(1), area.height.min(1));
         f.render_widget(
             Paragraph::new(logo::running(elapsed.as_millis(), app.permission.is_some())),
             spinner,
         );
         let area = Rect::new(
-            area.x.saturating_add(4),
+            area.x.saturating_add(2),
             area.y,
-            area.width.saturating_sub(4),
+            area.width.saturating_sub(2),
             area.height,
         );
         let timer = elapsed_label(elapsed);
@@ -266,7 +268,7 @@ fn draw_queue(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn draw_input(f: &mut Frame, app: &App, area: Rect) {
+fn draw_input(f: &mut Frame, app: &mut App, area: Rect) {
     let border_style = if app.permission.is_some() {
         theme::warning()
     } else if app.plan_mode {
@@ -292,6 +294,25 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
     let input = Layout::horizontal([Constraint::Length(2), Constraint::Min(1)]).split(inner);
     f.render_widget(Paragraph::new("❯").style(theme::accent()), input[0]);
     f.render_widget(&app.input, input[1]);
+    mouse::record_input(app, input[1]);
+    // TextArea marks its cursor with REVERSED after applying Unicode widths and
+    // viewport scrolling. Reuse that position for the terminal's native bar.
+    let focused = app.panel.is_none() && app.permission.is_none() && !app.extension_ui.active();
+    let mut cursor = None;
+    for y in input[1].top()..input[1].bottom() {
+        for x in input[1].left()..input[1].right() {
+            let cell = &mut f.buffer_mut()[(x, y)];
+            if cell.modifier.contains(ratatui::style::Modifier::REVERSED) {
+                cell.modifier.remove(ratatui::style::Modifier::REVERSED);
+                cursor.get_or_insert((x, y));
+            }
+        }
+    }
+    if focused {
+        if let Some(position) = cursor {
+            f.set_cursor_position(position);
+        }
+    }
 }
 
 /// Bottom bar: session metadata on the left, contextual key hints flushed

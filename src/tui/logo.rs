@@ -60,44 +60,13 @@ fn render_pixels(pixels: &[&str]) -> Vec<Line<'static>> {
         .collect()
 }
 
-// Four consecutive squares travel around an empty center. Half-blocks make
-// a true 3x3 pixel grid in three columns and two terminal rows.
-pub(super) fn running(elapsed_ms: u128, paused: bool) -> Vec<Line<'static>> {
-    let ring = [
-        (0, 0),
-        (1, 0),
-        (2, 0),
-        (2, 1),
-        (2, 2),
-        (1, 2),
-        (0, 2),
-        (0, 1),
-    ];
+// A single-cell spinner stays the same height as the status text.
+pub(super) fn running(elapsed_ms: u128, paused: bool) -> Line<'static> {
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let phase = if paused {
         0
     } else {
-        (elapsed_ms / 120 % 8) as usize
+        (elapsed_ms / 120 % FRAMES.len() as u128) as usize
     };
-    let mut pixels = [[false; 3]; 4];
-    for offset in 0..4 {
-        let (x, y) = ring[(phase + offset) % 8];
-        pixels[y][x] = true;
-    }
-    (0..2)
-        .map(|row| {
-            Line::from(
-                (0..3)
-                    .map(|x| {
-                        let symbol = match (pixels[row * 2][x], pixels[row * 2 + 1][x]) {
-                            (true, true) => "█",
-                            (true, false) => "▀",
-                            (false, true) => "▄",
-                            (false, false) => " ",
-                        };
-                        Span::styled(symbol, super::theme::accent())
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        })
-        .collect()
+    Line::from(Span::styled(FRAMES[phase], super::theme::accent()))
 }

@@ -9,6 +9,9 @@ mod input;
 mod logo;
 mod markdown;
 mod mentions;
+mod mouse;
+#[cfg(test)]
+mod mouse_tests;
 mod panels;
 mod queue;
 #[cfg(test)]
@@ -117,6 +120,9 @@ struct App {
     input: TextArea<'static>,
     images: attachments::DraftImages,
     clipboard_pending: Option<clipboard::Pending>,
+    clipboard_copy_pending: Option<clipboard::CopyPending>,
+    clipboard_owner: clipboard::CopyOwner,
+    mouse: mouse::State,
     permission: Option<PermissionPrompt>,
     busy: bool,
     queue: queue::Queue,
@@ -133,6 +139,7 @@ fn new_input(lang: Lang) -> TextArea<'static> {
     input.set_placeholder_text(i18n::text(lang, Key::InputPlaceholder));
     input.set_placeholder_style(theme::subtle());
     input.set_cursor_line_style(Style::default());
+    input.set_selection_style(theme::selection());
     input
 }
 
@@ -172,6 +179,9 @@ impl App {
             input: new_input(Lang::default()),
             images: attachments::DraftImages::default(),
             clipboard_pending: None,
+            clipboard_copy_pending: None,
+            clipboard_owner: Default::default(),
+            mouse: mouse::State::default(),
             permission: None,
             busy: false,
             queue: queue::Queue::default(),
@@ -272,6 +282,7 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
     let result = match crossterm::execute!(
         std::io::stdout(),
+        crossterm::cursor::SetCursorStyle::SteadyBar,
         crossterm::event::EnableBracketedPaste,
         crossterm::event::EnableMouseCapture,
         crossterm::event::PushKeyboardEnhancementFlags(
@@ -285,7 +296,8 @@ pub async fn run(cfg: &Config) -> anyhow::Result<()> {
         std::io::stdout(),
         crossterm::event::PopKeyboardEnhancementFlags,
         crossterm::event::DisableMouseCapture,
-        crossterm::event::DisableBracketedPaste
+        crossterm::event::DisableBracketedPaste,
+        crossterm::cursor::SetCursorStyle::DefaultUserShape
     );
     app.session.send(SessionCommand::Shutdown);
     ratatui::restore();
@@ -309,11 +321,13 @@ async fn event_loop(
                 None => app.quit = true,
             },
             result = clipboard::next(&mut app.clipboard_pending) => clipboard::apply(app, result),
+            result = clipboard::next_copy(&mut app.clipboard_copy_pending) => clipboard::apply_copy(app, result),
             ev = btw::next_event(&mut app.btw) => {
                 if let Some(side) = &mut app.btw {
                     match ev {
                         Some(btw::SideEvent::Agent(ev)) => handle_ui_event(&mut side.app, ev),
                         Some(btw::SideEvent::Clipboard(result)) => clipboard::apply(&mut side.app, result),
+                        Some(btw::SideEvent::Copy(result)) => clipboard::apply_copy(&mut side.app, result),
                         None => {
                             side.app.finish();
                             side.app.hint = Some(i18n::text(side.app.lang, Key::BtwClosed).into());
@@ -325,7 +339,8 @@ async fn event_loop(
                 Some(ev) => handle_ui_event(app, ev),
                 None => return Ok(()),
             },
-            _ = tick.tick(), if app.busy || app.btw.as_ref().is_some_and(|s| s.app.busy) || matches!(app.panel, Some(Panel::Tasks { .. } | Panel::Graph(_))) => {
+            _ = tick.tick(), if app.busy || app.btw.as_ref().is_some_and(|s| s.app.busy) || mouse::autoscrolling(app) || matches!(app.panel, Some(Panel::Tasks { .. } | Panel::Graph(_))) => {
+                mouse::tick(app);
                 if matches!(app.panel, Some(Panel::Graph(_))) && app.graph_received.elapsed() >= Duration::from_secs(1) {
                     app.graph_received = Instant::now();
                     app.session.send(SessionCommand::ShowGraph);
@@ -346,16 +361,7 @@ fn handle_terminal_event(app: &mut App, event: Event) {
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => handle_key(app, key),
         Event::Paste(text) => handle_paste(app, &text),
-        Event::Mouse(mouse) => {
-            // Use paging so wheel events never reach input-history arrows or
-            // change the selected permission decision.
-            let code = match mouse.kind {
-                MouseEventKind::ScrollUp => KeyCode::PageUp,
-                MouseEventKind::ScrollDown => KeyCode::PageDown,
-                _ => return,
-            };
-            handle_key(app, KeyEvent::new(code, KeyModifiers::NONE));
-        }
+        Event::Mouse(event) => mouse::handle(app, event),
         _ => {}
     }
 }
@@ -610,6 +616,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_key_inner(app: &mut App, key: KeyEvent) {
+    if mouse::handle_key(app, key) {
+        return;
+    }
     if let Some(side) = &mut app.btw {
         if key.code == KeyCode::Esc
             || (key.code == KeyCode::Char('d')

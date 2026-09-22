@@ -37,7 +37,7 @@ use tools::ToolContext;
 #[derive(Debug, Error)]
 pub enum AgentError {
     #[error(
-        "request context exceeds configured budget ({used} > {limit} estimated units including response reserve); reduce input, images, extension context, or tools, or raise agent.compact_threshold"
+        "request context exceeds configured budget ({used} >= {limit} estimated tokens including response reserve); reduce input, images, extension context, or tools, or check model context_window or agent.compact_threshold (percentage)"
     )]
     ContextBudget { used: usize, limit: usize },
     #[error("extension: {0}")]
@@ -96,10 +96,22 @@ impl Agent {
         if cfg.llm.model.is_empty() {
             return Err(AgentError::MissingModel);
         }
-        let models = cfg
+        let mut models = cfg
             .llm
             .selectable_models()
             .map_err(AgentError::InvalidModelSettings)?;
+        if !(1..=100).contains(&cfg.agent.compact_threshold) {
+            return Err(AgentError::InvalidModelSettings(
+                "agent.compact_threshold must be a percentage from 1 to 100 (default 75); legacy byte budgets are no longer supported".into(),
+            ));
+        }
+        let catalog = crate::model_catalog::catalog().await;
+        for model in &mut models {
+            model.context_window = catalog
+                .context_window(&cfg.llm.base_url, &model.model)
+                .and_then(std::num::NonZeroU64::new)
+                .or(model.context_window);
+        }
         let selected = models.iter().find(|m| m.model == cfg.llm.model).unwrap();
         let efforts = &selected.reasoning_efforts;
         let llm = LlmClient::new(
@@ -108,6 +120,7 @@ impl Agent {
             &cfg.llm.model,
             &cfg.llm.headers,
         );
+        llm.set_context_window(selected.context_window.map(|v| v.get()));
         llm.set_reasoning_effort(
             selected
                 .reasoning_effort
@@ -192,6 +205,7 @@ impl Agent {
         self.shared.llm.select_model(selected.model.clone(), effort);
         self.reasoning_efforts = selected.reasoning_efforts.clone();
         self.context_window = selected.context_window.map(|v| v.get());
+        self.shared.llm.set_context_window(self.context_window);
         Ok(())
     }
 
@@ -426,7 +440,9 @@ impl Agent {
             &self.shared.llm,
             &mut self.history,
             compact::KEEP_RECENT,
-            self.shared.compact_threshold,
+            self.shared
+                .llm
+                .context_budget(self.shared.compact_threshold),
         )
         .await;
         if let Some(span) = &mut span {

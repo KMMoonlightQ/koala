@@ -77,9 +77,21 @@ fn serialize_messages<S: serde::Serializer>(
     seq.end()
 }
 
-/// Text retains the existing serialized-byte budget. Images use a conservative
-/// dimension-based allowance, not their Base64 transport size. Providers' actual
-/// image token accounting varies; usage returned by the provider is authoritative.
+/// Conservative heuristic: ASCII uses roughly three bytes per token, while
+/// non-ASCII uses up to two UTF-8 bytes per token. Actual provider usage remains
+/// authoritative; no model-specific tokenizer is assumed.
+pub fn estimate_tokens(text: &str) -> usize {
+    let ascii = text.bytes().filter(u8::is_ascii).count();
+    ascii.div_ceil(3).saturating_add(
+        text.chars()
+            .filter(|c| !c.is_ascii())
+            .map(|c| c.len_utf8().div_ceil(2))
+            .sum::<usize>(),
+    )
+}
+
+/// Estimated input tokens, including message structure and image allowance.
+/// Image Base64 transport data does not contribute to the estimate.
 pub fn context_size(messages: &[Message]) -> usize {
     messages
         .iter()
@@ -93,10 +105,9 @@ pub fn context_size(messages: &[Message]) -> usize {
                 tool_call_id: message.tool_call_id.clone(),
                 name: message.name.clone(),
             };
-            let bytes = serde_json::to_vec(&text)
-                .expect("serializable message")
-                .len();
-            message.images.iter().fold(bytes + 1, |size, image| {
+            let tokens =
+                estimate_tokens(&serde_json::to_string(&text).expect("serializable message"));
+            message.images.iter().fold(tokens + 1, |size, image| {
                 // Estimate a vision input scaled to a 2048px long edge. The
                 // original pixels are sent unchanged; this is only a heuristic.
                 let long_edge = u64::from(image.width.max(image.height)).max(2048);
@@ -430,6 +441,7 @@ impl DeltaAggregator {
 }
 
 pub struct LlmClient {
+    context_window: std::sync::atomic::AtomicU64,
     base_url: String,
     api_key: String,
     selection: std::sync::RwLock<(String, Option<String>)>,
@@ -474,6 +486,7 @@ impl LlmClient {
         headers: &std::collections::HashMap<String, String>,
     ) -> Self {
         Self {
+            context_window: std::sync::atomic::AtomicU64::new(0),
             base_url: base_url.into(),
             api_key: api_key.into(),
             selection: std::sync::RwLock::new((model.into(), None)),
@@ -483,6 +496,20 @@ impl LlmClient {
                 .collect(),
             http: reqwest::Client::new(),
         }
+    }
+
+    pub fn set_context_window(&self, window: Option<u64>) {
+        self.context_window
+            .store(window.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn context_budget(&self, percentage: usize) -> usize {
+        let window = self
+            .context_window
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let window = if window == 0 { 16_384 } else { window };
+        ((u128::from(window) * percentage.clamp(1, 100) as u128 / 100).min(usize::MAX as u128))
+            as usize
     }
 
     pub fn reasoning_effort(&self) -> Option<String> {
@@ -881,10 +908,8 @@ mod image_tests {
     #[test]
     fn image_context_estimate_ignores_base64_transport_length() {
         let plain = [Message::user("hello")];
-        assert_eq!(
-            context_size(&plain),
-            serde_json::to_vec(&plain).unwrap().len()
-        );
+        // Message framing plus token estimate, rather than serialized bytes.
+        assert_eq!(context_size(&plain), 13);
         let mut message = Message::user_with_images(
             "look",
             vec![ImageAttachment {

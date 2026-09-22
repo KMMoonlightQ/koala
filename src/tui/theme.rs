@@ -74,6 +74,10 @@ pub fn selected() -> Style {
     suggestion().add_modifier(Modifier::BOLD)
 }
 
+pub fn selection() -> Style {
+    Style::default().fg(INVERSE).bg(SUGGESTION)
+}
+
 pub fn task_status(state: crate::agent::event::TaskState) -> Style {
     use crate::agent::event::TaskState;
     match state {

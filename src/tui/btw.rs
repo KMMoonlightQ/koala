@@ -15,6 +15,7 @@ impl Drop for Conversation {
 pub(super) enum SideEvent {
     Agent(UiEvent),
     Clipboard(Result<clipboard::Paste, String>),
+    Copy(clipboard::CopyResult),
 }
 
 pub(super) async fn next_event(side: &mut Option<Conversation>) -> Option<SideEvent> {
@@ -31,7 +32,8 @@ pub(super) async fn next_event(side: &mut Option<Conversation>) -> Option<SideEv
             if event.is_none() { side.events = None; }
             event.map(SideEvent::Agent)
         }
-        result = clipboard::next(&mut side.app.clipboard_pending) => Some(SideEvent::Clipboard(result))
+        result = clipboard::next(&mut side.app.clipboard_pending) => Some(SideEvent::Clipboard(result)),
+        result = clipboard::next_copy(&mut side.app.clipboard_copy_pending) => Some(SideEvent::Copy(result))
     }
 }
 
@@ -41,6 +43,7 @@ pub(super) fn open(app: &mut App, question: &str) {
     }
     let (handle, events) = app.session.open_btw();
     let mut side = App::new(handle);
+    side.clipboard_owner = app.clipboard_owner.clone();
     side.temporary = true;
     side.set_lang(app.lang);
     side.theme = app.theme;

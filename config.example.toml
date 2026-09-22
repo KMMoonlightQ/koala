@@ -11,10 +11,10 @@ base_url = "https://api.openai.com/v1"     # 任意 OpenAI 兼容端点，如 ht
 api_key = "sk-xxx"                          # provider 的 key，或用环境变量 KOALA_API_KEY 覆盖
 model = "gpt-4o-mini"                       # 模型名
 
-# 以下按模型/服务商实际能力填写；不配置则不展示对应信息。
+# 推理档位按服务商实际能力填写；上下文容量自动识别，手填仅作兜底。
 # reasoning_efforts = ["low", "medium", "high"] # 可选档位及弹窗顺序
 # reasoning_effort = "medium"                  # 初始档位，省略则取列表第一项
-# context_window = 128000                      # 上下文总容量（tokens），用于计算已用百分比
+# context_window = 128000                      # 自动识别失败时的上下文容量（tokens）
 
 # 额外的请求头：某些"OpenAI 兼容"端点要求额外的路由头时填这里，每个请求都会携带
 # [llm.headers]
@@ -32,7 +32,7 @@ model = "gpt-4o-mini"                       # 模型名
 [agent]
 max_tool_rounds = "unlimited"           # 不限制轮数；非负整数设置上限，0 禁止工具调用
 max_retries = 5
-compact_threshold = 40000                # 每次请求的序列化字节预算，含工具、动态上下文及 4096 字节回复预留
+compact_threshold = 75                   # 达到上下文窗口的 75% 时压缩，取值 1..100
 subagent_max_rounds = "unlimited"
 session_dir = ".koala/session"              # 会话转录目录：通用 JSONL 会话转录
 # memory_file = "..."                    # 结构化私有记忆，默认 ~/.koala/memory.json

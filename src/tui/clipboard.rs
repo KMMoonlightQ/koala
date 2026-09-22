@@ -7,6 +7,48 @@ pub(super) enum Paste {
     Image(crate::llm::ImageAttachment),
 }
 pub(super) type Pending = oneshot::Receiver<Result<Paste, String>>;
+pub(super) type CopyOwner = std::sync::Arc<std::sync::Mutex<Option<arboard::Clipboard>>>;
+pub(super) type CopyResult = Result<(), String>;
+pub(super) type CopyPending = oneshot::Receiver<CopyResult>;
+
+pub(super) fn copy(app: &mut App, text: String) {
+    if app.clipboard_copy_pending.is_some() {
+        return;
+    }
+    let (send, receive) = oneshot::channel();
+    app.clipboard_copy_pending = Some(receive);
+    app.hint = Some(i18n::text(app.lang, Key::SelectionCopying).into());
+    let owner = app.clipboard_owner.clone();
+    tokio::task::spawn_blocking(move || {
+        let result = arboard::Clipboard::new()
+            .and_then(|mut clipboard| {
+                clipboard.set_text(text)?;
+                // On Linux clipboard ownership must survive closing /btw,
+                // including when its copy completion receiver was dropped.
+                *owner.lock().unwrap_or_else(|error| error.into_inner()) = Some(clipboard);
+                Ok(())
+            })
+            .map_err(|error| error.to_string());
+        let _ = send.send(result);
+    });
+}
+
+pub(super) async fn next_copy(pending: &mut Option<CopyPending>) -> CopyResult {
+    match pending {
+        Some(receiver) => receiver
+            .await
+            .unwrap_or_else(|_| Err("Clipboard worker stopped".into())),
+        None => std::future::pending().await,
+    }
+}
+
+pub(super) fn apply_copy(app: &mut App, result: CopyResult) {
+    app.clipboard_copy_pending = None;
+    app.hint = Some(match result {
+        Ok(()) => i18n::text(app.lang, Key::SelectionCopied).into(),
+        Err(error) => i18n::fill(app.lang, Key::SelectionCopyFailed, &[("error", &error)]),
+    });
+}
 
 fn read() -> Result<Paste, String> {
     let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;

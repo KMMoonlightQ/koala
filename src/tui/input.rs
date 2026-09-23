@@ -12,6 +12,7 @@ pub(super) const COMMANDS: &[(&str, Key)] = &[
     ("new", Key::CmdNew),
     ("plan", Key::CmdPlan),
     ("model", Key::CmdModel),
+    ("login", Key::CmdLogin),
     ("permissions", Key::CmdPermissions),
     ("effort", Key::CmdEffort),
     ("tasks", Key::CmdTasks),

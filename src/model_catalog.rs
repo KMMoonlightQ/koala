@@ -93,6 +93,32 @@ impl ModelCatalog {
                 .filter_map(|provider| capacity(provider, model)),
         )
     }
+
+    pub fn context_window_for_provider(
+        &self,
+        provider: &str,
+        endpoint: &str,
+        model: &str,
+    ) -> Option<u64> {
+        if provider == "openai_compatible" {
+            return self.context_window(endpoint, model);
+        }
+        let catalog_provider = match provider {
+            "gemini" => "google",
+            "open_router" => "openrouter",
+            "moonshot" => "moonshotai",
+            "ollama_cloud" => "ollama-cloud",
+            other => other,
+        };
+        (!endpoint.is_empty())
+            .then(|| self.context_window(endpoint, model))
+            .flatten()
+            .or_else(|| {
+                self.0
+                    .get(catalog_provider)
+                    .and_then(|entry| capacity(entry, model))
+            })
+    }
 }
 
 // models.dev omits `api` when a provider's native SDK supplies the default.

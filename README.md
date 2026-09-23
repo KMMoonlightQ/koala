@@ -60,8 +60,9 @@ koala --help
 
 主配置统一读取用户主目录下的 `~/.koala/config.toml`，与安装位置和启动目录无关。
 首次运行 `koala`（或 `koala chat`）时自动创建此文件，无需手动复制模板；安装命令本身不写入配置。
-如果模型连接尚未配置，Koala 会先展示设置表单，填写 `base_url`、`api_key` 和 `model`。
-API Key 隐藏显示，免密服务可留空；Tab 或上下方向键切换字段，Enter 进入下一项并在最后一项保存，
+如果模型连接尚未配置，Koala 会先展示设置表单，填写 `provider`、`base_url`、`api_key` 和 `model`。
+对原生 provider（如 `anthropic`、`gemini`、`openai`、`deepseek`、`open_router`），`base_url` 可留空以使用默认地址；旧配置继续使用 `openai_compatible`。
+API Key 隐藏显示，免密服务可留空；Tab 或上下方向键切换字段，provider 字段可用左右方向键选择常见服务商，也可直接输入名称。Enter 进入下一项并在最后一项保存，
 Ctrl-S 可直接保存，Esc / Ctrl-C 退出，下次启动继续配置。保存后直接进入对话，无需重启。
 表单校验 URL 格式和必填模型名，不发送联网验证请求。保存失败时留在表单内，可重试或退出。
 
@@ -89,17 +90,21 @@ Unix 下新建及保存的主配置仅当前用户可读写（`0600`）。完整
 
 ```toml
 [llm]
+provider = "openai_compatible"
 base_url = "https://api.openai.com/v1"
 api_key = "your-api-key"
 model = "your-model-name"
 ```
 
-`base_url` 填 API 基础路径，客户端会追加 `/chat/completions`。对话使用 Agent 的 `[llm]` 配置。端点要求额外请求头时，可在 `[llm.headers]` 中声明。
+`openai_compatible` 沿用 `/chat/completions`；指定原生 provider 时由 `genai` 适配其协议。一次只有一个活动 provider，模型共享其凭据和地址。端点要求额外请求头时，可在 `[llm.headers]` 中声明。
+
+也可以在对话中输入 `/login` 打开配置表单。保存后立即切换当前 provider 和模型，API Key 存入 `~/.koala/config.toml`（Unix 权限 `0600`）。切换 provider 会移除旧 provider 的模型及请求元数据。环境变量覆盖连接时需先取消覆盖，再使用 `/login`。
 
 以下环境变量覆盖文件配置：
 
 | 环境变量 | 对应配置 | 默认值 |
 |---|---|---|
+| `KOALA_PROVIDER` | `llm.provider` | `openai_compatible` |
 | `KOALA_BASE_URL` | `llm.base_url` | `https://api.openai.com/v1` |
 | `KOALA_API_KEY` | `llm.api_key` | 空 |
 | `KOALA_MODEL` | `llm.model` | 空，调用模型前需配置 |
@@ -201,6 +206,7 @@ koala memory forget reply-language --scope global
 | `/plan` | 开关 plan mode |
 | `/compact` | 手动压缩上下文 |
 | `/model` | 打开模型列表，↑↓ 选择、Enter 确认、Esc 取消；也支持 `/model 模型名` |
+| `/login` | 配置当前 provider、API Key、地址和启动模型 |
 | `/permissions` | 选择四级权限；也支持 `/permissions normal`、`/permissions ask_when_need`、`/permissions auto_edit`、`/permissions never_ask` |
 | `/effort` | 打开思考档位列表，↑↓ 选择、Enter 确认、Esc 取消；也支持 `/effort high` |
 | `/tasks` | 查看后台任务 |
@@ -316,7 +322,7 @@ context_window = 128000
 `/effort` 在前台空闲时可用，切换对后续模型请求生效（包括共享客户端的
 子任务及压缩请求），不会修改已发出的请求。选择只保留在本次进程中，`/new` 不重置，重启后恢复配置。
 
-使用 `[[llm.models]]` 添加 `/model` 的可选模型，所有模型共用 `[llm]` 的端点、密钥及请求头：
+原生 provider 启动和 `/login` 后会尝试从 provider 在线读取模型列表；无法读取时仍可用 `/model 模型ID` 手动指定新模型。`openai_compatible` 保留原有静态配置方式。也可使用 `[[llm.models]]` 添加可选模型，所有模型共用 `[llm]` 的端点、密钥及请求头：
 
 ```toml
 [[llm.models]]

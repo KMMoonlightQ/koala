@@ -136,6 +136,7 @@ keys!(
     BtwClosed,
     CmdPlan,
     CmdModel,
+    CmdLogin,
     CmdPermissions,
     CmdEffort,
     CmdGraph,
@@ -172,6 +173,9 @@ keys!(
     QueueKeys,
     NoteUnknownCommand,
     NoteNoModels,
+    NoteModelListFailed,
+    NoteLoginEnv,
+    NoteLoginSaveFailed,
     NoteNoReasoningEfforts,
     NoteToolInterrupted,
     NoteTaskNotStoppable,
@@ -183,6 +187,7 @@ keys!(
     InfoDeniedOnce,
     InfoPermissionSwitched,
     InfoModelSwitched,
+    InfoProviderConfigured,
     InfoEffortSwitched,
     InfoContextCompacted,
     InfoNothingToCompact,
@@ -190,6 +195,7 @@ keys!(
     NoteLanguageSaveFailed,
     UsagePermissions,
     UsageModel,
+    UsageLogin,
     UsageEffort,
     UsageLang,
     PermNormalDesc,
@@ -367,6 +373,7 @@ pub fn text(lang: Lang, key: Key) -> &'static str {
         ),
         CmdPlan => ("Toggle Normal / Plan mode", "切换 Normal / Plan 模式"),
         CmdModel => ("Open the model picker", "打开模型选择列表"),
+        CmdLogin => ("Configure the active model provider", "配置当前模型服务商"),
         CmdPermissions => (
             "Choose Normal / Ask When Need / Never Ask",
             "选择 Normal / Ask When Need / Never Ask 权限",
@@ -437,6 +444,18 @@ pub fn text(lang: Lang, key: Key) -> &'static str {
             "No selectable models; configure llm.models",
             "没有可选模型，请配置 llm.models",
         ),
+        NoteModelListFailed => (
+            "Could not load model list: {error}. Use /model <model-id> to enter one manually.",
+            "无法读取模型列表：{error}。可用 /model <模型ID> 手动指定。",
+        ),
+        NoteLoginEnv => (
+            "Unset KOALA_PROVIDER, KOALA_BASE_URL, KOALA_API_KEY and KOALA_MODEL before using /login.",
+            "使用 /login 前请取消 KOALA_PROVIDER、KOALA_BASE_URL、KOALA_API_KEY、KOALA_MODEL 环境变量覆盖。",
+        ),
+        NoteLoginSaveFailed => (
+            "Could not save provider configuration",
+            "无法保存模型服务配置",
+        ),
         NoteNoReasoningEfforts => (
             "No reasoning efforts configured for this model (llm.reasoning_efforts)",
             "当前模型未配置思考档位（llm.reasoning_efforts）",
@@ -469,6 +488,10 @@ pub fn text(lang: Lang, key: Key) -> &'static str {
             "权限已切换为 {mode}：{description}",
         ),
         InfoModelSwitched => ("Model switched to {name}", "模型已切换为 {name}"),
+        InfoProviderConfigured => (
+            "Provider {provider} configured with model {model}",
+            "已配置服务商 {provider}，模型 {model}",
+        ),
         InfoEffortSwitched => (
             "Reasoning effort switched to {effort}",
             "思考档位已切换为 {effort}",
@@ -485,6 +508,7 @@ pub fn text(lang: Lang, key: Key) -> &'static str {
             "用法：/permissions [normal|ask_when_need|auto_edit|never_ask]",
         ),
         UsageModel => ("Usage: /model [model name]", "用法：/model [模型名]"),
+        UsageLogin => ("Usage: /login", "用法：/login"),
         UsageEffort => ("Usage: /effort [level]", "用法：/effort [档位]"),
         UsageLang => ("Usage: /lang [en|zh]", "用法：/lang [en|zh]"),
 

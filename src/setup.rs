@@ -34,10 +34,96 @@ pub fn valid_model(value: &str) -> bool {
     !value.is_empty() && !value.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
+pub fn valid_provider(value: &str) -> bool {
+    crate::llm::supports_provider(value)
+}
+
 pub fn needs_setup(cfg: &Config) -> bool {
-    !valid_base_url(&cfg.llm.base_url)
+    !valid_provider(&cfg.llm.provider)
+        || (cfg.llm.provider == "openai_compatible" && !valid_base_url(&cfg.llm.base_url))
+        || (!cfg.llm.base_url.is_empty() && !valid_base_url(&cfg.llm.base_url))
         || !valid_model(&cfg.llm.model)
         || cfg.llm.api_key == "sk-xxx"
+}
+
+/// Replace the active connection. Models and request metadata from a different
+/// provider or endpoint must not be offered after login.
+pub fn save_login(
+    path: &Path,
+    provider: &str,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(valid_provider(provider), "invalid provider");
+    anyhow::ensure!(
+        (provider != "openai_compatible" || valid_base_url(base_url))
+            && (base_url.is_empty() || valid_base_url(base_url)),
+        "invalid base URL"
+    );
+    anyhow::ensure!(valid_model(model), "invalid model");
+    save_login_fields(
+        path,
+        [Some(provider), Some(base_url), Some(api_key), Some(model)],
+    )
+}
+
+/// Save a first-run form without persisting values supplied by KOALA_*.
+pub(crate) fn save_login_fields(path: &Path, values: [Option<&str>; 4]) -> anyhow::Result<()> {
+    let text = fs::read_to_string(path)?;
+    let mut document: toml::Table = toml::from_str(&text)?;
+    let llm = document
+        .entry("llm")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .context("llm must be a table")?;
+    let provider_changed = values[0].is_some_and(|provider| {
+        llm.get("provider")
+            .and_then(toml::Value::as_str)
+            .unwrap_or("openai_compatible")
+            != provider
+    });
+    let changed = provider_changed
+        || values[1].is_some_and(|base_url| {
+            llm.get("base_url")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("")
+                != base_url
+        });
+    if changed {
+        for key in [
+            "models",
+            "reasoning_efforts",
+            "reasoning_effort",
+            "context_window",
+            "headers",
+        ] {
+            llm.remove(key);
+        }
+    }
+    if provider_changed {
+        for (index, key) in [(1, "base_url"), (2, "api_key"), (3, "model")] {
+            if values[index].is_none() {
+                llm.insert(key.into(), toml::Value::String(String::new()));
+            }
+        }
+    }
+    for (key, value) in ["provider", "base_url", "api_key", "model"]
+        .into_iter()
+        .zip(values)
+    {
+        if let Some(value) = value {
+            llm.insert(key.into(), toml::Value::String(value.into()));
+        }
+    }
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> anyhow::Result<()> {
+        write_private(&temporary, &toml::to_string_pretty(&document)?)?;
+        fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&temporary);
+    result
 }
 
 /// None leaves an environment-controlled field unchanged on disk.
@@ -149,5 +235,54 @@ mod tests {
             cfg.llm.model = model.into();
             assert_eq!(needs_setup(&cfg), expected, "{url} / {model}");
         }
+    }
+
+    #[test]
+    fn login_replaces_the_single_active_provider_and_drops_old_model_choices() {
+        let path = path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            "lang = 'zh'\n[llm]\nbase_url = 'https://api.openai.com/v1'\napi_key = 'old-secret'\nmodel = 'old-model'\n[[llm.models]]\nmodel = 'old-extra'\n",
+        )
+        .unwrap();
+
+        save_login(&path, "anthropic", "", "new-secret", "claude-new").unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        let cfg: Config = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.lang, crate::i18n::Lang::Zh);
+        assert_eq!(cfg.llm.provider, "anthropic");
+        assert_eq!(cfg.llm.base_url, "");
+        assert_eq!(cfg.llm.api_key, "new-secret");
+        assert_eq!(cfg.llm.model, "claude-new");
+        assert_eq!(cfg.llm.selectable_models().unwrap().len(), 1);
+        assert!(!text.contains("old-secret"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn first_run_does_not_persist_environment_credentials() {
+        let path = path();
+        ensure_config(&path).unwrap();
+        save_connection(&path, [None, Some("old-secret"), Some("old-model")]).unwrap();
+        save_login_fields(
+            &path,
+            [Some("anthropic"), Some(""), None, Some("claude-new")],
+        )
+        .unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("provider = \"anthropic\""));
+        assert!(text.contains("api_key = \"\""));
+        assert!(!text.contains("old-secret"));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }

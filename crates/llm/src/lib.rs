@@ -3,11 +3,20 @@ use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use thiserror::Error;
+mod provider;
 
 pub type BoxedDeltaStream = BoxStream<'static, Result<StreamDelta, LlmError>>;
 
+pub fn supports_provider(value: &str) -> bool {
+    value == "openai_compatible" || genai::adapter::AdapterKind::from_lower_str(value).is_some()
+}
+
 #[derive(Debug, Error)]
 pub enum LlmError {
+    #[error("provider error: {0}")]
+    Provider(#[from] genai::Error),
+    #[error("unsupported provider: {0}")]
+    UnsupportedProvider(String),
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("api error (status {status}): {body}")]
@@ -31,6 +40,8 @@ pub struct Message {
     pub images: Vec<ImageAttachment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thought_signatures: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -57,6 +68,7 @@ fn serialize_messages<S: serde::Serializer>(
     let mut seq = serializer.serialize_seq(Some(messages.len()))?;
     for message in messages {
         let mut value = serde_json::to_value(message).map_err(serde::ser::Error::custom)?;
+        value.as_object_mut().unwrap().remove("thought_signatures");
         if !message.images.is_empty() {
             value.as_object_mut().unwrap().remove("images");
             let mut parts = Vec::new();
@@ -101,6 +113,7 @@ pub fn context_size(messages: &[Message]) -> usize {
                 role: message.role.clone(),
                 content: message.content.clone(),
                 reasoning_content: message.reasoning_content.clone(),
+                thought_signatures: message.thought_signatures.clone(),
                 tool_calls: message.tool_calls.clone(),
                 tool_call_id: message.tool_call_id.clone(),
                 name: message.name.clone(),
@@ -201,6 +214,7 @@ pub struct StreamDelta {
     pub usage: Option<TokenUsage>,
     pub content: Option<String>,
     pub reasoning_content: Option<String>,
+    pub thought_signatures: Vec<String>,
     pub tool_calls: Vec<ToolCallDelta>,
 }
 
@@ -364,6 +378,7 @@ impl SseParser {
             usage: chunk.usage,
             content: choice.delta.content,
             reasoning_content: choice.delta.reasoning_content,
+            thought_signatures: Vec::new(),
             tool_calls,
         }))
     }
@@ -374,6 +389,7 @@ impl SseParser {
 #[derive(Debug, Default)]
 pub struct DeltaAggregator {
     reasoning_content: Option<String>,
+    thought_signatures: Vec<String>,
     content: String,
     tool_calls: BTreeMap<usize, ToolCallBuild>,
 }
@@ -387,6 +403,8 @@ struct ToolCallBuild {
 
 impl DeltaAggregator {
     pub fn push(&mut self, delta: &StreamDelta) {
+        self.thought_signatures
+            .extend(delta.thought_signatures.iter().cloned());
         if let Some(reasoning) = &delta.reasoning_content {
             self.reasoning_content
                 .get_or_insert_with(String::new)
@@ -424,6 +442,7 @@ impl DeltaAggregator {
             .collect();
         Message {
             reasoning_content: self.reasoning_content,
+            thought_signatures: self.thought_signatures,
             role: "assistant".into(),
             content: if self.content.is_empty() {
                 None
@@ -442,11 +461,18 @@ impl DeltaAggregator {
 
 pub struct LlmClient {
     context_window: std::sync::atomic::AtomicU64,
+    connection: std::sync::RwLock<Connection>,
+    http: reqwest::Client,
+}
+
+#[derive(Clone)]
+struct Connection {
+    provider: String,
     base_url: String,
     api_key: String,
-    selection: std::sync::RwLock<(String, Option<String>)>,
+    model: String,
+    reasoning_effort: Option<String>,
     headers: Vec<(String, String)>,
-    http: reqwest::Client,
 }
 
 #[derive(Serialize)]
@@ -487,15 +513,61 @@ impl LlmClient {
     ) -> Self {
         Self {
             context_window: std::sync::atomic::AtomicU64::new(0),
+            connection: std::sync::RwLock::new(Connection {
+                provider: "openai_compatible".into(),
+                base_url: base_url.into(),
+                api_key: api_key.into(),
+                model: model.into(),
+                reasoning_effort: None,
+                headers: headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            }),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    pub fn with_provider(
+        provider: &str,
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+        headers: &std::collections::HashMap<String, String>,
+    ) -> Result<Self, LlmError> {
+        let client = Self::new(base_url, api_key, model, headers);
+        client.reconfigure(provider, base_url, api_key, model, headers)?;
+        Ok(client)
+    }
+
+    pub fn reconfigure(
+        &self,
+        provider: &str,
+        base_url: &str,
+        api_key: &str,
+        model: &str,
+        headers: &std::collections::HashMap<String, String>,
+    ) -> Result<(), LlmError> {
+        if !supports_provider(provider) {
+            return Err(LlmError::UnsupportedProvider(provider.into()));
+        }
+        *self.connection.write().unwrap() = Connection {
+            provider: provider.into(),
             base_url: base_url.into(),
             api_key: api_key.into(),
-            selection: std::sync::RwLock::new((model.into(), None)),
+            model: model.into(),
+            reasoning_effort: None,
             headers: headers
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
-            http: reqwest::Client::new(),
-        }
+        };
+        Ok(())
+    }
+
+    pub async fn list_model_names(&self) -> Result<Vec<String>, LlmError> {
+        let connection = self.connection.read().unwrap().clone();
+        provider::list_model_names(&connection).await
     }
 
     pub fn set_context_window(&self, window: Option<u64>) {
@@ -513,35 +585,43 @@ impl LlmClient {
     }
 
     pub fn reasoning_effort(&self) -> Option<String> {
-        self.selection.read().unwrap().1.clone()
+        self.connection.read().unwrap().reasoning_effort.clone()
     }
 
     pub fn set_reasoning_effort(&self, effort: Option<String>) {
-        self.selection.write().unwrap().1 = effort;
+        self.connection.write().unwrap().reasoning_effort = effort;
     }
 
     pub fn model(&self) -> String {
-        self.selection.read().unwrap().0.clone()
+        self.connection.read().unwrap().model.clone()
     }
 
     pub fn select_model(&self, model: String, effort: Option<String>) {
-        *self.selection.write().unwrap() = (model, effort);
-    }
-
-    fn endpoint(&self) -> String {
-        format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
+        let mut connection = self.connection.write().unwrap();
+        connection.model = model;
+        connection.reasoning_effort = effort;
     }
 
     /// DeepSeek requires the field even for synthetic/legacy assistant messages.
     /// Preserve returned reasoning verbatim; an empty value marks unavailable
     /// reasoning, rather than inventing it or rewriting persisted history.
+    #[cfg(test)]
     fn request_messages<'a>(
         &self,
         model: &str,
         messages: &'a [Message],
     ) -> std::borrow::Cow<'a, [Message]> {
+        let base_url = self.connection.read().unwrap().base_url.clone();
+        Self::request_messages_for(&base_url, model, messages)
+    }
+
+    fn request_messages_for<'a>(
+        base_url: &str,
+        model: &str,
+        messages: &'a [Message],
+    ) -> std::borrow::Cow<'a, [Message]> {
         let deepseek = model.to_ascii_lowercase().contains("deepseek")
-            || reqwest::Url::parse(&self.base_url)
+            || reqwest::Url::parse(base_url)
                 .ok()
                 .and_then(|url| url.host_str().map(str::to_owned))
                 .is_some_and(|host| host == "api.deepseek.com");
@@ -567,11 +647,12 @@ impl LlmClient {
         tools: Option<&[Tool]>,
         stream: bool,
     ) -> Result<reqwest::Response, LlmError> {
-        let (model, reasoning_effort) = self.selection.read().unwrap().clone();
-        let messages = self.request_messages(&model, messages);
+        let connection = self.connection.read().unwrap().clone();
+        let messages =
+            Self::request_messages_for(&connection.base_url, &connection.model, messages);
         let request = ChatRequest {
-            model: &model,
-            reasoning_effort,
+            model: &connection.model,
+            reasoning_effort: connection.reasoning_effort.clone(),
             messages: &messages,
             tools,
             stream,
@@ -579,8 +660,14 @@ impl LlmClient {
                 include_usage: true,
             }),
         };
-        let mut req = self.http.post(self.endpoint()).bearer_auth(&self.api_key);
-        for (key, value) in &self.headers {
+        let mut req = self
+            .http
+            .post(format!(
+                "{}/chat/completions",
+                connection.base_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&connection.api_key);
+        for (key, value) in &connection.headers {
             req = req.header(key, value);
         }
         let resp = req.json(&request).send().await?;
@@ -607,6 +694,17 @@ impl LlmClient {
         messages: &[Message],
         tools: Option<&[Tool]>,
     ) -> Result<Message, LlmError> {
+        let connection = self.connection.read().unwrap().clone();
+        if connection.provider != "openai_compatible" {
+            return provider::chat(
+                &connection,
+                &connection.model,
+                connection.reasoning_effort.as_deref(),
+                messages,
+                tools,
+            )
+            .await;
+        }
         let resp = self.send(messages, tools, false).await?;
         let parsed: ChatResponse = resp.json().await?;
         parsed
@@ -622,6 +720,17 @@ impl LlmClient {
         messages: &[Message],
         tools: Option<&[Tool]>,
     ) -> Result<BoxStream<'static, Result<StreamDelta, LlmError>>, LlmError> {
+        let connection = self.connection.read().unwrap().clone();
+        if connection.provider != "openai_compatible" {
+            return provider::chat_stream(
+                &connection,
+                &connection.model,
+                connection.reasoning_effort.as_deref(),
+                messages,
+                tools,
+            )
+            .await;
+        }
         let resp = self.send(messages, tools, true).await?;
         let state = (
             resp.bytes_stream(),

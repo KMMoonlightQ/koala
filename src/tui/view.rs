@@ -6,6 +6,10 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Clear, Paragraph, Wrap};
 
 pub(super) fn draw(f: &mut Frame, app: &mut App) {
+    if let Some(form) = &mut app.login_form {
+        form.draw(f);
+        return;
+    }
     if let Some(side) = &mut app.btw {
         draw(f, &mut side.app);
         return;

@@ -165,9 +165,10 @@ pub struct HooksConfig {
     pub turn_end: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone)]
 pub struct LlmConfig {
+    /// One active provider. Legacy configs use the OpenAI-compatible transport.
+    pub provider: String,
     pub base_url: String,
     pub api_key: String,
     pub model: String,
@@ -184,9 +185,49 @@ pub struct LlmConfig {
     pub headers: std::collections::HashMap<String, String>,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct RawLlmConfig {
+    provider: Option<String>,
+    base_url: Option<String>,
+    api_key: String,
+    model: String,
+    models: Vec<ModelConfig>,
+    reasoning_efforts: Vec<String>,
+    reasoning_effort: Option<String>,
+    context_window: Option<std::num::NonZeroU64>,
+    headers: std::collections::HashMap<String, String>,
+}
+
+impl<'de> Deserialize<'de> for LlmConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RawLlmConfig::deserialize(deserializer)?;
+        let provider = raw.provider.unwrap_or_else(|| "openai_compatible".into());
+        let base_url = raw.base_url.unwrap_or_else(|| {
+            if provider == "openai_compatible" {
+                "https://api.openai.com/v1".into()
+            } else {
+                String::new()
+            }
+        });
+        Ok(Self {
+            provider,
+            base_url,
+            api_key: raw.api_key,
+            model: raw.model,
+            models: raw.models,
+            reasoning_efforts: raw.reasoning_efforts,
+            reasoning_effort: raw.reasoning_effort,
+            context_window: raw.context_window,
+            headers: raw.headers,
+        })
+    }
+}
+
 impl Default for LlmConfig {
     fn default() -> Self {
         Self {
+            provider: "openai_compatible".into(),
             base_url: "https://api.openai.com/v1".into(),
             api_key: String::new(),
             model: String::new(),
@@ -406,6 +447,19 @@ impl Config {
     }
 
     pub fn apply_env_with(&mut self, get: impl Fn(&str) -> Option<String>) {
+        if let Some(v) = get("KOALA_PROVIDER") {
+            if v != self.llm.provider {
+                self.llm.base_url.clear();
+                self.llm.api_key.clear();
+                self.llm.model.clear();
+                self.llm.models.clear();
+                self.llm.headers.clear();
+                self.llm.reasoning_efforts.clear();
+                self.llm.reasoning_effort = None;
+                self.llm.context_window = None;
+            }
+            self.llm.provider = v;
+        }
         if let Some(v) = get("KOALA_BASE_URL") {
             self.llm.base_url = v;
         }
@@ -653,6 +707,16 @@ max_tool_rounds = 2
     }
 
     #[test]
+    fn native_provider_without_base_url_uses_its_default_endpoint() {
+        let cfg: Config = toml::from_str(
+            "[llm]\nprovider = 'anthropic'\napi_key = 'secret'\nmodel = 'claude-new'\n",
+        )
+        .unwrap();
+        assert!(cfg.llm.base_url.is_empty());
+        assert!(!crate::setup::needs_setup(&cfg));
+    }
+
+    #[test]
     fn env_vars_override_file_values() {
         let mut cfg: Config = toml::from_str(
             "[llm]\nbase_url = \"http://a:1/v1\"\napi_key = \"k1\"\nmodel = \"m1\"\n",
@@ -674,5 +738,20 @@ max_tool_rounds = 2
         let mut cfg: Config = toml::from_str("[llm]\napi_key = \"from-file\"\n").unwrap();
         cfg.apply_env_with(|_| None);
         assert_eq!(cfg.llm.api_key, "from-file");
+    }
+
+    #[test]
+    fn changing_provider_by_env_drops_previous_provider_credentials() {
+        let mut cfg: Config = toml::from_str("[llm]\napi_key = 'old-key'\nmodel = 'old-model'\n[[llm.models]]\nmodel = 'old-extra'\n").unwrap();
+        cfg.apply_env_with(|key| match key {
+            "KOALA_PROVIDER" => Some("anthropic".into()),
+            "KOALA_MODEL" => Some("claude-new".into()),
+            _ => None,
+        });
+        assert_eq!(cfg.llm.provider, "anthropic");
+        assert!(cfg.llm.base_url.is_empty());
+        assert!(cfg.llm.api_key.is_empty());
+        assert_eq!(cfg.llm.model, "claude-new");
+        assert!(cfg.llm.models.is_empty());
     }
 }

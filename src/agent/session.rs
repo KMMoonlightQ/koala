@@ -333,6 +333,25 @@ fn spawn_inner(agent: Agent, has_ui: bool) -> (SessionHandle, mpsc::UnboundedRec
                                 Err(message) => { let _ = ev_tx.send(UiEvent::Note(message)); }
                             }
                         }
+                        SessionCommand::RefreshModels => {
+                            let mut agent = agent.lock().await;
+                            match agent.refresh_models().await {
+                                Ok(()) => { let _ = ev_tx.send(agent.model_settings()); }
+                                Err(error) => { let lang = agent.lang(); let _ = ev_tx.send(UiEvent::Note(i18n::fill(lang, Key::NoteModelListFailed, &[("error", &error)]))); }
+                            }
+                        }
+                        SessionCommand::ConfigureLlm(cfg) => {
+                            let mut agent = agent.lock().await;
+                            match agent.configure_llm(&cfg).await {
+                                Ok(warning) => {
+                                    let _ = ev_tx.send(agent.model_settings());
+                                    let lang = agent.lang();
+                                    let _ = ev_tx.send(UiEvent::Info(i18n::fill(lang, Key::InfoProviderConfigured, &[("provider", &cfg.provider), ("model", &cfg.model)])));
+                                    if let Some(warning) = warning { let _ = ev_tx.send(UiEvent::Note(i18n::fill(lang, Key::NoteModelListFailed, &[("error", &warning)]))); }
+                                }
+                                Err(error) => { let _ = ev_tx.send(UiEvent::Error(error)); }
+                            }
+                        }
                         SessionCommand::SetReasoningEffort(value) => {
                             let agent = agent.lock().await;
                             match agent.set_reasoning_effort(&value) {

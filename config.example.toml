@@ -7,7 +7,8 @@
 # theme = "auto"
 
 [llm]
-base_url = "https://api.openai.com/v1"     # 任意 OpenAI 兼容端点，如 https://dashscope.aliyuncs.com/compatible-mode/v1
+provider = "openai_compatible"              # 原生服务可填 anthropic、gemini、openai、deepseek 等；原生服务的 base_url 可留空
+base_url = "https://api.openai.com/v1"     # OpenAI 兼容端点；使用原生 provider 时删除本行或置空
 api_key = "sk-xxx"                          # provider 的 key，或用环境变量 KOALA_API_KEY 覆盖
 model = "gpt-4o-mini"                       # 模型名
 

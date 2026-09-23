@@ -20,7 +20,7 @@ pub mod tools;
 pub mod transcripts;
 pub mod work;
 
-use crate::config::{Config, HooksConfig};
+use crate::config::{Config, HooksConfig, LlmConfig, ModelConfig};
 use crate::i18n::{self, Key, Lang, LangCell};
 use crate::llm::{ImageAttachment, LlmClient, LlmError, Message};
 use agentmem::AgentMemory;
@@ -89,6 +89,8 @@ pub struct Agent {
     plan_mode: bool,
     pending_input: Option<String>,
     pending_images: Vec<ImageAttachment>,
+    provider: String,
+    base_url: String,
 }
 
 impl Agent {
@@ -106,20 +108,40 @@ impl Agent {
             ));
         }
         let catalog = crate::model_catalog::catalog().await;
-        for model in &mut models {
-            model.context_window = catalog
-                .context_window(&cfg.llm.base_url, &model.model)
-                .and_then(std::num::NonZeroU64::new)
-                .or(model.context_window);
-        }
-        let selected = models.iter().find(|m| m.model == cfg.llm.model).unwrap();
-        let efforts = &selected.reasoning_efforts;
-        let llm = LlmClient::new(
+        let llm = LlmClient::with_provider(
+            &cfg.llm.provider,
             &cfg.llm.base_url,
             &cfg.llm.api_key,
             &cfg.llm.model,
             &cfg.llm.headers,
-        );
+        )?;
+        if cfg.llm.provider != "openai_compatible" {
+            if let Ok(Ok(names)) =
+                tokio::time::timeout(std::time::Duration::from_secs(4), llm.list_model_names())
+                    .await
+            {
+                for name in names {
+                    if !models.iter().any(|m| m.model == name) {
+                        models.push(ModelConfig {
+                            model: name,
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
+        for model in &mut models {
+            model.context_window = catalog
+                .context_window_for_provider(&cfg.llm.provider, &cfg.llm.base_url, &model.model)
+                .and_then(std::num::NonZeroU64::new)
+                .or(model.context_window);
+        }
+        let selected = models
+            .iter()
+            .find(|m| m.model == cfg.llm.model)
+            .unwrap()
+            .clone();
+        let efforts = &selected.reasoning_efforts;
         llm.set_context_window(selected.context_window.map(|v| v.get()));
         llm.set_reasoning_effort(
             selected
@@ -174,6 +196,8 @@ impl Agent {
             plan_mode: false,
             pending_input: None,
             pending_images: Vec::new(),
+            provider: cfg.llm.provider.clone(),
+            base_url: cfg.llm.base_url.clone(),
         })
     }
 
@@ -188,6 +212,15 @@ impl Agent {
     }
 
     pub fn select_model(&mut self, name: &str) -> Result<(), String> {
+        if self.provider != "openai_compatible"
+            && crate::setup::valid_model(name)
+            && !self.models.iter().any(|m| m.model == name)
+        {
+            self.models.push(ModelConfig {
+                model: name.into(),
+                ..Default::default()
+            });
+        }
         let selected = self
             .models
             .iter()
@@ -195,9 +228,6 @@ impl Agent {
             .ok_or_else(|| {
                 i18n::fill(self.lang(), Key::ErrModelNotConfigured, &[("name", name)])
             })?;
-        if self.shared.llm.model() == name {
-            return Ok(());
-        }
         let effort = selected
             .reasoning_effort
             .clone()
@@ -206,6 +236,98 @@ impl Agent {
         self.reasoning_efforts = selected.reasoning_efforts.clone();
         self.context_window = selected.context_window.map(|v| v.get());
         self.shared.llm.set_context_window(self.context_window);
+        Ok(())
+    }
+
+    pub async fn configure_llm(&mut self, cfg: &LlmConfig) -> Result<Option<String>, String> {
+        let mut models = cfg.selectable_models()?;
+        let client = LlmClient::with_provider(
+            &cfg.provider,
+            &cfg.base_url,
+            &cfg.api_key,
+            &cfg.model,
+            &cfg.headers,
+        )
+        .map_err(|e| e.to_string())?;
+        let warning = if cfg.provider == "openai_compatible" {
+            None
+        } else {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), client.list_model_names())
+                .await
+            {
+                Ok(Ok(names)) => {
+                    for name in names {
+                        if !models.iter().any(|m| m.model == name) {
+                            models.push(ModelConfig {
+                                model: name,
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    None
+                }
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(_) => Some("request timed out".into()),
+            }
+        };
+        let catalog = crate::model_catalog::catalog().await;
+        for model in &mut models {
+            model.context_window = catalog
+                .context_window_for_provider(&cfg.provider, &cfg.base_url, &model.model)
+                .and_then(std::num::NonZeroU64::new)
+                .or(model.context_window);
+        }
+        self.shared
+            .llm
+            .reconfigure(
+                &cfg.provider,
+                &cfg.base_url,
+                &cfg.api_key,
+                &cfg.model,
+                &cfg.headers,
+            )
+            .map_err(|e| e.to_string())?;
+        self.models = models;
+        self.provider = cfg.provider.clone();
+        self.base_url = cfg.base_url.clone();
+        self.select_model(&cfg.model)?;
+        Ok(warning)
+    }
+
+    pub async fn refresh_models(&mut self) -> Result<(), String> {
+        if self.provider == "openai_compatible" {
+            return Ok(());
+        }
+        let names = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.shared.llm.list_model_names(),
+        )
+        .await
+        .map_err(|_| "Model list request timed out".to_owned())?
+        .map_err(|e| e.to_string())?;
+        for name in names {
+            if !self.models.iter().any(|m| m.model == name) {
+                self.models.push(ModelConfig {
+                    model: name,
+                    ..Default::default()
+                });
+            }
+        }
+        let catalog = crate::model_catalog::catalog().await;
+        for model in &mut self.models {
+            model.context_window = catalog
+                .context_window_for_provider(&self.provider, &self.base_url, &model.model)
+                .and_then(std::num::NonZeroU64::new)
+                .or(model.context_window);
+        }
+        if let Some(selected) = self
+            .models
+            .iter()
+            .find(|m| m.model == self.shared.llm.model())
+        {
+            self.context_window = selected.context_window.map(|v| v.get());
+            self.shared.llm.set_context_window(self.context_window);
+        }
         Ok(())
     }
 

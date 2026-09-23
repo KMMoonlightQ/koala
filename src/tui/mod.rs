@@ -94,6 +94,8 @@ struct App {
     menu_selected: usize,
     menu_dismissed: bool,
     panel: Option<Panel>,
+    login_form: Option<setup::Form>,
+    llm_config: crate::config::LlmConfig,
     graph: crate::agent::graph::Graph,
     graph_received: Instant,
     tasks: Vec<TaskView>,
@@ -154,6 +156,8 @@ impl App {
             menu_selected: 0,
             menu_dismissed: false,
             panel: None,
+            login_form: None,
+            llm_config: crate::config::LlmConfig::default(),
             graph: Default::default(),
             graph_received: Instant::now(),
             tasks: Vec::new(),
@@ -195,6 +199,7 @@ impl App {
     }
 
     fn configure_appearance(&mut self, cfg: &Config) {
+        self.llm_config = cfg.llm.clone();
         self.theme = cfg.theme;
         self.theme_path = cfg.theme_path.clone();
         self.set_lang(cfg.lang);
@@ -361,7 +366,7 @@ fn handle_terminal_event(app: &mut App, event: Event) {
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => handle_key(app, key),
         Event::Paste(text) => handle_paste(app, &text),
-        Event::Mouse(event) => mouse::handle(app, event),
+        Event::Mouse(event) if app.login_form.is_none() => mouse::handle(app, event),
         _ => {}
     }
 }
@@ -407,6 +412,7 @@ fn handle_ui_event(app: &mut App, ev: UiEvent) {
                 app.context_used = None;
                 app.token_usage = None;
             }
+            app.llm_config.model = model.clone();
             app.model = model;
             app.models = models;
             app.reasoning_efforts = reasoning_efforts;
@@ -579,6 +585,10 @@ fn handle_paste(app: &mut App, pasted: &str) {
 }
 
 fn handle_paste_inner(app: &mut App, pasted: &str) {
+    if let Some(form) = &mut app.login_form {
+        form.handle(Event::Paste(pasted.into()));
+        return;
+    }
     if let Some(side) = &mut app.btw {
         handle_paste(&mut side.app, pasted);
         return;
@@ -616,6 +626,50 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_key_inner(app: &mut App, key: KeyEvent) {
+    if let Some(form) = &mut app.login_form {
+        match form.handle(Event::Key(key)) {
+            setup::Action::Continue => {}
+            setup::Action::Cancel => {
+                app.login_form = None;
+            }
+            setup::Action::Save => {
+                let values = form.values();
+                let result = crate::config::koala_dir()
+                    .map(|dir| dir.join("config.toml"))
+                    .map_err(anyhow::Error::from)
+                    .and_then(|path| {
+                        crate::setup::save_login(
+                            &path, &values[0], &values[1], &values[2], &values[3],
+                        )
+                    });
+                match result {
+                    Ok(()) => {
+                        let mut llm = app.llm_config.clone();
+                        let changed = llm.provider != values[0] || llm.base_url != values[1];
+                        llm.provider = values[0].clone();
+                        llm.base_url = values[1].clone();
+                        llm.api_key = values[2].clone();
+                        llm.model = values[3].clone();
+                        if changed {
+                            llm.models.clear();
+                            llm.headers.clear();
+                            llm.reasoning_efforts.clear();
+                            llm.reasoning_effort = None;
+                            llm.context_window = None;
+                        }
+                        app.llm_config = llm.clone();
+                        app.session.send(SessionCommand::ConfigureLlm(llm));
+                        app.login_form = None;
+                    }
+                    Err(_) => {
+                        app.hint = Some(i18n::text(app.lang, Key::NoteLoginSaveFailed).into());
+                        app.login_form = None;
+                    }
+                }
+            }
+        }
+        return;
+    }
     if mouse::handle_key(app, key) {
         return;
     }
@@ -890,6 +944,32 @@ fn send_draft(app: &mut App, text: String) {
 fn handle_command(app: &mut App, cmd: &str) -> bool {
     let mut words = cmd.split_whitespace();
     let command = words.next();
+    if command == Some("login") {
+        if words.next().is_some() {
+            app.hint = Some(i18n::text(app.lang, Key::UsageLogin).into());
+            return false;
+        }
+        if [
+            "KOALA_PROVIDER",
+            "KOALA_BASE_URL",
+            "KOALA_API_KEY",
+            "KOALA_MODEL",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+        {
+            app.push(EntryKind::Note(
+                i18n::text(app.lang, Key::NoteLoginEnv).into(),
+            ));
+            return true;
+        }
+        let mut cfg = Config::default();
+        cfg.llm = app.llm_config.clone();
+        cfg.lang = app.lang;
+        app.panel = None;
+        app.login_form = Some(setup::Form::new(&cfg, [false; 4]));
+        return true;
+    }
     if command == Some("extensions") {
         controls::close_panel(app);
         app.extension_ui.open();
@@ -976,6 +1056,9 @@ fn handle_command(app: &mut App, cmd: &str) -> bool {
                 i18n::text(app.lang, Key::NoteNoModels).into(),
             ));
         } else {
+            if app.llm_config.provider != "openai_compatible" {
+                app.session.send(SessionCommand::RefreshModels);
+            }
             let selected = app.models.iter().position(|m| m == &app.model).unwrap_or(0);
             app.panel = Some(Panel::Model { selected });
         }
@@ -1076,6 +1159,42 @@ fn handle_command(app: &mut App, cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_opens_provider_form_and_escape_closes_it() {
+        if [
+            "KOALA_PROVIDER",
+            "KOALA_BASE_URL",
+            "KOALA_API_KEY",
+            "KOALA_MODEL",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+        {
+            return;
+        }
+        let mut app = app();
+        assert!(handle_command(&mut app, "login"));
+        assert!(app.login_form.is_some());
+        assert!(render(&mut app, 100, 28).contains("provider"));
+        handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.login_form.is_none());
+    }
+
+    #[test]
+    fn native_model_picker_requests_fresh_model_names() {
+        let (session, mut commands) = SessionHandle::test_channel();
+        let mut app = test_app(session);
+        app.llm_config.provider = "anthropic".into();
+        app.model = "claude-current".into();
+        app.models = vec![app.model.clone()];
+        assert!(handle_command(&mut app, "model"));
+        assert!(matches!(
+            commands.try_recv().unwrap(),
+            SessionCommand::RefreshModels
+        ));
+        assert!(matches!(app.panel, Some(Panel::Model { .. })));
+    }
 
     #[test]
     fn btw_shortcut_preserves_draft_cursor_and_permission_and_never_saves_input() {

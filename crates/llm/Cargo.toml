@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+genai = "=0.6.5"
 koala-extension-api = { path = "../extension-api" }
 futures-util = "0.3.34"
 serde = { version = "1.0.229", features = ["derive"] }

@@ -33,6 +33,8 @@ pub enum SessionCommand {
     /// Select one of the configured reasoning efforts.
     SetReasoningEffort(String),
     SelectModel(String),
+    RefreshModels,
+    ConfigureLlm(crate::config::LlmConfig),
     SetPermissionMode(crate::config::PermissionMode),
     /// Compact the conversation history now.
     Compact,

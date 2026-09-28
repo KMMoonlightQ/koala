@@ -92,9 +92,6 @@ pub async fn run(
                 request.insert(0, Message::system(context));
             }
         }
-        if ctx.depth == 0 {
-            let _ = ctx.events.send(UiEvent::ContextUsage(None));
-        }
         // Estimate input tokens, including tools and dynamic context, and reserve
         // output tokens before applying the selected model's percentage budget.
         let used = crate::llm::context_size(&request)
@@ -183,6 +180,8 @@ pub async fn run(
                 if let Some(u) = &delta.usage {
                     usage = serde_json::json!({"input_tokens": u.prompt_tokens, "output_tokens": u.completion_tokens});
                     if ctx.depth == 0 {
+                        // Keep the last reported values visible between requests
+                        // until the provider supplies another usage update.
                         let _ = ctx.events.send(UiEvent::ContextUsage(Some(u.prompt_tokens.saturating_add(u.completion_tokens))));
                         let _ = ctx.events.send(UiEvent::TokenUsage(u.clone()));
                     }

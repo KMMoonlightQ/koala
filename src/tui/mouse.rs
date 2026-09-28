@@ -201,8 +201,18 @@ pub(super) fn handle(app: &mut App, event: MouseEvent) {
         MouseEventKind::ScrollDown => Some(KeyCode::PageDown),
         _ => None,
     } {
-        // Paging preserves permission decisions and never recalls input history.
-        super::handle_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+        if blocked(app) {
+            // Paging preserves permission decisions and overlay navigation.
+            super::handle_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+        } else {
+            // Wheel events use a smaller step than keyboard paging and never
+            // move the input cursor or recall input history.
+            app.transcript.scroll(if code == KeyCode::PageUp {
+                Scroll::Up(3)
+            } else {
+                Scroll::Down(3)
+            });
+        }
         app.mouse.extend_after_scroll = true;
         return;
     }

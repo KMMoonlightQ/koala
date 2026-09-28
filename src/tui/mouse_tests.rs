@@ -140,7 +140,10 @@ fn output_drag_can_extend_across_scrolled_rows() {
     let frame = render(&mut app, 60, 16);
     let from = locate(&frame, "line38");
     mouse(&mut app, MouseEventKind::Down(MouseButton::Left), from);
-    mouse(&mut app, MouseEventKind::ScrollUp, from);
+    for _ in 0..3 {
+        mouse(&mut app, MouseEventKind::ScrollUp, from);
+        render(&mut app, 60, 16);
+    }
     let frame = render(&mut app, 60, 16);
     let to = locate(&frame, "line28");
     mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), to);

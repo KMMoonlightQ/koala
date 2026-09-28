@@ -1229,8 +1229,9 @@ mod tests {
             })
             .await
             .unwrap();
-            assert_eq!(usage.first(), Some(&None));
-            assert_eq!(usage.last(), Some(&expected));
+            // Starting another request must not clear the last known usage.
+            // Responses without usage leave the frontend's previous values intact.
+            assert_eq!(usage, expected.into_iter().map(Some).collect::<Vec<_>>());
             assert_eq!(
                 mock.request().await["stream_options"]["include_usage"],
                 true

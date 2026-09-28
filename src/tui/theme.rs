@@ -20,7 +20,7 @@ pub const ERROR: Color = Color::Rgb(0xDA, 0x8A, 0x93);
 pub const WARNING: Color = Color::Rgb(0xD8, 0xB2, 0x70);
 /// Muted sage green — plan mode.
 pub const PLAN: Color = Color::Rgb(0x7F, 0xAE, 0x99);
-/// Warm gold — user prompt label.
+/// Warm gold — user message and prompt label.
 pub const USER: Color = Color::Rgb(0xFF, 0xDF, 0x80);
 /// Muted blue-gray — input box border.
 pub const PROMPT_BORDER: Color = Color::Rgb(0x55, 0x60, 0x6F);

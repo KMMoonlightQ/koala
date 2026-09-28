@@ -326,7 +326,7 @@ pub(super) fn render_entry(
     let body_width = width.saturating_sub(2).max(1);
     match entry {
         EntryKind::User(source) => {
-            let style = theme::text().add_modifier(Modifier::BOLD);
+            let style = theme::user();
             text::prefixed_styled(
                 literal(source, body_width, style),
                 Span::styled("› ", theme::user()),
